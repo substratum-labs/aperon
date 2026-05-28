@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/aperon-core", "crates/aperon-cli", "crates/aperon-py"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/substratum-labs/aperon"
+homepage = "https://github.com/substratum-labs/aperon"
+keywords = ["ann", "vector-search", "database", "simd"]
+categories = ["database-implementations", "algorithms"]
+
+[workspace.dependencies]
+aperon-core = { path = "crates/aperon-core" }
+pyo3 = "0.25.1"

@@ -1,0 +1,18 @@
+[package]
+name = "aperon-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aperon_py"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+aperon-core.workspace = true
+pyo3.workspace = true

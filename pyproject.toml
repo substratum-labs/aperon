@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "aperon-py"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Python bindings for the Aperon vector search engine"
+license = { text = "Apache-2.0" }
+
+[tool.maturin]
+manifest-path = "crates/aperon-py/Cargo.toml"
+features = ["extension-module"]
+module-name = "aperon_py"
