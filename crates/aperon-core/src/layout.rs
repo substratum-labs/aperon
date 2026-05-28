@@ -150,6 +150,10 @@ impl BlockSoaLayout {
         self.ids.get(ordinal).copied()
     }
 
+    pub fn ids(&self) -> &[VectorId] {
+        &self.ids
+    }
+
     pub fn block_count(&self) -> usize {
         self.ids.len().div_ceil(self.block_size)
     }
@@ -190,6 +194,133 @@ impl BlockSoaLayout {
 
     fn sketch_offset(&self, block: usize, dim: usize, lane: usize) -> usize {
         block * self.sketch_dim * self.block_size + dim * self.block_size + lane
+    }
+
+    /// Serialise all blocks into the wire-format byte sequence expected by
+    /// `binary::read_single_body`. Per block:
+    ///   `local_dim * block_size` × i16 coords  (SoA, dim-major)
+    ///   `block_size`             × u16 residuals
+    ///   `block_size`             × u32 ids      (DUMMY_ID for padding slots)
+    ///   `sketch_dim * block_size`× i8 sketches  (SoA, dim-major)
+    pub fn raw_block_bytes(&self) -> Vec<u8> {
+        let num_blocks = self.block_count();
+        let bytes_per_block = self.block_size
+            * (self.local_dim * size_of::<i16>()
+                + size_of::<u16>()
+                + size_of::<u32>()
+                + self.sketch_dim * size_of::<i8>());
+        let mut out = Vec::with_capacity(num_blocks * bytes_per_block);
+        for b in 0..num_blocks {
+            // coords: local_dim * block_size i16 (already stored SoA dim-major)
+            let coord_start = b * self.local_dim * self.block_size;
+            let coord_end = coord_start + self.local_dim * self.block_size;
+            for &c in &self.coords[coord_start..coord_end] {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+            // residuals: block_size u16
+            let res_start = b * self.block_size;
+            let res_end = res_start + self.block_size;
+            for &r in &self.residuals[res_start..res_end] {
+                out.extend_from_slice(&r.to_le_bytes());
+            }
+            // ids: block_size u32 (real ids then DUMMY_ID for padding)
+            let real_len = self.block_len(b);
+            for lane in 0..self.block_size {
+                let id_u32 = if lane < real_len {
+                    let ordinal = b * self.block_size + lane;
+                    // Safety: ordinal < self.ids.len() because lane < real_len
+                    self.ids[ordinal].as_u32().unwrap_or(DUMMY_ID)
+                } else {
+                    DUMMY_ID
+                };
+                out.extend_from_slice(&id_u32.to_le_bytes());
+            }
+            // sketches: sketch_dim * block_size i8 (stored SoA dim-major)
+            let sk_start = b * self.sketch_dim * self.block_size;
+            let sk_end = sk_start + self.sketch_dim * self.block_size;
+            for &s in &self.sketches[sk_start..sk_end] {
+                out.push(s as u8);
+            }
+        }
+        out
+    }
+
+    pub fn from_raw_block_bytes(
+        local_dim: usize,
+        sketch_dim: usize,
+        block_size: usize,
+        num_vectors: usize,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
+        let bytes_per_block = block_size
+            * (local_dim * size_of::<i16>()
+                + size_of::<u16>()
+                + size_of::<u32>()
+                + sketch_dim * size_of::<i8>());
+        let expected_len = num_vectors.div_ceil(block_size) * bytes_per_block;
+        if bytes.len() != expected_len {
+            return Err(format!(
+                "block data length mismatch: expected {}, got {}",
+                expected_len,
+                bytes.len()
+            ));
+        }
+
+        let mut layout = Self::with_shape(local_dim, sketch_dim, block_size);
+        let num_blocks = num_vectors.div_ceil(block_size);
+        for block in 0..num_blocks {
+            let block_start = block * bytes_per_block;
+            let coord_start = block_start;
+            let residual_start = coord_start + local_dim * block_size * size_of::<i16>();
+            let id_start = residual_start + block_size * size_of::<u16>();
+            let sketch_start = id_start + block_size * size_of::<u32>();
+            let real_lanes = num_vectors
+                .saturating_sub(block * block_size)
+                .min(block_size);
+
+            for lane in 0..real_lanes {
+                let id_offset = id_start + lane * size_of::<u32>();
+                let id = u32::from_le_bytes(
+                    bytes[id_offset..id_offset + size_of::<u32>()]
+                        .try_into()
+                        .map_err(|_| "invalid id bytes")?,
+                );
+                if id == DUMMY_ID {
+                    return Err("dummy id found in a live vector lane".to_string());
+                }
+
+                let mut coords = Vec::with_capacity(local_dim);
+                for dim in 0..local_dim {
+                    let offset = coord_start + (dim * block_size + lane) * size_of::<i16>();
+                    coords.push(i16::from_le_bytes(
+                        bytes[offset..offset + size_of::<i16>()]
+                            .try_into()
+                            .map_err(|_| "invalid coord bytes")?,
+                    ));
+                }
+
+                let residual_offset = residual_start + lane * size_of::<u16>();
+                let residual = u16::from_le_bytes(
+                    bytes[residual_offset..residual_offset + size_of::<u16>()]
+                        .try_into()
+                        .map_err(|_| "invalid residual bytes")?,
+                );
+
+                let mut sketches = Vec::with_capacity(sketch_dim);
+                for dim in 0..sketch_dim {
+                    let offset = sketch_start + dim * block_size + lane;
+                    sketches.push(bytes[offset] as i8);
+                }
+
+                layout.push_quantized(
+                    VectorId::new(u64::from(id)),
+                    &coords,
+                    residual,
+                    &sketches,
+                )?;
+            }
+        }
+        Ok(layout)
     }
 }
 

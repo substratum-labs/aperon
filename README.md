@@ -33,9 +33,10 @@ Rust port of the validated compact scan path:
 - architecture-specific L2 SIMD dispatch for AVX2/FMA and AArch64 NEON with
   scalar fallback;
 - HNTR/HNTQ/HNTL/HNTM binary format loaders;
+- `aperon build` and `aperon query` CLI workflows for HNTR/HNTQ/HNTL files;
 - PyO3 bindings for insert, rebuild, split configuration, search, and stats.
 
 Next up (roadmap):
-- **T-124** — Index serialization writer (`write_legacy_index`)
-- **T-122** — CLI `build` / `query` / `eval` subcommands
-- **T-125** — GitHub Actions Python wheel CI (maturin)
+- **T-123** — Recall evaluation pipeline
+- **T-127** — Memory deduplication for raw vector storage
+- **T-128** — Python API improvements

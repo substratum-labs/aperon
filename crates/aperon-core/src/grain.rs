@@ -1,3 +1,4 @@
+use crate::binary::LegacySingleGrain;
 use crate::layout::{BlockSoaLayout, VectorId};
 use crate::quantization::{
     quantize_i16, quantize_i8, quantize_u16, scale_for_i16, scale_for_i8, scale_for_u16,
@@ -154,6 +155,51 @@ impl Grain {
         Ok(grain)
     }
 
+    pub fn from_legacy_single(id: GrainId, legacy: LegacySingleGrain) -> Result<Self, String> {
+        let source_dim = legacy.dimension as usize;
+        let local_dim = legacy.local_dim as usize;
+        let sketch_dim = legacy.sketch_dim as usize;
+        let block_size = legacy.block_size as usize;
+        if source_dim == 0 || local_dim == 0 || block_size == 0 {
+            return Err("dimension, local_dim, and block_size must be nonzero".to_string());
+        }
+
+        expect_len(&legacy.mean, source_dim, "mean")?;
+        expect_len(&legacy.projection, source_dim * local_dim, "projection")?;
+        expect_len(&legacy.proj_scales, local_dim, "proj_scales")?;
+        expect_len(
+            &legacy.sketch_projection,
+            source_dim * sketch_dim,
+            "sketch_projection",
+        )?;
+        expect_len(&legacy.sketch_scales, sketch_dim, "sketch_scales")?;
+
+        let layout = BlockSoaLayout::from_raw_block_bytes(
+            local_dim,
+            sketch_dim,
+            block_size,
+            legacy.num_vectors as usize,
+            &legacy.block_data,
+        )?;
+        let mut grain = Self {
+            id,
+            layout,
+            source_dim,
+            mean: legacy.mean,
+            projection: legacy.projection,
+            proj_scales: legacy.proj_scales,
+            residual_scale: legacy.residual_scale,
+            sketch_projection: legacy.sketch_projection,
+            sketch_scales: legacy.sketch_scales,
+            distance_unit: 1.0,
+            coord_weights: Vec::new(),
+            residual_weight: 1,
+            sketch_weights: Vec::new(),
+        };
+        grain.build_distance_weights();
+        Ok(grain)
+    }
+
     pub const fn id(&self) -> GrainId {
         self.id
     }
@@ -180,6 +226,39 @@ impl Grain {
 
     pub fn centroid(&self) -> &[f32] {
         &self.mean
+    }
+
+    pub fn mean(&self) -> &[f32] {
+        &self.mean
+    }
+
+    pub fn projection(&self) -> &[f32] {
+        &self.projection
+    }
+
+    pub fn proj_scales(&self) -> &[f32] {
+        &self.proj_scales
+    }
+
+    pub fn residual_scale(&self) -> f32 {
+        self.residual_scale
+    }
+
+    pub fn sketch_projection(&self) -> &[f32] {
+        &self.sketch_projection
+    }
+
+    pub fn sketch_scales(&self) -> &[f32] {
+        &self.sketch_scales
+    }
+
+    /// Serialize the block data to the on-disk wire format.
+    pub fn raw_block_bytes(&self) -> Vec<u8> {
+        self.layout.raw_block_bytes()
+    }
+
+    pub fn vector_ids(&self) -> &[VectorId] {
+        self.layout.ids()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -320,6 +399,18 @@ impl Grain {
             .iter()
             .map(|scale| scaled_weight(f64::from(*scale) * f64::from(*scale), unit, 8_388_607))
             .collect();
+    }
+}
+
+fn expect_len<T>(slice: &[T], expected: usize, name: &str) -> Result<(), String> {
+    if slice.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} length mismatch: expected {}, got {}",
+            expected,
+            slice.len()
+        ))
     }
 }
 

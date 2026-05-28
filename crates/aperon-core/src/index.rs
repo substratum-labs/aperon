@@ -1,5 +1,8 @@
 use crate::{
-    distance::l2_squared, grain::ScoredVector, Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
+    binary::{LegacyIndex, LegacySingleGrain},
+    distance::l2_squared,
+    grain::ScoredVector,
+    Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
 };
 
 /// Minimal in-memory index skeleton.
@@ -59,6 +62,73 @@ impl AperonIndex {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn from_legacy_index(index: LegacyIndex) -> Result<Self, String> {
+        match index {
+            LegacyIndex::Single(single) => {
+                let dim = single.dimension as usize;
+                let local_dim = single.local_dim as usize;
+                let sketch_dim = single.sketch_dim as usize;
+                let block_size = single.block_size as usize;
+                let grain = Grain::from_legacy_single(GrainId::new(0), single)?;
+                let ids = grain.vector_ids().to_vec();
+                Ok(Self {
+                    dim,
+                    local_dim,
+                    sketch_dim,
+                    block_size,
+                    centroids: vec![grain.centroid().to_vec()],
+                    grain_ids: vec![ids],
+                    grain_vectors: vec![Vec::new()],
+                    ids: Vec::new(),
+                    raw_vectors: Vec::new(),
+                    grains: vec![grain],
+                    split_threshold: None,
+                })
+            }
+            LegacyIndex::Multi(multi) => {
+                let dim = multi.dimension as usize;
+                let local_dim = multi.local_dim as usize;
+                let sketch_dim = multi.sketch_dim as usize;
+                let block_size = multi.block_size as usize;
+                let grains = multi
+                    .grains
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, grain)| Grain::from_legacy_single(GrainId::new(idx as u64), grain))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let grain_ids = grains
+                    .iter()
+                    .map(|grain| grain.vector_ids().to_vec())
+                    .collect::<Vec<_>>();
+                let centroids = multi
+                    .centroids
+                    .chunks_exact(dim)
+                    .map(|chunk| chunk.to_vec())
+                    .collect::<Vec<_>>();
+                if centroids.len() != grains.len() {
+                    return Err(format!(
+                        "centroid count mismatch: expected {}, got {}",
+                        grains.len(),
+                        centroids.len()
+                    ));
+                }
+                Ok(Self {
+                    dim,
+                    local_dim,
+                    sketch_dim,
+                    block_size,
+                    grains,
+                    centroids,
+                    grain_ids,
+                    grain_vectors: vec![Vec::new(); multi.num_centroids as usize],
+                    ids: Vec::new(),
+                    raw_vectors: Vec::new(),
+                    split_threshold: None,
+                })
+            }
+        }
     }
 
     pub fn enable_dynamic_splitting(&mut self, split_threshold: usize) -> Result<(), String> {
@@ -301,6 +371,26 @@ impl AperonIndex {
             grains: self.grains.len(),
             vectors: self.grains.iter().map(Grain::len).sum(),
         }
+    }
+
+    /// Extract the first (and typically only) grain as a `LegacySingleGrain`
+    /// for serialisation. Returns `None` if no grain has been built yet.
+    pub fn to_legacy_single(&self) -> Option<LegacySingleGrain> {
+        let grain = self.grains.first()?;
+        Some(LegacySingleGrain {
+            num_vectors: grain.len() as u32,
+            dimension: self.dim as u32,
+            local_dim: grain.local_dim() as u32,
+            block_size: grain.block_size() as u32,
+            sketch_dim: grain.sketch_dim() as u32,
+            mean: grain.mean().to_vec(),
+            projection: grain.projection().to_vec(),
+            proj_scales: grain.proj_scales().to_vec(),
+            residual_scale: grain.residual_scale(),
+            sketch_projection: grain.sketch_projection().to_vec(),
+            sketch_scales: grain.sketch_scales().to_vec(),
+            block_data: grain.raw_block_bytes(),
+        })
     }
 }
 
