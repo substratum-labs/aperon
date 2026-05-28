@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 pub const LEGACY_VERSION: u32 = 1;
 
@@ -255,6 +255,88 @@ fn read_f32_vec(reader: &mut impl Read, count: usize) -> io::Result<Vec<f32>> {
     Ok(out)
 }
 
+// ─── Writers ─────────────────────────────────────────────────────────────────
+
+pub fn write_raw_vectors(mut writer: impl Write, raw: &RawVectors) -> io::Result<()> {
+    writer.write_all(b"HNTR")?;
+    write_u32(&mut writer, LEGACY_VERSION)?;
+    write_u32(&mut writer, raw.num_vectors)?;
+    write_u32(&mut writer, raw.dimension)?;
+    write_f32_vec(&mut writer, &raw.vectors)
+}
+
+pub fn write_queries(mut writer: impl Write, qs: &QuerySet) -> io::Result<()> {
+    writer.write_all(b"HNTQ")?;
+    write_u32(&mut writer, LEGACY_VERSION)?;
+    write_u32(&mut writer, qs.num_queries)?;
+    write_u32(&mut writer, qs.dimension)?;
+    write_f32_vec(&mut writer, &qs.vectors)
+}
+
+pub fn write_legacy_index(mut writer: impl Write, index: &LegacyIndex) -> io::Result<()> {
+    match index {
+        LegacyIndex::Single(single) => {
+            writer.write_all(b"HNTL")?;
+            write_u32(&mut writer, LEGACY_VERSION)?;
+            write_u32(&mut writer, single.num_vectors)?;
+            write_u32(&mut writer, single.dimension)?;
+            write_u32(&mut writer, single.local_dim)?;
+            write_u32(&mut writer, single.block_size)?;
+            write_u32(&mut writer, single.sketch_dim)?;
+            write_single_body(&mut writer, single)
+        }
+        LegacyIndex::Multi(multi) => {
+            writer.write_all(b"HNTM")?;
+            write_u32(&mut writer, LEGACY_VERSION)?;
+            write_u32(&mut writer, multi.num_centroids)?;
+            write_u32(&mut writer, multi.num_vectors)?;
+            write_u32(&mut writer, multi.dimension)?;
+            write_u32(&mut writer, multi.local_dim)?;
+            write_u32(&mut writer, multi.block_size)?;
+            write_u32(&mut writer, multi.sketch_dim)?;
+            write_f32_vec(&mut writer, &multi.centroids)?;
+            for grain in &multi.grains {
+                write_embedded_single(&mut writer, grain)?
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Write a single grain body (mean, projection, scales, block_data) — no magic/version prefix.
+fn write_single_body(writer: &mut impl Write, g: &LegacySingleGrain) -> io::Result<()> {
+    write_f32_vec(writer, &g.mean)?;
+    write_f32_vec(writer, &g.projection)?;
+    write_f32_vec(writer, &g.proj_scales)?;
+    write_f32(writer, g.residual_scale)?;
+    if g.sketch_dim > 0 {
+        write_f32_vec(writer, &g.sketch_projection)?;
+        write_f32_vec(writer, &g.sketch_scales)?;
+    }
+    writer.write_all(&g.block_data)
+}
+
+/// Write a grain embedded inside a multi-grain index: num_vectors first, then the body.
+fn write_embedded_single(writer: &mut impl Write, g: &LegacySingleGrain) -> io::Result<()> {
+    write_u32(writer, g.num_vectors)?;
+    write_single_body(writer, g)
+}
+
+fn write_u32(writer: &mut impl Write, v: u32) -> io::Result<()> {
+    writer.write_all(&v.to_le_bytes())
+}
+
+fn write_f32(writer: &mut impl Write, v: f32) -> io::Result<()> {
+    writer.write_all(&v.to_le_bytes())
+}
+
+fn write_f32_vec(writer: &mut impl Write, v: &[f32]) -> io::Result<()> {
+    for &x in v {
+        write_f32(writer, x)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +384,78 @@ mod tests {
             }
             LegacyIndex::Multi(_) => panic!("expected single index"),
         }
+    }
+
+    #[test]
+    fn round_trips_raw_vectors() {
+        let raw = RawVectors {
+            num_vectors: 3,
+            dimension: 2,
+            vectors: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        };
+        let mut buf = Vec::new();
+        write_raw_vectors(&mut buf, &raw).unwrap();
+        let loaded = load_raw_vectors(Cursor::new(buf)).unwrap();
+        assert_eq!(loaded, raw);
+    }
+
+    fn make_single_grain(sketch_dim: u32) -> LegacySingleGrain {
+        let num_vectors: u32 = 4;
+        let dimension: u32 = 2;
+        let local_dim: u32 = 1;
+        let block_size: u32 = 2;
+        // num_blocks = ceil(4/2) = 2
+        // block_bytes = block_size * (local_dim * sizeof(i16) + sizeof(u16) + sizeof(u32)
+        //               + sketch_dim * sizeof(i8))
+        //             = 2 * (1*2 + 2 + 4 + sketch_dim*1)
+        //             = 2 * (8 + sketch_dim)
+        let block_bytes = block_size as usize
+            * (local_dim as usize * size_of::<i16>()
+                + size_of::<u16>()
+                + size_of::<u32>()
+                + sketch_dim as usize * size_of::<i8>());
+        let num_blocks = num_vectors.div_ceil(block_size) as usize;
+        let (sketch_projection, sketch_scales) = if sketch_dim > 0 {
+            (
+                vec![0.1_f32; dimension as usize * sketch_dim as usize],
+                vec![1.0_f32; sketch_dim as usize],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        LegacySingleGrain {
+            num_vectors,
+            dimension,
+            local_dim,
+            block_size,
+            sketch_dim,
+            mean: vec![0.0_f32; dimension as usize],
+            projection: vec![1.0_f32; dimension as usize * local_dim as usize],
+            proj_scales: vec![1.0_f32; local_dim as usize],
+            residual_scale: 1.0,
+            sketch_projection,
+            sketch_scales,
+            block_data: vec![0u8; num_blocks * block_bytes],
+        }
+    }
+
+    #[test]
+    fn round_trips_single_legacy_index() {
+        let grain = make_single_grain(0);
+        let index = LegacyIndex::Single(grain);
+        let mut buf = Vec::new();
+        write_legacy_index(&mut buf, &index).unwrap();
+        let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+        assert_eq!(loaded, index);
+    }
+
+    #[test]
+    fn round_trips_single_with_sketch() {
+        let grain = make_single_grain(2);
+        let index = LegacyIndex::Single(grain);
+        let mut buf = Vec::new();
+        write_legacy_index(&mut buf, &index).unwrap();
+        let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+        assert_eq!(loaded, index);
     }
 }
