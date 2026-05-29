@@ -2,9 +2,12 @@ use aperon_core::{
     binary::{load_legacy_index, write_legacy_index},
     AperonIndex, VectorId,
 };
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use std::{fs::File, io::BufWriter, path::PathBuf};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[pyclass(name = "AperonIndex")]
 struct PyAperonIndex {
@@ -21,10 +24,57 @@ impl PyAperonIndex {
         Self { inner }
     }
 
-    fn insert(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+    #[pyo3(signature = (id_or_vector, vector=None))]
+    fn insert(
+        &mut self,
+        id_or_vector: &Bound<'_, PyAny>,
+        vector: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let (id, vector) = match vector {
+            Some(vector) => (id_or_vector.extract::<u64>()?, extract_vector(vector)?),
+            None => (
+                self.inner.stats().vectors as u64,
+                extract_vector(id_or_vector)?,
+            ),
+        };
+
         self.inner
             .insert(VectorId::new(id), vector)
-            .map_err(value_error)
+            .map_err(value_error)?;
+        Ok(id)
+    }
+
+    fn insert_many(
+        &mut self,
+        ids: &Bound<'_, PyAny>,
+        matrix: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let ids = extract_ids(ids)?;
+        let vectors = extract_matrix(matrix)?;
+        if ids.len() != vectors.len() {
+            return Err(value_error(format!(
+                "ids length mismatch: expected {}, got {}",
+                vectors.len(),
+                ids.len()
+            )));
+        }
+        for vector in &vectors {
+            if vector.len() != self.inner.dim() {
+                return Err(value_error(format!(
+                    "dimension mismatch: expected {}, got {}",
+                    self.inner.dim(),
+                    vector.len()
+                )));
+            }
+        }
+
+        let count = vectors.len();
+        for (id, vector) in ids.into_iter().zip(vectors) {
+            self.inner
+                .insert(VectorId::new(id), vector)
+                .map_err(value_error)?;
+        }
+        Ok(count)
     }
 
     fn rebuild_single_grain(&mut self) -> PyResult<()> {
@@ -33,6 +83,10 @@ impl PyAperonIndex {
 
     fn rebuild_two_grains(&mut self) -> PyResult<()> {
         self.inner.rebuild_two_grains().map_err(value_error)
+    }
+
+    fn rebuild_n_grains(&mut self, grains: usize) -> PyResult<()> {
+        self.inner.rebuild_n_grains(grains).map_err(value_error)
     }
 
     fn enable_dynamic_splitting(&mut self, split_threshold: usize) -> PyResult<()> {
@@ -94,9 +148,44 @@ impl PyAperonIndex {
 }
 
 #[pymodule]
-fn aperon_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn aperon(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("__version__", VERSION)?;
     module.add_class::<PyAperonIndex>()?;
     Ok(())
+}
+
+fn extract_vector(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
+    if let Ok(vector) = obj.extract::<Vec<f32>>() {
+        return Ok(vector);
+    }
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, f32>>() {
+        return Ok(array.as_array().iter().copied().collect());
+    }
+    obj.extract::<Vec<f32>>()
+}
+
+fn extract_matrix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f32>>> {
+    if let Ok(matrix) = obj.extract::<Vec<Vec<f32>>>() {
+        return Ok(matrix);
+    }
+    if let Ok(array) = obj.extract::<PyReadonlyArray2<'_, f32>>() {
+        return Ok(array
+            .as_array()
+            .outer_iter()
+            .map(|row| row.iter().copied().collect())
+            .collect());
+    }
+    obj.extract::<Vec<Vec<f32>>>()
+}
+
+fn extract_ids(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+    if let Ok(ids) = obj.extract::<Vec<u64>>() {
+        return Ok(ids);
+    }
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, u64>>() {
+        return Ok(array.as_array().iter().copied().collect());
+    }
+    obj.extract::<Vec<u64>>()
 }
 
 fn value_error(message: String) -> PyErr {
@@ -118,7 +207,9 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let mut index = PyAperonIndex::new(2, None, 0, 4);
-            index.insert(7, vec![1.0, 2.0]).unwrap();
+            let id = 7_u64.into_pyobject(py).unwrap();
+            let vector = vec![1.0, 2.0].into_pyobject(py).unwrap();
+            index.insert(id.as_any(), Some(vector.as_any())).unwrap();
 
             let stats = index.stats(py).unwrap();
 
@@ -162,9 +253,17 @@ mod tests {
             unique_suffix()
         ));
         let mut index = PyAperonIndex::new(2, Some(2), 0, 4);
-        index.insert(0, vec![0.0, 0.0]).unwrap();
-        index.insert(1, vec![10.0, 0.0]).unwrap();
-        index.insert(2, vec![0.0, 10.0]).unwrap();
+        Python::with_gil(|py| {
+            for (id, vector) in [
+                (0_u64, vec![0.0, 0.0]),
+                (1_u64, vec![10.0, 0.0]),
+                (2_u64, vec![0.0, 10.0]),
+            ] {
+                let id = id.into_pyobject(py).unwrap();
+                let vector = vector.into_pyobject(py).unwrap();
+                index.insert(id.as_any(), Some(vector.as_any())).unwrap();
+            }
+        });
         index.rebuild_single_grain().unwrap();
 
         index.save(path.clone()).unwrap();
@@ -192,5 +291,23 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn insert_many_accepts_python_sequences() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut index = PyAperonIndex::new(2, None, 0, 4);
+            let ids = vec![10_u64, 11_u64].into_pyobject(py).unwrap();
+            let matrix = vec![vec![1.0, 0.0], vec![2.0, 0.0]]
+                .into_pyobject(py)
+                .unwrap();
+
+            let inserted = index.insert_many(ids.as_any(), matrix.as_any()).unwrap();
+
+            assert_eq!(inserted, 2);
+            assert_eq!(index.search(vec![1.8, 0.0], 1, None).unwrap()[0].0, 11);
+        });
     }
 }

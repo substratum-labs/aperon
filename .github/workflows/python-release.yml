@@ -1,0 +1,57 @@
+name: Python Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository-url:
+        description: "Python package repository upload URL"
+        required: true
+        default: "https://test.pypi.org/legacy/"
+
+jobs:
+  wheels:
+    name: Build wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build wheel
+        run: maturin build --release -m crates/aperon-py/Cargo.toml -F extension-module --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: wheels
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install twine
+        run: pip install twine
+      - name: Upload wheels
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          TWINE_REPOSITORY_URL: ${{ inputs.repository-url }}
+        run: twine upload dist/*.whl

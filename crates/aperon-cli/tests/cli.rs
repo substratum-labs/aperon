@@ -52,6 +52,79 @@ fn build_writes_legacy_index() {
 }
 
 #[test]
+fn build_grains_writes_hntm_and_eval_reads_it() {
+    let dir = TestDir::new("build_grains_writes_hntm_and_eval_reads_it");
+    let vectors = dir.path("vectors.hntr");
+    let index = dir.path("index.hntm");
+    let queries = dir.path("queries.hntq");
+    let raw = RawVectors {
+        num_vectors: 8,
+        dimension: 2,
+        vectors: vec![
+            0.0, 0.0, 100.0, 0.0, 0.0, 100.0, 100.0, 100.0, 200.0, 0.0, 0.0, 200.0, 200.0, 200.0,
+            300.0, 300.0,
+        ],
+    };
+    write_raw_vectors(File::create(&vectors).unwrap(), &raw).unwrap();
+    write_queries(
+        File::create(&queries).unwrap(),
+        &QuerySet {
+            num_queries: 2,
+            dimension: 2,
+            vectors: vec![99.0, 0.0, 201.0, 201.0],
+        },
+    )
+    .unwrap();
+
+    let build = Command::new(env!("CARGO_BIN_EXE_aperon"))
+        .args([
+            "build",
+            "--vectors",
+            vectors.to_str().unwrap(),
+            "--output",
+            index.to_str().unwrap(),
+            "--grains",
+            "8",
+            "--local-dim",
+            "2",
+            "--block-size",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&build);
+
+    let loaded = load_legacy_index(File::open(&index).unwrap()).unwrap();
+    match loaded {
+        LegacyIndex::Multi(multi) => {
+            assert_eq!(multi.num_centroids, 8);
+            assert_eq!(multi.num_vectors, 8);
+            assert_eq!(multi.dimension, 2);
+        }
+        LegacyIndex::Single(_) => panic!("expected multi-grain index"),
+    }
+
+    let eval = Command::new(env!("CARGO_BIN_EXE_aperon"))
+        .args([
+            "eval",
+            "--index",
+            index.to_str().unwrap(),
+            "--vectors",
+            vectors.to_str().unwrap(),
+            "--queries",
+            queries.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_success(&eval);
+    let stdout = String::from_utf8(eval.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("queries,top_k,recall@10"));
+    assert_eq!(lines.next(), Some("2,10,1"));
+}
+
+#[test]
 fn query_returns_nearest_ids() {
     let dir = TestDir::new("query_returns_nearest_ids");
     let vectors = dir.path("vectors.hntr");

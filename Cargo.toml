@@ -13,4 +13,5 @@ categories = ["database-implementations", "algorithms"]
 
 [workspace.dependencies]
 aperon-core = { path = "crates/aperon-core" }
+numpy = "0.25.0"
 pyo3 = "0.25.1"

@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "aperon_py"
+name = "aperon"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
@@ -15,4 +15,5 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 aperon-core.workspace = true
+numpy.workspace = true
 pyo3.workspace = true

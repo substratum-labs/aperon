@@ -243,6 +243,54 @@ impl AperonIndex {
         Ok(())
     }
 
+    pub fn rebuild_n_grains(&mut self, requested_grains: usize) -> Result<(), String> {
+        if requested_grains == 0 {
+            return Err("requested_grains must be greater than zero".to_string());
+        }
+        let target_grains = requested_grains.min(self.raw_vectors.len());
+        if target_grains <= 1 {
+            return self.rebuild_single_grain();
+        }
+
+        let split = k_means(&self.raw_vectors, self.dim, target_grains);
+        let mut bucket_ids = vec![Vec::new(); split.centroids.len()];
+        let mut bucket_vectors = vec![Vec::new(); split.centroids.len()];
+        for (idx, assignment) in split.assignments.iter().copied().enumerate() {
+            bucket_ids[assignment].push(self.ids[idx]);
+            bucket_vectors[assignment].push(self.raw_vectors[idx].clone());
+        }
+
+        let mut grains = Vec::new();
+        let mut centroids = Vec::new();
+        let mut grain_ids = Vec::new();
+        for (ids, vectors) in bucket_ids.into_iter().zip(bucket_vectors) {
+            if ids.is_empty() {
+                continue;
+            }
+            let grain_idx = grains.len();
+            grains.push(Grain::build(
+                GrainId::new(grain_idx as u64),
+                &vectors,
+                &ids,
+                self.dim,
+                self.local_dim,
+                self.sketch_dim,
+                self.block_size,
+            )?);
+            centroids.push(mean_vector(&vectors, self.dim));
+            grain_ids.push(ids);
+        }
+
+        if grains.len() <= 1 {
+            return self.rebuild_single_grain();
+        }
+
+        self.grains = grains;
+        self.centroids = centroids;
+        self.grain_ids = grain_ids;
+        Ok(())
+    }
+
     pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredVector>, String> {
         let mut results = Vec::new();
         for grain in self.routed_grains(query)? {
@@ -444,6 +492,122 @@ struct TwoMeansSplit {
     centroid1: Vec<f32>,
 }
 
+#[derive(Clone, Debug)]
+struct KMeansSplit {
+    assignments: Vec<usize>,
+    centroids: Vec<Vec<f32>>,
+}
+
+fn k_means(vectors: &[Vec<f32>], dim: usize, k: usize) -> KMeansSplit {
+    let mut centroids = seed_centroids(vectors, dim, k);
+    let mut assignments = vec![usize::MAX; vectors.len()];
+
+    for _ in 0..20 {
+        let next = assign_to_centroids(vectors, &centroids);
+        let updated = recompute_centroids(vectors, dim, &next, &centroids);
+        let converged = next == assignments;
+        assignments = next;
+        centroids = updated;
+        if converged {
+            break;
+        }
+    }
+
+    KMeansSplit {
+        assignments,
+        centroids,
+    }
+}
+
+fn seed_centroids(vectors: &[Vec<f32>], dim: usize, k: usize) -> Vec<Vec<f32>> {
+    if vectors.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let target = k.min(vectors.len());
+    let mut selected = vec![false; vectors.len()];
+    let mut centroids = vec![vectors[0].clone()];
+    selected[0] = true;
+
+    while centroids.len() < target {
+        let mut best_idx = None;
+        let mut best_distance = f32::NEG_INFINITY;
+        for (idx, vector) in vectors.iter().enumerate() {
+            if selected[idx] {
+                continue;
+            }
+            let nearest = centroids
+                .iter()
+                .map(|centroid| l2_squared(vector, centroid).unwrap_or(f32::INFINITY))
+                .fold(f32::INFINITY, f32::min);
+            if nearest > best_distance {
+                best_distance = nearest;
+                best_idx = Some(idx);
+            }
+        }
+
+        let Some(idx) = best_idx else {
+            break;
+        };
+        selected[idx] = true;
+        centroids.push(vectors[idx].clone());
+    }
+
+    if centroids.is_empty() {
+        centroids.push(vec![0.0; dim]);
+    }
+    centroids
+}
+
+fn assign_to_centroids(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
+    vectors
+        .iter()
+        .map(|vector| {
+            centroids
+                .iter()
+                .enumerate()
+                .map(|(idx, centroid)| {
+                    let distance = l2_squared(vector, centroid).unwrap_or(f32::INFINITY);
+                    (idx, distance)
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn recompute_centroids(
+    vectors: &[Vec<f32>],
+    dim: usize,
+    assignments: &[usize],
+    previous: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    let mut sums = vec![vec![0.0; dim]; previous.len()];
+    let mut counts = vec![0_usize; previous.len()];
+
+    for (vector, assignment) in vectors.iter().zip(assignments) {
+        counts[*assignment] += 1;
+        for (sum, value) in sums[*assignment].iter_mut().zip(vector) {
+            *sum += value;
+        }
+    }
+
+    sums.into_iter()
+        .zip(counts)
+        .zip(previous)
+        .map(|((mut sum, count), old)| {
+            if count == 0 {
+                return old.clone();
+            }
+            for value in &mut sum {
+                *value /= count as f32;
+            }
+            sum
+        })
+        .collect()
+}
+
 fn two_means(vectors: &[Vec<f32>], dim: usize) -> TwoMeansSplit {
     let mut centroid0 = vectors[0].clone();
     let mut centroid1 = vectors
@@ -566,6 +730,24 @@ mod tests {
         assert_eq!(stats.vectors, 4);
         let results = loaded.search_with_nprobe(&[100.2, 100.0], 1, 1).unwrap();
         assert_eq!(results[0].id, VectorId::new(10));
+    }
+
+    #[test]
+    fn rebuild_n_grains_builds_requested_routable_grains() {
+        let mut index = AperonIndex::with_options(2, 2, 0, 2);
+        for cluster in 0..4 {
+            let base = cluster as f32 * 100.0;
+            index.insert(cluster * 10, [base, base]).unwrap();
+            index.insert(cluster * 10 + 1, [base + 1.0, base]).unwrap();
+        }
+
+        index.rebuild_n_grains(4).unwrap();
+
+        let stats = index.stats();
+        assert_eq!(stats.grains, 4);
+        assert_eq!(stats.vectors, 8);
+        let results = index.search_with_nprobe(&[200.2, 200.0], 1, 1).unwrap();
+        assert_eq!(results[0].id, VectorId::new(20));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use aperon_core::{
-    binary::{load_legacy_index, load_queries, load_raw_vectors, write_legacy_index, LegacyIndex},
+    binary::{load_legacy_index, load_queries, load_raw_vectors, write_legacy_index},
     l2_squared, AperonIndex, ScoredVector, VectorId,
 };
 use std::{
@@ -41,6 +41,7 @@ fn build(args: &[String]) -> Result<(), String> {
     let local_dim = flags.optional_nonzero_usize("--local-dim")?;
     let sketch_dim = flags.optional_usize("--sketch-dim")?.unwrap_or(0);
     let block_size = flags.optional_nonzero_usize("--block-size")?.unwrap_or(64);
+    let grains = flags.optional_nonzero_usize("--grains")?.unwrap_or(1);
     flags.finish()?;
 
     let raw = load_raw_vectors(File::open(&vectors_path).map_err(format_io)?).map_err(format_io)?;
@@ -65,13 +66,13 @@ fn build(args: &[String]) -> Result<(), String> {
     for (idx, vector) in raw.vectors.chunks_exact(dim).enumerate() {
         index.insert(VectorId::new(idx as u64), vector.to_vec())?;
     }
-    index.rebuild_single_grain()?;
-    let single = index
-        .to_legacy_single()
-        .ok_or_else(|| "failed to build a serializable grain".to_string())?;
+    index.rebuild_n_grains(grains)?;
+    let legacy = index
+        .to_legacy_index()
+        .ok_or_else(|| "failed to build a serializable index".to_string())?;
 
     let output = File::create(&output_path).map_err(format_io)?;
-    write_legacy_index(BufWriter::new(output), &LegacyIndex::Single(single)).map_err(format_io)?;
+    write_legacy_index(BufWriter::new(output), &legacy).map_err(format_io)?;
     Ok(())
 }
 
@@ -329,7 +330,7 @@ fn format_io(err: io::Error) -> String {
 fn usage() -> String {
     [
         "usage:",
-        "  aperon build --vectors <HNTR> --output <HNTL> [--local-dim N] [--sketch-dim N] [--block-size N]",
+        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--block-size N]",
         "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N]",
         "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N]",
     ]
