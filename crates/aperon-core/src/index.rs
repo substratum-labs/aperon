@@ -4,6 +4,7 @@ use crate::{
     grain::ScoredVector,
     Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
 };
+use std::collections::HashMap;
 
 /// Minimal in-memory index skeleton.
 #[derive(Clone, Debug)]
@@ -15,7 +16,7 @@ pub struct AperonIndex {
     grains: Vec<Grain>,
     centroids: Vec<Vec<f32>>,
     grain_ids: Vec<Vec<VectorId>>,
-    grain_vectors: Vec<Vec<Vec<f32>>>,
+    id_to_index: HashMap<VectorId, usize>,
     ids: Vec<VectorId>,
     raw_vectors: Vec<Vec<f32>>,
     split_threshold: Option<usize>,
@@ -32,7 +33,7 @@ impl AperonIndex {
             grains: vec![Grain::new(GrainId::new(0), dim)],
             centroids: vec![vec![0.0; dim]],
             grain_ids: vec![Vec::new()],
-            grain_vectors: vec![Vec::new()],
+            id_to_index: HashMap::new(),
             ids: Vec::new(),
             raw_vectors: Vec::new(),
             split_threshold: None,
@@ -53,7 +54,7 @@ impl AperonIndex {
             grains: vec![Grain::new(GrainId::new(0), dim)],
             centroids: vec![vec![0.0; dim]],
             grain_ids: vec![Vec::new()],
-            grain_vectors: vec![Vec::new()],
+            id_to_index: HashMap::new(),
             ids: Vec::new(),
             raw_vectors: Vec::new(),
             split_threshold: None,
@@ -80,7 +81,7 @@ impl AperonIndex {
                     block_size,
                     centroids: vec![grain.centroid().to_vec()],
                     grain_ids: vec![ids],
-                    grain_vectors: vec![Vec::new()],
+                    id_to_index: HashMap::new(),
                     ids: Vec::new(),
                     raw_vectors: Vec::new(),
                     grains: vec![grain],
@@ -122,7 +123,7 @@ impl AperonIndex {
                     grains,
                     centroids,
                     grain_ids,
-                    grain_vectors: vec![Vec::new(); multi.num_centroids as usize],
+                    id_to_index: HashMap::new(),
                     ids: Vec::new(),
                     raw_vectors: Vec::new(),
                     split_threshold: None,
@@ -165,7 +166,7 @@ impl AperonIndex {
 
         self.grains[route].insert(id, vector.clone())?;
         self.grain_ids[route].push(id);
-        self.grain_vectors[route].push(vector.clone());
+        self.id_to_index.insert(id, self.ids.len());
         self.ids.push(id);
         self.raw_vectors.push(vector);
 
@@ -190,7 +191,6 @@ impl AperonIndex {
         )?];
         self.centroids = vec![mean_vector(&self.raw_vectors, self.dim)];
         self.grain_ids = vec![self.ids.clone()];
-        self.grain_vectors = vec![self.raw_vectors.clone()];
         Ok(())
     }
 
@@ -240,7 +240,6 @@ impl AperonIndex {
         ];
         self.centroids = vec![split.centroid0, split.centroid1];
         self.grain_ids = vec![ids0, ids1];
-        self.grain_vectors = vec![vectors0, vectors1];
         Ok(())
     }
 
@@ -312,9 +311,17 @@ impl AperonIndex {
 
     fn split_grain(&mut self, grain_idx: usize) -> Result<(), String> {
         let ids = self.grain_ids[grain_idx].clone();
-        let vectors = self.grain_vectors[grain_idx].clone();
         if ids.len() < self.block_size * 2 {
             return Ok(());
+        }
+
+        let mut vectors = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(&idx) = self.id_to_index.get(id) {
+                vectors.push(self.raw_vectors[idx].clone());
+            } else {
+                return Err(format!("VectorId {:?} not found in raw_vectors", id));
+            }
         }
 
         let split = two_means(&vectors, self.dim);
@@ -347,7 +354,6 @@ impl AperonIndex {
         )?;
         self.centroids[grain_idx] = split.centroid0;
         self.grain_ids[grain_idx] = ids0;
-        self.grain_vectors[grain_idx] = vectors0;
 
         let new_idx = self.grains.len();
         self.grains.push(Grain::build(
@@ -361,7 +367,7 @@ impl AperonIndex {
         )?);
         self.centroids.push(split.centroid1);
         self.grain_ids.push(ids1);
-        self.grain_vectors.push(vectors1);
+
         Ok(())
     }
 

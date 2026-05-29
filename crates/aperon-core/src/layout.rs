@@ -175,6 +175,21 @@ impl BlockSoaLayout {
         self.sketches[self.sketch_offset(block, dim, lane)]
     }
 
+    pub(crate) fn coord_block(&self, block: usize, dim: usize) -> &[i16] {
+        let start = self.coord_offset(block, dim, 0);
+        &self.coords[start..start + self.block_size]
+    }
+
+    pub(crate) fn residual_block(&self, block: usize) -> &[u16] {
+        let start = block * self.block_size;
+        &self.residuals[start..start + self.block_size]
+    }
+
+    pub(crate) fn sketch_block(&self, block: usize, dim: usize) -> &[i8] {
+        let start = self.sketch_offset(block, dim, 0);
+        &self.sketches[start..start + self.block_size]
+    }
+
     fn start_block(&mut self) {
         self.coords.extend(std::iter::repeat_n(
             i16::MAX,

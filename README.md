@@ -32,11 +32,12 @@ Rust port of the validated compact scan path:
   dynamic grain splitting, two-grain centroid routing, and top-k search;
 - architecture-specific L2 SIMD dispatch for AVX2/FMA and AArch64 NEON with
   scalar fallback;
+- block-level integer scan dispatch for quantized Block-SoA grains with
+  deterministic scalar parity coverage;
 - HNTR/HNTQ/HNTL/HNTM binary format loaders;
-- `aperon build` and `aperon query` CLI workflows for HNTR/HNTQ/HNTL files;
+- `aperon build`, `aperon query`, and `aperon eval` CLI workflows for
+  HNTR/HNTQ/HNTL files, including brute-force Recall@K evaluation;
 - PyO3 bindings for insert, rebuild, split configuration, search, and stats.
 
 Next up (roadmap):
-- **T-123** — Recall evaluation pipeline
-- **T-127** — Memory deduplication for raw vector storage
 - **T-128** — Python API improvements

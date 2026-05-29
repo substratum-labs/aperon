@@ -7,6 +7,7 @@ pub mod index;
 pub mod layout;
 pub mod quantization;
 pub mod routing;
+mod scan;
 
 pub use distance::{l2_squared, Distance};
 pub use grain::{Grain, GrainId, ScoredVector};

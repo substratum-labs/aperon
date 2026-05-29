@@ -4,6 +4,7 @@ use crate::quantization::{
     quantize_i16, quantize_i8, quantize_u16, scale_for_i16, scale_for_i8, scale_for_u16,
     scaled_weight,
 };
+use crate::scan::{scan_block_into, ScanWeights};
 
 /// Stable identifier for a local Aperon grain.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -279,22 +280,24 @@ impl Grain {
     pub fn scan(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredVector>, String> {
         let projected = self.project_query(query)?;
         let mut out = Vec::new();
+        let mut distances = vec![0; self.layout.block_size()];
         for block in 0..self.layout.block_count() {
-            for lane in 0..self.layout.block_len(block) {
-                let mut dist = 0_i64;
-                for k in 0..self.local_dim() {
-                    let diff = i64::from(projected.coords[k])
-                        - i64::from(self.layout.coord(block, k, lane));
-                    dist += diff * diff * self.coord_weights[k];
-                }
-                dist += (i64::from(projected.residual)
-                    + i64::from(self.layout.residual(block, lane)))
-                    * self.residual_weight;
-                for m in 0..self.sketch_dim() {
-                    let diff = i64::from(projected.sketches[m])
-                        - i64::from(self.layout.sketch(block, m, lane));
-                    dist += diff * diff * self.sketch_weights[m];
-                }
+            let lanes = self.layout.block_len(block);
+            scan_block_into(
+                &self.layout,
+                block,
+                lanes,
+                &projected.coords,
+                projected.residual,
+                &projected.sketches,
+                ScanWeights {
+                    coord: &self.coord_weights,
+                    residual: self.residual_weight,
+                    sketch: &self.sketch_weights,
+                },
+                &mut distances,
+            );
+            for (lane, dist) in distances.iter().copied().take(lanes).enumerate() {
                 if let Some(id) = self.layout.id_at(block * self.layout.block_size() + lane) {
                     out.push(ScoredVector {
                         id,
