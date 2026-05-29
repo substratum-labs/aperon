@@ -17,11 +17,20 @@ struct PyAperonIndex {
 #[pymethods]
 impl PyAperonIndex {
     #[new]
-    #[pyo3(signature = (dim, local_dim=None, sketch_dim=0, block_size=64))]
-    fn new(dim: usize, local_dim: Option<usize>, sketch_dim: usize, block_size: usize) -> Self {
-        let inner =
+    #[pyo3(signature = (dim, local_dim=None, sketch_dim=0, block_size=64, rerank_factor=4))]
+    fn new(dim: usize, local_dim: Option<usize>, sketch_dim: usize, block_size: usize, rerank_factor: usize) -> Self {
+        let mut inner =
             AperonIndex::with_options(dim, local_dim.unwrap_or(dim), sketch_dim, block_size);
+        inner.set_rerank_factor(rerank_factor);
         Self { inner }
+    }
+
+    fn set_rerank_factor(&mut self, factor: usize) {
+        self.inner.set_rerank_factor(factor);
+    }
+
+    fn get_rerank_factor(&self) -> usize {
+        self.inner.rerank_factor()
     }
 
     #[pyo3(signature = (id_or_vector, vector=None))]
@@ -95,16 +104,19 @@ impl PyAperonIndex {
             .map_err(value_error)
     }
 
-    #[pyo3(signature = (query, top_k, nprobe=None))]
+    #[pyo3(signature = (query, top_k, nprobe=None, rerank_factor=None))]
     fn search(
         &self,
         query: Vec<f32>,
         top_k: usize,
         nprobe: Option<usize>,
+        rerank_factor: Option<usize>,
     ) -> PyResult<Vec<(u64, f64)>> {
-        let results = match nprobe {
-            Some(nprobe) => self.inner.search_with_nprobe(&query, top_k, nprobe),
-            None => self.inner.search(&query, top_k),
+        let results = match (nprobe, rerank_factor) {
+            (Some(np), Some(rf)) => self.inner.search_with_nprobe_internal(&query, top_k, np, rf),
+            (Some(np), None) => self.inner.search_with_nprobe(&query, top_k, np),
+            (None, Some(rf)) => self.inner.search_internal(&query, top_k, rf),
+            (None, None) => self.inner.search(&query, top_k),
         }
         .map_err(value_error)?;
 
@@ -112,6 +124,35 @@ impl PyAperonIndex {
             .into_iter()
             .map(|scored| (scored.id.get(), scored.distance))
             .collect())
+    }
+
+    #[pyo3(signature = (queries, top_k, nprobe=None, rerank_factor=None))]
+    fn search_many(
+        &self,
+        queries: PyReadonlyArray2<'_, f32>,
+        top_k: usize,
+        nprobe: Option<usize>,
+        rerank_factor: Option<usize>,
+    ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let array = queries.as_array();
+        let mut all_results = Vec::with_capacity(array.shape()[0]);
+        for row in array.outer_iter() {
+            let query: Vec<f32> = row.iter().copied().collect();
+            let results = match (nprobe, rerank_factor) {
+                (Some(np), Some(rf)) => self.inner.search_with_nprobe_internal(&query, top_k, np, rf),
+                (Some(np), None) => self.inner.search_with_nprobe(&query, top_k, np),
+                (None, Some(rf)) => self.inner.search_internal(&query, top_k, rf),
+                (None, None) => self.inner.search(&query, top_k),
+            }
+            .map_err(value_error)?;
+
+            let mapped = results
+                .into_iter()
+                .map(|scored| (scored.id.get(), scored.distance))
+                .collect();
+            all_results.push(mapped);
+        }
+        Ok(all_results)
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -207,7 +248,7 @@ mod tests {
     fn stats_returns_python_dict() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let mut index = PyAperonIndex::new(2, None, 0, 4);
+            let mut index = PyAperonIndex::new(2, None, 0, 4, 4);
             let id = 7_u64.into_pyobject(py).unwrap();
             let vector = vec![1.0, 2.0].into_pyobject(py).unwrap();
             index.insert(id.as_any(), Some(vector.as_any())).unwrap();
@@ -257,7 +298,7 @@ mod tests {
     #[allow(deprecated)]
     fn stats_returns_python_grain_sizes_for_multi_grain_index() {
         pyo3::prepare_freethreaded_python();
-        let mut index = PyAperonIndex::new(2, Some(2), 0, 2);
+        let mut index = PyAperonIndex::new(2, Some(2), 0, 2, 4);
         Python::with_gil(|py| {
             for cluster in 0..4 {
                 let base = cluster as f32 * 100.0;
@@ -292,7 +333,7 @@ mod tests {
             process::id(),
             unique_suffix()
         ));
-        let mut index = PyAperonIndex::new(2, Some(2), 0, 4);
+        let mut index = PyAperonIndex::new(2, Some(2), 0, 4, 4);
         Python::with_gil(|py| {
             for (id, vector) in [
                 (0_u64, vec![0.0, 0.0]),
@@ -310,7 +351,7 @@ mod tests {
         let loaded = PyAperonIndex::load_path(path.clone()).unwrap();
         fs::remove_file(path).unwrap();
 
-        let results = loaded.search(vec![9.0, 0.0], 1, None).unwrap();
+        let results = loaded.search(vec![9.0, 0.0], 1, None, None).unwrap();
         assert_eq!(results[0].0, 1);
         Python::with_gil(|py| {
             let stats = loaded.stats(py).unwrap();
@@ -338,7 +379,7 @@ mod tests {
     fn insert_many_accepts_python_sequences() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let mut index = PyAperonIndex::new(2, None, 0, 4);
+            let mut index = PyAperonIndex::new(2, None, 0, 4, 4);
             let ids = vec![10_u64, 11_u64].into_pyobject(py).unwrap();
             let matrix = vec![vec![1.0, 0.0], vec![2.0, 0.0]]
                 .into_pyobject(py)
@@ -347,7 +388,32 @@ mod tests {
             let inserted = index.insert_many(ids.as_any(), matrix.as_any()).unwrap();
 
             assert_eq!(inserted, 2);
-            assert_eq!(index.search(vec![1.8, 0.0], 1, None).unwrap()[0].0, 11);
+            assert_eq!(index.search(vec![1.8, 0.0], 1, None, None).unwrap()[0].0, 11);
+        });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_reranks_and_improves_accuracy_py() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut index = PyAperonIndex::new(3, Some(2), 1, 4, 4);
+            let ids = vec![1_u64, 2_u64, 3_u64].into_pyobject(py).unwrap();
+            let matrix = vec![
+                vec![0.0, 0.0, 0.0],
+                vec![10.0, 0.0, 0.0],
+                vec![0.0, 10.0, 0.0],
+            ]
+            .into_pyobject(py)
+            .unwrap();
+            index.insert_many(ids.as_any(), matrix.as_any()).unwrap();
+            index.rebuild_single_grain().unwrap();
+
+            // Reranking should find the correct nearest neighbor
+            let results = index.search(vec![9.0, 0.0, 0.0], 1, None, Some(4)).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, 2);
+            assert!((results[0].1 - 1.0).abs() < 1.0);
         });
     }
 }

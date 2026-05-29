@@ -20,6 +20,8 @@ pub struct AperonIndex {
     ids: Vec<VectorId>,
     raw_vectors: Vec<Vec<f32>>,
     split_threshold: Option<usize>,
+    rerank_factor: usize,
+    vector_locations: HashMap<VectorId, (usize, usize)>,
 }
 
 impl AperonIndex {
@@ -37,6 +39,8 @@ impl AperonIndex {
             ids: Vec::new(),
             raw_vectors: Vec::new(),
             split_threshold: None,
+            rerank_factor: 4,
+            vector_locations: HashMap::new(),
         }
     }
 
@@ -58,6 +62,25 @@ impl AperonIndex {
             ids: Vec::new(),
             raw_vectors: Vec::new(),
             split_threshold: None,
+            rerank_factor: 4,
+            vector_locations: HashMap::new(),
+        }
+    }
+
+    pub fn set_rerank_factor(&mut self, factor: usize) {
+        self.rerank_factor = factor;
+    }
+
+    pub fn rerank_factor(&self) -> usize {
+        self.rerank_factor
+    }
+
+    fn update_vector_locations(&mut self) {
+        self.vector_locations.clear();
+        for (g_idx, ids) in self.grain_ids.iter().enumerate() {
+            for (ord, id) in ids.iter().enumerate() {
+                self.vector_locations.insert(*id, (g_idx, ord));
+            }
         }
     }
 
@@ -66,7 +89,7 @@ impl AperonIndex {
     }
 
     pub fn from_legacy_index(index: LegacyIndex) -> Result<Self, String> {
-        match index {
+        let mut index_obj = match index {
             LegacyIndex::Single(single) => {
                 let dim = single.dimension as usize;
                 let local_dim = single.local_dim as usize;
@@ -74,7 +97,7 @@ impl AperonIndex {
                 let block_size = single.block_size as usize;
                 let grain = Grain::from_legacy_single(GrainId::new(0), single)?;
                 let ids = grain.vector_ids().to_vec();
-                Ok(Self {
+                Self {
                     dim,
                     local_dim,
                     sketch_dim,
@@ -86,7 +109,9 @@ impl AperonIndex {
                     raw_vectors: Vec::new(),
                     grains: vec![grain],
                     split_threshold: None,
-                })
+                    rerank_factor: 4,
+                    vector_locations: HashMap::new(),
+                }
             }
             LegacyIndex::Multi(multi) => {
                 let dim = multi.dimension as usize;
@@ -115,7 +140,7 @@ impl AperonIndex {
                         centroids.len()
                     ));
                 }
-                Ok(Self {
+                Self {
                     dim,
                     local_dim,
                     sketch_dim,
@@ -127,9 +152,13 @@ impl AperonIndex {
                     ids: Vec::new(),
                     raw_vectors: Vec::new(),
                     split_threshold: None,
-                })
+                    rerank_factor: 4,
+                    vector_locations: HashMap::new(),
+                }
             }
-        }
+        };
+        index_obj.update_vector_locations();
+        Ok(index_obj)
     }
 
     pub fn enable_dynamic_splitting(&mut self, split_threshold: usize) -> Result<(), String> {
@@ -170,6 +199,9 @@ impl AperonIndex {
         self.ids.push(id);
         self.raw_vectors.push(vector);
 
+        let ord = self.grain_ids[route].len() - 1;
+        self.vector_locations.insert(id, (route, ord));
+
         if self
             .split_threshold
             .is_some_and(|threshold| self.grain_ids[route].len() >= threshold)
@@ -191,6 +223,7 @@ impl AperonIndex {
         )?];
         self.centroids = vec![mean_vector(&self.raw_vectors, self.dim)];
         self.grain_ids = vec![self.ids.clone()];
+        self.update_vector_locations();
         Ok(())
     }
 
@@ -240,6 +273,7 @@ impl AperonIndex {
         ];
         self.centroids = vec![split.centroid0, split.centroid1];
         self.grain_ids = vec![ids0, ids1];
+        self.update_vector_locations();
         Ok(())
     }
 
@@ -288,21 +322,12 @@ impl AperonIndex {
         self.grains = grains;
         self.centroids = centroids;
         self.grain_ids = grain_ids;
+        self.update_vector_locations();
         Ok(())
     }
 
     pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredVector>, String> {
-        let mut results = Vec::new();
-        for grain in self.routed_grains(query)? {
-            results.extend(grain.scan(query, top_k)?);
-        }
-        results.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        results.truncate(top_k);
-        Ok(results)
+        self.search_internal(query, top_k, self.rerank_factor)
     }
 
     pub fn search_with_nprobe(
@@ -311,21 +336,129 @@ impl AperonIndex {
         top_k: usize,
         nprobe: usize,
     ) -> Result<Vec<ScoredVector>, String> {
-        let mut routes = self.route(query)?;
-        let probe_count = nprobe.max(1).min(routes.len());
-        routes.truncate(probe_count);
+        self.search_with_nprobe_internal(query, top_k, nprobe, self.rerank_factor)
+    }
 
-        let mut results = Vec::new();
-        for route in routes {
-            results.extend(self.grains[route].scan(query, top_k)?);
+    pub fn search_internal(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        rerank_factor: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        if rerank_factor == 0 {
+            let mut results = Vec::new();
+            for grain in self.routed_grains(query)? {
+                results.extend(grain.scan(query, top_k)?);
+            }
+            results.sort_by(|a, b| {
+                a.distance
+                    .total_cmp(&b.distance)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            results.truncate(top_k);
+            return Ok(results);
         }
-        results.sort_by(|a, b| {
+
+        let scan_k = top_k * rerank_factor;
+        let mut candidates = Vec::new();
+        for grain in self.routed_grains(query)? {
+            candidates.extend(grain.scan(query, scan_k)?);
+        }
+
+        candidates.sort_by_key(|c| c.id);
+        candidates.dedup_by_key(|c| c.id);
+
+        let mut reranked = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let dist = self.rerank_distance(query, candidate.id)?;
+            reranked.push(ScoredVector {
+                id: candidate.id,
+                distance: dist,
+            });
+        }
+
+        reranked.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        results.truncate(top_k);
-        Ok(results)
+        reranked.truncate(top_k);
+        Ok(reranked)
+    }
+
+    pub fn search_with_nprobe_internal(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        nprobe: usize,
+        rerank_factor: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        if rerank_factor == 0 {
+            let mut routes = self.route(query)?;
+            let probe_count = nprobe.max(1).min(routes.len());
+            routes.truncate(probe_count);
+
+            let mut results = Vec::new();
+            for route in routes {
+                results.extend(self.grains[route].scan(query, top_k)?);
+            }
+            results.sort_by(|a, b| {
+                a.distance
+                    .total_cmp(&b.distance)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            results.truncate(top_k);
+            return Ok(results);
+        }
+
+        let mut routes = self.route(query)?;
+        let probe_count = nprobe.max(1).min(routes.len());
+        routes.truncate(probe_count);
+
+        let scan_k = top_k * rerank_factor;
+        let mut candidates = Vec::new();
+        for route in routes {
+            candidates.extend(self.grains[route].scan(query, scan_k)?);
+        }
+
+        candidates.sort_by_key(|c| c.id);
+        candidates.dedup_by_key(|c| c.id);
+
+        let mut reranked = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let dist = self.rerank_distance(query, candidate.id)?;
+            reranked.push(ScoredVector {
+                id: candidate.id,
+                distance: dist,
+            });
+        }
+
+        reranked.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+            });
+        reranked.truncate(top_k);
+        Ok(reranked)
+    }
+
+    fn rerank_distance(&self, query: &[f32], id: VectorId) -> Result<f64, String> {
+        if !self.raw_vectors.is_empty() {
+            if let Some(&idx) = self.id_to_index.get(&id) {
+                let raw_vec = &self.raw_vectors[idx];
+                return Ok(l2_squared(query, raw_vec).unwrap_or(f32::INFINITY) as f64);
+            }
+        }
+
+        if let Some(&(g_idx, ord)) = self.vector_locations.get(&id) {
+            let grain = &self.grains[g_idx];
+            let recon = grain.reconstruct(ord)?;
+            let remaining = grain.residual_norm_sq(ord)?;
+            let dist = l2_squared(query, &recon).unwrap_or(f32::INFINITY);
+            return Ok((dist + remaining) as f64);
+        }
+
+        Err(format!("VectorId {:?} location not found for reranking", id))
     }
 
     fn routed_grains(&self, query: &[f32]) -> Result<Vec<&Grain>, String> {
@@ -417,6 +550,7 @@ impl AperonIndex {
         self.centroids.push(split.centroid1);
         self.grain_ids.push(ids1);
 
+        self.update_vector_locations();
         Ok(())
     }
 
@@ -508,7 +642,7 @@ fn k_means(vectors: &[Vec<f32>], dim: usize, k: usize) -> KMeansSplit {
     let mut assignments = vec![usize::MAX; vectors.len()];
 
     for _ in 0..20 {
-        let next = assign_to_centroids(vectors, &centroids);
+        let next = assign_to_centroids_balanced(vectors, &centroids);
         let updated = recompute_centroids(vectors, dim, &next, &centroids);
         let converged = next == assignments;
         assignments = next;
@@ -564,22 +698,64 @@ fn seed_centroids(vectors: &[Vec<f32>], dim: usize, k: usize) -> Vec<Vec<f32>> {
     centroids
 }
 
-fn assign_to_centroids(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
-    vectors
-        .iter()
-        .map(|vector| {
-            centroids
-                .iter()
-                .enumerate()
-                .map(|(idx, centroid)| {
-                    let distance = l2_squared(vector, centroid).unwrap_or(f32::INFINITY);
-                    (idx, distance)
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0)
-        })
-        .collect()
+fn assign_to_centroids_balanced(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
+    let n = vectors.len();
+    let k = centroids.len();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+
+    let mut vec_centroid_dists = vec![Vec::with_capacity(k); n];
+    let mut regret_indices = (0..n).collect::<Vec<usize>>();
+    let mut regrets = vec![0.0_f32; n];
+
+    for i in 0..n {
+        let v = &vectors[i];
+        for j in 0..k {
+            let dist = l2_squared(v, &centroids[j]).unwrap_or(f32::INFINITY);
+            vec_centroid_dists[i].push((j, dist));
+        }
+        vec_centroid_dists[i].sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        let r = if k > 1 {
+            vec_centroid_dists[i][1].1 - vec_centroid_dists[i][0].1
+        } else {
+            0.0
+        };
+        regrets[i] = r;
+    }
+
+    regret_indices.sort_by(|&a, &b| regrets[b].total_cmp(&regrets[a]));
+
+    let cap = ((n as f32 / k as f32) * 1.3).ceil() as usize;
+    let mut assignments = vec![usize::MAX; n];
+    let mut centroid_counts = vec![0_usize; k];
+
+    for idx in regret_indices {
+        let mut assigned = false;
+        for &(c_idx, _) in &vec_centroid_dists[idx] {
+            if centroid_counts[c_idx] < cap {
+                assignments[idx] = c_idx;
+                centroid_counts[c_idx] += 1;
+                assigned = true;
+                break;
+            }
+        }
+        if !assigned {
+            let mut best_c = 0;
+            let mut min_count = usize::MAX;
+            for c_idx in 0..k {
+                if centroid_counts[c_idx] < min_count {
+                    min_count = centroid_counts[c_idx];
+                    best_c = c_idx;
+                }
+            }
+            assignments[idx] = best_c;
+            centroid_counts[best_c] += 1;
+        }
+    }
+
+    assignments
 }
 
 fn recompute_centroids(
@@ -783,5 +959,39 @@ mod tests {
         let stats = index.stats();
         assert_eq!(stats.vectors, 4);
         assert_eq!(stats.grains, 2);
+    }
+
+    #[test]
+    fn search_with_rerank_improves_accuracy_on_loaded_index() {
+        let mut index = AperonIndex::with_options(3, 2, 1, 4);
+        index.insert(1, [0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, [10.0, 0.0, 0.0]).unwrap();
+        index.insert(3, [0.0, 10.0, 0.0]).unwrap();
+        index.rebuild_single_grain().unwrap();
+
+        let legacy = index.to_legacy_index().unwrap();
+        let loaded = AperonIndex::from_legacy_index(legacy).unwrap();
+
+        // 1. Search with rerank factor = 0 (no rerank, quantized integer/distance units)
+        let mut loaded_no_rerank = loaded.clone();
+        loaded_no_rerank.set_rerank_factor(0);
+        let results_no_rerank = loaded_no_rerank.search(&[9.0, 0.0, 0.0], 2).unwrap();
+
+        // 2. Search with rerank factor = 4 (uses reconstructed vectors in float32 L2 space)
+        let mut loaded_rerank = loaded.clone();
+        loaded_rerank.set_rerank_factor(4);
+        let results_rerank = loaded_rerank.search(&[9.0, 0.0, 0.0], 2).unwrap();
+
+        assert_eq!(results_no_rerank.len(), 2);
+        assert_eq!(results_rerank.len(), 2);
+
+        assert_eq!(results_no_rerank[0].id, VectorId::new(2));
+        assert_eq!(results_rerank[0].id, VectorId::new(2));
+
+        // The rerank distance should be closer to the exact float32 L2 distance
+        // exact L2 distance squared from [9.0, 0.0, 0.0] to [10.0, 0.0, 0.0] is 1.0.
+        // The reconstructed vector will be close to [10.0, 0.0, 0.0].
+        let rerank_dist = results_rerank[0].distance;
+        assert!((rerank_dist - 1.0).abs() < 1.0, "rerank distance {} not close to 1.0", rerank_dist);
     }
 }

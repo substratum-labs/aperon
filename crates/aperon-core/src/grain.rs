@@ -403,6 +403,79 @@ impl Grain {
             .map(|scale| scaled_weight(f64::from(*scale) * f64::from(*scale), unit, 8_388_607))
             .collect();
     }
+
+    pub fn reconstruct(&self, ordinal: usize) -> Result<Vec<f32>, String> {
+        if ordinal >= self.len() {
+            return Err(format!("ordinal {} out of bounds", ordinal));
+        }
+        let block = ordinal / self.block_size();
+        let lane = ordinal % self.block_size();
+
+        let local_dim = self.local_dim();
+        let sketch_dim = self.sketch_dim();
+        let source_dim = self.source_dim;
+
+        // 1. Unquantize coords: z_i
+        let mut z = vec![0.0_f32; local_dim];
+        for k in 0..local_dim {
+            let coord_q = self.layout.coord(block, k, lane);
+            z[k] = coord_q as f32 * self.proj_scales[k];
+        }
+
+        // 2. Unquantize sketches: s_i
+        let mut s = vec![0.0_f32; sketch_dim];
+        for m in 0..sketch_dim {
+            let sketch_q = self.layout.sketch(block, m, lane);
+            s[m] = sketch_q as f32 * self.sketch_scales[m];
+        }
+
+        // 3. Reconstruct: mean + W_g * z_i + W_s * s_i
+        let mut recon = self.mean.clone();
+
+        // Add projection part W_g * z_i
+        for d in 0..source_dim {
+            let mut val = 0.0_f32;
+            for k in 0..local_dim {
+                val += z[k] * self.projection[d * local_dim + k];
+            }
+            recon[d] += val;
+        }
+
+        // Add sketch part W_s * s_i
+        if sketch_dim > 0 {
+            for d in 0..source_dim {
+                let mut val = 0.0_f32;
+                for m in 0..sketch_dim {
+                    val += s[m] * self.sketch_projection[d * sketch_dim + m];
+                }
+                recon[d] += val;
+            }
+        }
+
+        Ok(recon)
+    }
+
+    pub fn residual_norm_sq(&self, ordinal: usize) -> Result<f32, String> {
+        if ordinal >= self.len() {
+            return Err(format!("ordinal {} out of bounds", ordinal));
+        }
+        let block = ordinal / self.block_size();
+        let lane = ordinal % self.block_size();
+
+        let residual_q = self.layout.residual(block, lane);
+        let total_residual_norm_sq = residual_q as f32 * self.residual_scale;
+
+        let sketch_dim = self.sketch_dim();
+        let mut sketch_norm_sq = 0.0_f32;
+        for m in 0..sketch_dim {
+            let sketch_q = self.layout.sketch(block, m, lane);
+            let s_val = sketch_q as f32 * self.sketch_scales[m];
+            sketch_norm_sq += s_val * s_val;
+        }
+
+        let remaining = (total_residual_norm_sq - sketch_norm_sq).max(0.0);
+        Ok(remaining)
+    }
 }
 
 fn expect_len<T>(slice: &[T], expected: usize, name: &str) -> Result<(), String> {
@@ -632,5 +705,22 @@ mod tests {
 
         assert!(grain.projection[0].abs() > 0.99);
         assert!(grain.projection[1].abs() < 0.01);
+    }
+
+    #[test]
+    fn reconstructs_inserted_vectors_accurately() {
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![10.0, -2.0, 1.5],
+            vec![-3.0, 4.0, 8.2],
+        ];
+        let ids = vec![VectorId::new(1), VectorId::new(2), VectorId::new(3)];
+        let grain = Grain::build(GrainId::new(0), &vectors, &ids, 3, 2, 1, 4).unwrap();
+
+        for i in 0..vectors.len() {
+            let recon = grain.reconstruct(i).unwrap();
+            let dist = crate::distance::l2_squared(&vectors[i], &recon).unwrap().sqrt();
+            assert!(dist < 2.0, "reconstruction error too high: {}", dist);
+        }
     }
 }

@@ -2,3 +2,5 @@
 .DS_Store
 *.profraw
 *.profdata
+/benchmarks/data/
+.venv/

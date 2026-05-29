@@ -82,11 +82,15 @@ fn query(args: &[String]) -> Result<(), String> {
     let queries_path = flags.required_path("--queries")?;
     let top_k = flags.optional_usize("--top-k")?.unwrap_or(10);
     let nprobe = flags.optional_usize("--nprobe")?;
+    let rerank_factor = flags.optional_usize("--rerank-factor")?;
     flags.finish()?;
 
     let legacy =
         load_legacy_index(File::open(&index_path).map_err(format_io)?).map_err(format_io)?;
-    let index = AperonIndex::from_legacy_index(legacy)?;
+    let mut index = AperonIndex::from_legacy_index(legacy)?;
+    if let Some(rf) = rerank_factor {
+        index.set_rerank_factor(rf);
+    }
     let queries = load_queries(File::open(&queries_path).map_err(format_io)?).map_err(format_io)?;
     if queries.dimension as usize != index.dim() {
         return Err(format!(
@@ -138,11 +142,15 @@ fn eval(args: &[String]) -> Result<(), String> {
     let queries_path = flags.required_path("--queries")?;
     let top_k = flags.optional_usize("--top-k")?.unwrap_or(10);
     let nprobe = flags.optional_usize("--nprobe")?;
+    let rerank_factor = flags.optional_usize("--rerank-factor")?;
     flags.finish()?;
 
     let legacy =
         load_legacy_index(File::open(&index_path).map_err(format_io)?).map_err(format_io)?;
-    let index = AperonIndex::from_legacy_index(legacy)?;
+    let mut index = AperonIndex::from_legacy_index(legacy)?;
+    if let Some(rf) = rerank_factor {
+        index.set_rerank_factor(rf);
+    }
     let raw = load_raw_vectors(File::open(&vectors_path).map_err(format_io)?).map_err(format_io)?;
     let queries = load_queries(File::open(&queries_path).map_err(format_io)?).map_err(format_io)?;
 
@@ -331,8 +339,8 @@ fn usage() -> String {
     [
         "usage:",
         "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--block-size N]",
-        "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N]",
-        "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N]",
+        "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
+        "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
     ]
     .join("\n")
 }
