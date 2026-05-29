@@ -312,7 +312,8 @@ impl AperonIndex {
         nprobe: usize,
     ) -> Result<Vec<ScoredVector>, String> {
         let mut routes = self.route(query)?;
-        routes.truncate(nprobe.max(1));
+        let probe_count = nprobe.max(1).min(routes.len());
+        routes.truncate(probe_count);
 
         let mut results = Vec::new();
         for route in routes {
@@ -420,10 +421,13 @@ impl AperonIndex {
     }
 
     pub fn stats(&self) -> IndexStats {
+        let grain_sizes = self.grains.iter().map(Grain::len).collect::<Vec<_>>();
+        let vectors = grain_sizes.iter().sum();
         IndexStats {
             dim: self.dim,
             grains: self.grains.len(),
-            vectors: self.grains.iter().map(Grain::len).sum(),
+            vectors,
+            grain_sizes,
         }
     }
 
@@ -478,11 +482,12 @@ impl AperonIndex {
 }
 
 /// Small status snapshot exposed by the core crate and CLI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexStats {
     pub dim: usize,
     pub grains: usize,
     pub vectors: usize,
+    pub grain_sizes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -746,8 +751,25 @@ mod tests {
         let stats = index.stats();
         assert_eq!(stats.grains, 4);
         assert_eq!(stats.vectors, 8);
+        assert_eq!(stats.grain_sizes, vec![2, 2, 2, 2]);
         let results = index.search_with_nprobe(&[200.2, 200.0], 1, 1).unwrap();
         assert_eq!(results[0].id, VectorId::new(20));
+    }
+
+    #[test]
+    fn search_with_nprobe_clamps_to_available_grains() {
+        let mut index = AperonIndex::with_options(2, 2, 0, 2);
+        for cluster in 0..4 {
+            let base = cluster as f32 * 100.0;
+            index.insert(cluster * 10, [base, base]).unwrap();
+            index.insert(cluster * 10 + 1, [base + 1.0, base]).unwrap();
+        }
+        index.rebuild_n_grains(4).unwrap();
+
+        let all_routes = index.search(&[200.2, 200.0], 3).unwrap();
+        let clamped = index.search_with_nprobe(&[200.2, 200.0], 3, 999).unwrap();
+
+        assert_eq!(clamped, all_routes);
     }
 
     #[test]

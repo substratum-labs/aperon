@@ -120,6 +120,7 @@ impl PyAperonIndex {
         out.set_item("dim", stats.dim)?;
         out.set_item("grains", stats.grains)?;
         out.set_item("vectors", stats.vectors)?;
+        out.set_item("grain_sizes", stats.grain_sizes)?;
         Ok(out)
     }
 
@@ -239,6 +240,45 @@ mod tests {
                     .extract::<usize>()
                     .unwrap(),
                 1
+            );
+            assert_eq!(
+                stats
+                    .get_item("grain_sizes")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<Vec<usize>>()
+                    .unwrap(),
+                vec![1]
+            );
+        });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn stats_returns_python_grain_sizes_for_multi_grain_index() {
+        pyo3::prepare_freethreaded_python();
+        let mut index = PyAperonIndex::new(2, Some(2), 0, 2);
+        Python::with_gil(|py| {
+            for cluster in 0..4 {
+                let base = cluster as f32 * 100.0;
+                for offset in 0..2 {
+                    let id = ((cluster * 10 + offset) as u64).into_pyobject(py).unwrap();
+                    let vector = vec![base + offset as f32, base].into_pyobject(py).unwrap();
+                    index.insert(id.as_any(), Some(vector.as_any())).unwrap();
+                }
+            }
+            index.rebuild_n_grains(4).unwrap();
+
+            let stats = index.stats(py).unwrap();
+
+            assert_eq!(
+                stats
+                    .get_item("grain_sizes")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<Vec<usize>>()
+                    .unwrap(),
+                vec![2, 2, 2, 2]
             );
         });
     }
