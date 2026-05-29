@@ -37,7 +37,8 @@ Rust port of the validated compact scan path:
 - HNTR/HNTQ/HNTL/HNTM binary format loaders;
 - `aperon build`, `aperon query`, and `aperon eval` CLI workflows for
   HNTR/HNTQ/HNTL files, including brute-force Recall@K evaluation;
-- PyO3 bindings for insert, rebuild, split configuration, search, and stats.
+- PyO3 bindings for insert, rebuild, split configuration, search, dict stats,
+  and save/load.
 
 Next up (roadmap):
-- **T-128** — Python API improvements
+- Python packaging and API polish beyond the core T-128 surface

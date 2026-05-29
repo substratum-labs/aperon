@@ -1,5 +1,5 @@
 use crate::{
-    binary::{LegacyIndex, LegacySingleGrain},
+    binary::{LegacyIndex, LegacyMultiGrain, LegacySingleGrain},
     distance::l2_squared,
     grain::ScoredVector,
     Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
@@ -383,7 +383,36 @@ impl AperonIndex {
     /// for serialisation. Returns `None` if no grain has been built yet.
     pub fn to_legacy_single(&self) -> Option<LegacySingleGrain> {
         let grain = self.grains.first()?;
-        Some(LegacySingleGrain {
+        Some(self.legacy_single_for_grain(grain))
+    }
+
+    pub fn to_legacy_index(&self) -> Option<LegacyIndex> {
+        if self.grains.len() <= 1 {
+            return self.to_legacy_single().map(LegacyIndex::Single);
+        }
+
+        Some(LegacyIndex::Multi(LegacyMultiGrain {
+            num_centroids: self.centroids.len() as u32,
+            num_vectors: self.grains.iter().map(Grain::len).sum::<usize>() as u32,
+            dimension: self.dim as u32,
+            local_dim: self.local_dim as u32,
+            block_size: self.block_size as u32,
+            sketch_dim: self.sketch_dim as u32,
+            centroids: self
+                .centroids
+                .iter()
+                .flat_map(|centroid| centroid.iter().copied())
+                .collect(),
+            grains: self
+                .grains
+                .iter()
+                .map(|grain| self.legacy_single_for_grain(grain))
+                .collect(),
+        }))
+    }
+
+    fn legacy_single_for_grain(&self, grain: &Grain) -> LegacySingleGrain {
+        LegacySingleGrain {
             num_vectors: grain.len() as u32,
             dimension: self.dim as u32,
             local_dim: grain.local_dim() as u32,
@@ -396,7 +425,7 @@ impl AperonIndex {
             sketch_projection: grain.sketch_projection().to_vec(),
             sketch_scales: grain.sketch_scales().to_vec(),
             block_data: grain.raw_block_bytes(),
-        })
+        }
     }
 }
 
@@ -517,6 +546,25 @@ mod tests {
         assert_eq!(stats.grains, 2);
 
         let results = index.search_with_nprobe(&[100.2, 100.0], 1, 1).unwrap();
+        assert_eq!(results[0].id, VectorId::new(10));
+    }
+
+    #[test]
+    fn exports_multi_grain_legacy_index() {
+        let mut index = AperonIndex::with_options(2, 2, 0, 4);
+        index.insert(1, [0.0, 0.0]).unwrap();
+        index.insert(2, [1.0, 0.0]).unwrap();
+        index.insert(10, [100.0, 100.0]).unwrap();
+        index.insert(11, [101.0, 100.0]).unwrap();
+        index.rebuild_two_grains().unwrap();
+
+        let legacy = index.to_legacy_index().unwrap();
+        let loaded = AperonIndex::from_legacy_index(legacy).unwrap();
+
+        let stats = loaded.stats();
+        assert_eq!(stats.grains, 2);
+        assert_eq!(stats.vectors, 4);
+        let results = loaded.search_with_nprobe(&[100.2, 100.0], 1, 1).unwrap();
         assert_eq!(results[0].id, VectorId::new(10));
     }
 
