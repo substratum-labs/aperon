@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 
-pub const LEGACY_VERSION: u32 = 1;
+pub const LEGACY_VERSION: u32 = 3;
+pub const MIN_SUPPORTED_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawVectors {
@@ -23,6 +24,7 @@ pub struct LegacySingleGrain {
     pub local_dim: u32,
     pub block_size: u32,
     pub sketch_dim: u32,
+    pub residual_bits: u8,
     pub mean: Vec<f32>,
     pub projection: Vec<f32>,
     pub proj_scales: Vec<f32>,
@@ -40,6 +42,7 @@ pub struct LegacyMultiGrain {
     pub local_dim: u32,
     pub block_size: u32,
     pub sketch_dim: u32,
+    pub residual_bits: u8,
     pub centroids: Vec<f32>,
     pub grains: Vec<LegacySingleGrain>,
 }
@@ -89,18 +92,25 @@ pub fn load_legacy_index(mut reader: impl Read) -> io::Result<LegacyIndex> {
 }
 
 fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain> {
-    expect_version(reader)?;
+    let version = read_supported_version(reader)?;
     let num_centroids = read_u32(reader)?;
     let num_vectors = read_u32(reader)?;
     let dimension = read_u32(reader)?;
     let local_dim = read_u32(reader)?;
     let block_size = read_u32(reader)?;
     let sketch_dim = read_u32(reader)?;
+    let residual_bits = if version >= 2 { read_u8(reader)? } else { 8 };
     let centroids = read_f32_vec(reader, num_centroids as usize * dimension as usize)?;
     let mut grains = Vec::with_capacity(num_centroids as usize);
     for _ in 0..num_centroids {
         grains.push(read_embedded_single(
-            reader, dimension, local_dim, block_size, sketch_dim,
+            reader,
+            version,
+            dimension,
+            local_dim,
+            block_size,
+            sketch_dim,
+            residual_bits,
         )?);
     }
     Ok(LegacyMultiGrain {
@@ -110,18 +120,20 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
         local_dim,
         block_size,
         sketch_dim,
+        residual_bits,
         centroids,
         grains,
     })
 }
 
 fn read_single_after_magic(reader: &mut impl Read) -> io::Result<LegacySingleGrain> {
-    expect_version(reader)?;
+    let version = read_supported_version(reader)?;
     let num_vectors = read_u32(reader)?;
     let dimension = read_u32(reader)?;
     let local_dim = read_u32(reader)?;
     let block_size = read_u32(reader)?;
     let sketch_dim = read_u32(reader)?;
+    let residual_bits = if version >= 2 { read_u8(reader)? } else { 8 };
     read_single_body(
         reader,
         num_vectors,
@@ -129,17 +141,30 @@ fn read_single_after_magic(reader: &mut impl Read) -> io::Result<LegacySingleGra
         local_dim,
         block_size,
         sketch_dim,
+        residual_bits,
     )
 }
 
 fn read_embedded_single(
     reader: &mut impl Read,
+    version: u32,
     dimension: u32,
     local_dim: u32,
     block_size: u32,
     sketch_dim: u32,
+    residual_bits: u8,
 ) -> io::Result<LegacySingleGrain> {
     let num_vectors = read_u32(reader)?;
+    let (local_dim, block_size, sketch_dim, residual_bits) = if version >= 3 {
+        (
+            read_u32(reader)?,
+            read_u32(reader)?,
+            read_u32(reader)?,
+            read_u8(reader)?,
+        )
+    } else {
+        (local_dim, block_size, sketch_dim, residual_bits)
+    };
     read_single_body(
         reader,
         num_vectors,
@@ -147,6 +172,7 @@ fn read_embedded_single(
         local_dim,
         block_size,
         sketch_dim,
+        residual_bits,
     )
 }
 
@@ -157,10 +183,12 @@ fn read_single_body(
     local_dim: u32,
     block_size: u32,
     sketch_dim: u32,
+    residual_bits: u8,
 ) -> io::Result<LegacySingleGrain> {
     validate_nonzero(dimension, "dimension")?;
     validate_nonzero(local_dim, "local_dim")?;
     validate_nonzero(block_size, "block_size")?;
+    validate_residual_bits(residual_bits)?;
     let mean = read_f32_vec(reader, dimension as usize)?;
     let projection = read_f32_vec(reader, dimension as usize * local_dim as usize)?;
     let proj_scales = read_f32_vec(reader, local_dim as usize)?;
@@ -175,10 +203,8 @@ fn read_single_body(
     };
     let num_blocks = num_vectors.div_ceil(block_size);
     let block_bytes = block_size as usize
-        * (local_dim as usize * size_of::<i16>()
-            + size_of::<u16>()
-            + size_of::<u32>()
-            + sketch_dim as usize * size_of::<i8>());
+        * (local_dim as usize * size_of::<i16>() + size_of::<u16>() + size_of::<u32>())
+        + packed_bytes(sketch_dim as usize * block_size as usize, residual_bits);
     let mut block_data = vec![0; num_blocks as usize * block_bytes];
     reader.read_exact(&mut block_data)?;
     Ok(LegacySingleGrain {
@@ -187,6 +213,7 @@ fn read_single_body(
         local_dim,
         block_size,
         sketch_dim,
+        residual_bits,
         mean,
         projection,
         proj_scales,
@@ -212,16 +239,20 @@ fn expect_magic(reader: &mut impl Read, expected: &[u8; 4]) -> io::Result<()> {
     }
 }
 
-fn expect_version(reader: &mut impl Read) -> io::Result<()> {
+fn read_supported_version(reader: &mut impl Read) -> io::Result<u32> {
     let version = read_u32(reader)?;
-    if version == LEGACY_VERSION {
-        Ok(())
+    if (MIN_SUPPORTED_VERSION..=LEGACY_VERSION).contains(&version) {
+        Ok(version)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported legacy version",
         ))
     }
+}
+
+fn expect_version(reader: &mut impl Read) -> io::Result<()> {
+    read_supported_version(reader).map(|_| ())
 }
 
 fn validate_nonzero(value: u32, name: &str) -> io::Result<()> {
@@ -235,10 +266,31 @@ fn validate_nonzero(value: u32, name: &str) -> io::Result<()> {
     }
 }
 
+fn validate_residual_bits(bits: u8) -> io::Result<()> {
+    if matches!(bits, 1 | 2 | 8) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "residual_bits must be 1, 2, or 8",
+        ))
+    }
+}
+
+fn packed_bytes(values: usize, bits: u8) -> usize {
+    (values * bits as usize).div_ceil(8)
+}
+
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
     let mut bytes = [0; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
+    let mut bytes = [0; 1];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes[0])
 }
 
 fn read_f32(reader: &mut impl Read) -> io::Result<f32> {
@@ -283,6 +335,7 @@ pub fn write_legacy_index(mut writer: impl Write, index: &LegacyIndex) -> io::Re
             write_u32(&mut writer, single.local_dim)?;
             write_u32(&mut writer, single.block_size)?;
             write_u32(&mut writer, single.sketch_dim)?;
+            write_u8(&mut writer, single.residual_bits)?;
             write_single_body(&mut writer, single)
         }
         LegacyIndex::Multi(multi) => {
@@ -294,6 +347,7 @@ pub fn write_legacy_index(mut writer: impl Write, index: &LegacyIndex) -> io::Re
             write_u32(&mut writer, multi.local_dim)?;
             write_u32(&mut writer, multi.block_size)?;
             write_u32(&mut writer, multi.sketch_dim)?;
+            write_u8(&mut writer, multi.residual_bits)?;
             write_f32_vec(&mut writer, &multi.centroids)?;
             for grain in &multi.grains {
                 write_embedded_single(&mut writer, grain)?
@@ -319,11 +373,19 @@ fn write_single_body(writer: &mut impl Write, g: &LegacySingleGrain) -> io::Resu
 /// Write a grain embedded inside a multi-grain index: num_vectors first, then the body.
 fn write_embedded_single(writer: &mut impl Write, g: &LegacySingleGrain) -> io::Result<()> {
     write_u32(writer, g.num_vectors)?;
+    write_u32(writer, g.local_dim)?;
+    write_u32(writer, g.block_size)?;
+    write_u32(writer, g.sketch_dim)?;
+    write_u8(writer, g.residual_bits)?;
     write_single_body(writer, g)
 }
 
 fn write_u32(writer: &mut impl Write, v: u32) -> io::Result<()> {
     writer.write_all(&v.to_le_bytes())
+}
+
+fn write_u8(writer: &mut impl Write, v: u8) -> io::Result<()> {
+    writer.write_all(&[v])
 }
 
 fn write_f32(writer: &mut impl Write, v: f32) -> io::Result<()> {
@@ -429,6 +491,7 @@ mod tests {
             local_dim,
             block_size,
             sketch_dim,
+            residual_bits: 8,
             mean: vec![0.0_f32; dimension as usize],
             projection: vec![1.0_f32; dimension as usize * local_dim as usize],
             proj_scales: vec![1.0_f32; local_dim as usize],

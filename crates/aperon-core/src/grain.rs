@@ -1,10 +1,11 @@
 use crate::binary::LegacySingleGrain;
-use crate::layout::{BlockSoaLayout, VectorId};
+use crate::layout::{BlockSoaLayout, VectorId, DEFAULT_RESIDUAL_BITS};
 use crate::quantization::{
     quantize_i16, quantize_i8, quantize_u16, scale_for_i16, scale_for_i8, scale_for_u16,
     scaled_weight,
 };
 use crate::scan::{scan_block_into, ScanWeights};
+use std::mem::size_of;
 
 /// Stable identifier for a local Aperon grain.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -32,6 +33,7 @@ pub struct Grain {
     residual_scale: f32,
     sketch_projection: Vec<f32>,
     sketch_scales: Vec<f32>,
+    residual_bits: u8,
     distance_unit: f64,
     coord_weights: Vec<i64>,
     residual_weight: i64,
@@ -50,6 +52,7 @@ impl Grain {
             residual_scale: 1.0,
             sketch_projection: Vec::new(),
             sketch_scales: Vec::new(),
+            residual_bits: DEFAULT_RESIDUAL_BITS,
             distance_unit: 1.0,
             coord_weights: vec![1; dim],
             residual_weight: 1,
@@ -66,9 +69,33 @@ impl Grain {
         sketch_dim: usize,
         block_size: usize,
     ) -> Result<Self, String> {
+        Self::build_with_residual_bits(
+            id,
+            vectors,
+            ids,
+            source_dim,
+            local_dim,
+            sketch_dim,
+            block_size,
+            DEFAULT_RESIDUAL_BITS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_residual_bits(
+        id: GrainId,
+        vectors: &[Vec<f32>],
+        ids: &[VectorId],
+        source_dim: usize,
+        local_dim: usize,
+        sketch_dim: usize,
+        block_size: usize,
+        residual_bits: u8,
+    ) -> Result<Self, String> {
         if vectors.len() != ids.len() {
             return Err("vectors and ids length mismatch".to_string());
         }
+        crate::layout::validate_residual_bits(residual_bits)?;
         for vector in vectors {
             if vector.len() != source_dim {
                 return Err(format!(
@@ -118,14 +145,23 @@ impl Grain {
             let abs_max = (0..vectors.len())
                 .map(|i| sketches[i * sketch_dim + m].abs())
                 .fold(0.0_f32, f32::max);
-            let scale = scale_for_i8(abs_max);
+            let scale = scale_for_residual_bits(abs_max, residual_bits);
             sketch_scales[m] = scale;
             for i in 0..vectors.len() {
-                qsketches[i * sketch_dim + m] = quantize_i8(sketches[i * sketch_dim + m], scale);
+                qsketches[i * sketch_dim + m] = quantize_residual_bits(
+                    sketches[i * sketch_dim + m],
+                    sketch_scales[m],
+                    residual_bits,
+                );
             }
         }
 
-        let mut layout = BlockSoaLayout::with_shape(local_dim, sketch_dim, block_size);
+        let mut layout = BlockSoaLayout::with_shape_and_residual_bits(
+            local_dim,
+            sketch_dim,
+            block_size,
+            residual_bits,
+        );
         for i in 0..vectors.len() {
             let coord_start = i * local_dim;
             let sketch_start = i * sketch_dim;
@@ -147,6 +183,7 @@ impl Grain {
             residual_scale,
             sketch_projection,
             sketch_scales,
+            residual_bits,
             distance_unit: 1.0,
             coord_weights: Vec::new(),
             residual_weight: 1,
@@ -178,6 +215,7 @@ impl Grain {
         let layout = BlockSoaLayout::from_raw_block_bytes(
             local_dim,
             sketch_dim,
+            legacy.residual_bits,
             block_size,
             legacy.num_vectors as usize,
             &legacy.block_data,
@@ -192,6 +230,7 @@ impl Grain {
             residual_scale: legacy.residual_scale,
             sketch_projection: legacy.sketch_projection,
             sketch_scales: legacy.sketch_scales,
+            residual_bits: legacy.residual_bits,
             distance_unit: 1.0,
             coord_weights: Vec::new(),
             residual_weight: 1,
@@ -253,9 +292,23 @@ impl Grain {
         &self.sketch_scales
     }
 
+    pub fn residual_bits(&self) -> u8 {
+        self.residual_bits
+    }
+
     /// Serialize the block data to the on-disk wire format.
     pub fn raw_block_bytes(&self) -> Vec<u8> {
         self.layout.raw_block_bytes()
+    }
+
+    pub fn encoded_bytes(&self) -> usize {
+        self.layout.raw_block_bytes().len()
+            + self.mean.len() * size_of::<f32>()
+            + self.projection.len() * size_of::<f32>()
+            + self.proj_scales.len() * size_of::<f32>()
+            + size_of::<f32>()
+            + self.sketch_projection.len() * size_of::<f32>()
+            + self.sketch_scales.len() * size_of::<f32>()
     }
 
     pub fn vector_ids(&self) -> &[VectorId] {
@@ -354,7 +407,7 @@ impl Grain {
         let sketches = sketch_values
             .iter()
             .zip(&self.sketch_scales)
-            .map(|(value, scale)| quantize_i8(*value, *scale))
+            .map(|(value, scale)| quantize_residual_bits(*value, *scale, self.residual_bits))
             .collect::<Vec<_>>();
 
         Ok(QueryProjection {
@@ -417,38 +470,38 @@ impl Grain {
 
         // 1. Unquantize coords: z_i
         let mut z = vec![0.0_f32; local_dim];
-        for k in 0..local_dim {
+        for (k, value) in z.iter_mut().enumerate() {
             let coord_q = self.layout.coord(block, k, lane);
-            z[k] = coord_q as f32 * self.proj_scales[k];
+            *value = coord_q as f32 * self.proj_scales[k];
         }
 
         // 2. Unquantize sketches: s_i
         let mut s = vec![0.0_f32; sketch_dim];
-        for m in 0..sketch_dim {
+        for (m, value) in s.iter_mut().enumerate() {
             let sketch_q = self.layout.sketch(block, m, lane);
-            s[m] = sketch_q as f32 * self.sketch_scales[m];
+            *value = sketch_q as f32 * self.sketch_scales[m];
         }
 
         // 3. Reconstruct: mean + W_g * z_i + W_s * s_i
         let mut recon = self.mean.clone();
 
         // Add projection part W_g * z_i
-        for d in 0..source_dim {
+        for (d, recon_value) in recon.iter_mut().enumerate().take(source_dim) {
             let mut val = 0.0_f32;
-            for k in 0..local_dim {
-                val += z[k] * self.projection[d * local_dim + k];
+            for (k, z_value) in z.iter().enumerate() {
+                val += z_value * self.projection[d * local_dim + k];
             }
-            recon[d] += val;
+            *recon_value += val;
         }
 
         // Add sketch part W_s * s_i
         if sketch_dim > 0 {
-            for d in 0..source_dim {
+            for (d, recon_value) in recon.iter_mut().enumerate().take(source_dim) {
                 let mut val = 0.0_f32;
-                for m in 0..sketch_dim {
-                    val += s[m] * self.sketch_projection[d * sketch_dim + m];
+                for (m, s_value) in s.iter().enumerate() {
+                    val += s_value * self.sketch_projection[d * sketch_dim + m];
                 }
-                recon[d] += val;
+                *recon_value += val;
             }
         }
 
@@ -487,6 +540,54 @@ fn expect_len<T>(slice: &[T], expected: usize, name: &str) -> Result<(), String>
             expected,
             slice.len()
         ))
+    }
+}
+
+fn scale_for_residual_bits(abs_max: f32, bits: u8) -> f32 {
+    match bits {
+        1 => {
+            if abs_max > 0.0 {
+                abs_max
+            } else {
+                1.0
+            }
+        }
+        2 => {
+            if abs_max > 0.0 {
+                abs_max / 3.0
+            } else {
+                1.0
+            }
+        }
+        8 => scale_for_i8(abs_max),
+        _ => unreachable!("validated residual_bits"),
+    }
+}
+
+fn quantize_residual_bits(value: f32, scale: f32, bits: u8) -> i8 {
+    match bits {
+        1 => {
+            if value >= 0.0 {
+                1
+            } else {
+                -1
+            }
+        }
+        2 => {
+            let scaled = if scale > 0.0 { value / scale } else { value };
+            let rounded = scaled.round_ties_even().clamp(-3.0, 3.0);
+            if rounded < -2.0 {
+                -3
+            } else if rounded < 0.0 {
+                -1
+            } else if rounded < 2.0 {
+                1
+            } else {
+                3
+            }
+        }
+        8 => quantize_i8(value, scale),
+        _ => unreachable!("validated residual_bits"),
     }
 }
 
@@ -717,9 +818,9 @@ mod tests {
         let ids = vec![VectorId::new(1), VectorId::new(2), VectorId::new(3)];
         let grain = Grain::build(GrainId::new(0), &vectors, &ids, 3, 2, 1, 4).unwrap();
 
-        for i in 0..vectors.len() {
+        for (i, vector) in vectors.iter().enumerate() {
             let recon = grain.reconstruct(i).unwrap();
-            let dist = crate::distance::l2_squared(&vectors[i], &recon).unwrap().sqrt();
+            let dist = crate::distance::l2_squared(vector, &recon).unwrap().sqrt();
             assert!(dist < 2.0, "reconstruction error too high: {}", dist);
         }
     }

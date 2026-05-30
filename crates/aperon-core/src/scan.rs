@@ -48,6 +48,19 @@ pub(crate) fn scan_block_into(
     scores: &mut [i64],
 ) {
     assert!(scores.len() >= lanes, "score scratch is shorter than lanes");
+    if layout.residual_bits() != 8 {
+        scalar_scan_block_into(
+            layout,
+            block,
+            lanes,
+            query_coords,
+            query_residual,
+            query_sketches,
+            weights,
+            scores,
+        );
+        return;
+    }
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -152,10 +165,9 @@ pub(crate) fn scalar_scan_block_into(
         }
     }
     for (dim, (&query, &weight)) in query_sketches.iter().zip(weights.sketch).enumerate() {
-        let sketches = layout.sketch_block(block, dim);
-        for lane in 0..lanes {
-            let diff = i64::from(query) - i64::from(sketches[lane]);
-            scores[lane] += diff * diff * weight;
+        for (lane, score) in scores.iter_mut().enumerate().take(lanes) {
+            let diff = i64::from(query) - i64::from(layout.sketch(block, dim, lane));
+            *score += diff * diff * weight;
         }
     }
 }
@@ -386,10 +398,9 @@ fn add_scalar_sketch_tail(
     scores: &mut [i64],
 ) {
     for (dim, (&query, &weight)) in query_sketches.iter().zip(weights).enumerate() {
-        let sketches = layout.sketch_block(block, dim);
-        for lane in start..lanes {
-            let diff = i64::from(query) - i64::from(sketches[lane]);
-            scores[lane] += diff * diff * weight;
+        for (lane, score) in scores.iter_mut().enumerate().take(lanes).skip(start) {
+            let diff = i64::from(query) - i64::from(layout.sketch(block, dim, lane));
+            *score += diff * diff * weight;
         }
     }
 }

@@ -1,6 +1,7 @@
 /// Default block size for pointer-free structure-of-arrays storage.
 pub const DEFAULT_BLOCK_SIZE: usize = 64;
 pub const DUMMY_ID: u32 = u32::MAX;
+pub const DEFAULT_RESIDUAL_BITS: u8 = 8;
 
 /// Stable identifier for an original vector.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -35,11 +36,12 @@ impl VectorId {
 pub struct BlockSoaLayout {
     local_dim: usize,
     sketch_dim: usize,
+    residual_bits: u8,
     block_size: usize,
     ids: Vec<VectorId>,
     coords: Vec<i16>,
     residuals: Vec<u16>,
-    sketches: Vec<i8>,
+    sketches: Vec<u8>,
 }
 
 impl BlockSoaLayout {
@@ -48,10 +50,24 @@ impl BlockSoaLayout {
     }
 
     pub fn with_shape(local_dim: usize, sketch_dim: usize, block_size: usize) -> Self {
+        Self::with_shape_and_residual_bits(local_dim, sketch_dim, block_size, DEFAULT_RESIDUAL_BITS)
+    }
+
+    pub fn with_shape_and_residual_bits(
+        local_dim: usize,
+        sketch_dim: usize,
+        block_size: usize,
+        residual_bits: u8,
+    ) -> Self {
         assert!(block_size > 0, "block_size must be positive");
+        assert!(
+            matches!(residual_bits, 1 | 2 | 8),
+            "residual_bits must be 1, 2, or 8"
+        );
         Self {
             local_dim,
             sketch_dim,
+            residual_bits,
             block_size,
             ids: Vec::new(),
             coords: Vec::new(),
@@ -70,6 +86,10 @@ impl BlockSoaLayout {
 
     pub fn sketch_dim(&self) -> usize {
         self.sketch_dim
+    }
+
+    pub fn residual_bits(&self) -> u8 {
+        self.residual_bits
     }
 
     pub fn block_size(&self) -> usize {
@@ -138,8 +158,7 @@ impl BlockSoaLayout {
         self.residuals[residual_offset] = residual;
 
         for (m, sketch) in sketches.iter().enumerate() {
-            let offset = self.sketch_offset(block, m, slot);
-            self.sketches[offset] = *sketch;
+            self.set_sketch(block, m, slot, *sketch);
         }
 
         self.ids.push(id);
@@ -172,7 +191,12 @@ impl BlockSoaLayout {
     }
 
     pub fn sketch(&self, block: usize, dim: usize, lane: usize) -> i8 {
-        self.sketches[self.sketch_offset(block, dim, lane)]
+        match self.residual_bits {
+            8 => self.sketches[self.sketch_offset(block, dim, lane)] as i8,
+            2 => decode_2bit(self.sketch_code(block, dim, lane)),
+            1 => decode_1bit(self.sketch_code(block, dim, lane)),
+            _ => unreachable!("validated residual_bits"),
+        }
     }
 
     pub(crate) fn coord_block(&self, block: usize, dim: usize) -> &[i16] {
@@ -186,8 +210,11 @@ impl BlockSoaLayout {
     }
 
     pub(crate) fn sketch_block(&self, block: usize, dim: usize) -> &[i8] {
+        assert_eq!(self.residual_bits, 8);
         let start = self.sketch_offset(block, dim, 0);
-        &self.sketches[start..start + self.block_size]
+        let bytes = &self.sketches[start..start + self.block_size];
+        // i8 and u8 have identical layout; this view keeps the SIMD scan path zero-copy.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) }
     }
 
     fn start_block(&mut self) {
@@ -197,10 +224,8 @@ impl BlockSoaLayout {
         ));
         self.residuals
             .extend(std::iter::repeat_n(u16::MAX, self.block_size));
-        self.sketches.extend(std::iter::repeat_n(
-            i8::MAX,
-            self.sketch_dim * self.block_size,
-        ));
+        self.sketches
+            .extend(std::iter::repeat_n(0xff, self.sketch_bytes_per_block()));
     }
 
     fn coord_offset(&self, block: usize, dim: usize, lane: usize) -> usize {
@@ -209,6 +234,41 @@ impl BlockSoaLayout {
 
     fn sketch_offset(&self, block: usize, dim: usize, lane: usize) -> usize {
         block * self.sketch_dim * self.block_size + dim * self.block_size + lane
+    }
+
+    fn sketch_bytes_per_block(&self) -> usize {
+        packed_bytes(self.sketch_dim * self.block_size, self.residual_bits)
+    }
+
+    fn packed_sketch_offset(&self, block: usize, dim: usize, lane: usize) -> (usize, u8) {
+        let bit_idx = (dim * self.block_size + lane) * self.residual_bits as usize;
+        let byte = block * self.sketch_bytes_per_block() + bit_idx / 8;
+        let shift = (bit_idx % 8) as u8;
+        (byte, shift)
+    }
+
+    fn sketch_code(&self, block: usize, dim: usize, lane: usize) -> u8 {
+        let (byte, shift) = self.packed_sketch_offset(block, dim, lane);
+        let mask = (1_u8 << self.residual_bits) - 1;
+        (self.sketches[byte] >> shift) & mask
+    }
+
+    fn set_sketch(&mut self, block: usize, dim: usize, lane: usize, value: i8) {
+        match self.residual_bits {
+            8 => {
+                let offset = self.sketch_offset(block, dim, lane);
+                self.sketches[offset] = value as u8;
+            }
+            2 => self.set_sketch_code(block, dim, lane, encode_2bit(value)),
+            1 => self.set_sketch_code(block, dim, lane, encode_1bit(value)),
+            _ => unreachable!("validated residual_bits"),
+        }
+    }
+
+    fn set_sketch_code(&mut self, block: usize, dim: usize, lane: usize, code: u8) {
+        let (byte, shift) = self.packed_sketch_offset(block, dim, lane);
+        let mask = ((1_u8 << self.residual_bits) - 1) << shift;
+        self.sketches[byte] = (self.sketches[byte] & !mask) | ((code << shift) & mask);
     }
 
     /// Serialise all blocks into the wire-format byte sequence expected by
@@ -220,10 +280,8 @@ impl BlockSoaLayout {
     pub fn raw_block_bytes(&self) -> Vec<u8> {
         let num_blocks = self.block_count();
         let bytes_per_block = self.block_size
-            * (self.local_dim * size_of::<i16>()
-                + size_of::<u16>()
-                + size_of::<u32>()
-                + self.sketch_dim * size_of::<i8>());
+            * (self.local_dim * size_of::<i16>() + size_of::<u16>() + size_of::<u32>())
+            + self.sketch_bytes_per_block();
         let mut out = Vec::with_capacity(num_blocks * bytes_per_block);
         for b in 0..num_blocks {
             // coords: local_dim * block_size i16 (already stored SoA dim-major)
@@ -250,12 +308,9 @@ impl BlockSoaLayout {
                 };
                 out.extend_from_slice(&id_u32.to_le_bytes());
             }
-            // sketches: sketch_dim * block_size i8 (stored SoA dim-major)
-            let sk_start = b * self.sketch_dim * self.block_size;
-            let sk_end = sk_start + self.sketch_dim * self.block_size;
-            for &s in &self.sketches[sk_start..sk_end] {
-                out.push(s as u8);
-            }
+            let sk_start = b * self.sketch_bytes_per_block();
+            let sk_end = sk_start + self.sketch_bytes_per_block();
+            out.extend_from_slice(&self.sketches[sk_start..sk_end]);
         }
         out
     }
@@ -263,15 +318,15 @@ impl BlockSoaLayout {
     pub fn from_raw_block_bytes(
         local_dim: usize,
         sketch_dim: usize,
+        residual_bits: u8,
         block_size: usize,
         num_vectors: usize,
         bytes: &[u8],
     ) -> Result<Self, String> {
+        validate_residual_bits(residual_bits)?;
         let bytes_per_block = block_size
-            * (local_dim * size_of::<i16>()
-                + size_of::<u16>()
-                + size_of::<u32>()
-                + sketch_dim * size_of::<i8>());
+            * (local_dim * size_of::<i16>() + size_of::<u16>() + size_of::<u32>())
+            + packed_bytes(sketch_dim * block_size, residual_bits);
         let expected_len = num_vectors.div_ceil(block_size) * bytes_per_block;
         if bytes.len() != expected_len {
             return Err(format!(
@@ -281,7 +336,8 @@ impl BlockSoaLayout {
             ));
         }
 
-        let mut layout = Self::with_shape(local_dim, sketch_dim, block_size);
+        let mut layout =
+            Self::with_shape_and_residual_bits(local_dim, sketch_dim, block_size, residual_bits);
         let num_blocks = num_vectors.div_ceil(block_size);
         for block in 0..num_blocks {
             let block_start = block * bytes_per_block;
@@ -323,8 +379,15 @@ impl BlockSoaLayout {
 
                 let mut sketches = Vec::with_capacity(sketch_dim);
                 for dim in 0..sketch_dim {
-                    let offset = sketch_start + dim * block_size + lane;
-                    sketches.push(bytes[offset] as i8);
+                    sketches.push(read_packed_sketch(
+                        bytes,
+                        sketch_start,
+                        sketch_dim,
+                        block_size,
+                        residual_bits,
+                        dim,
+                        lane,
+                    )?);
                 }
 
                 layout.push_quantized(
@@ -337,6 +400,78 @@ impl BlockSoaLayout {
         }
         Ok(layout)
     }
+}
+
+pub fn validate_residual_bits(bits: u8) -> Result<(), String> {
+    if matches!(bits, 1 | 2 | 8) {
+        Ok(())
+    } else {
+        Err(format!("residual_bits must be 1, 2, or 8, got {bits}"))
+    }
+}
+
+fn packed_bytes(values: usize, bits: u8) -> usize {
+    (values * bits as usize).div_ceil(8)
+}
+
+fn encode_1bit(value: i8) -> u8 {
+    if value >= 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn decode_1bit(code: u8) -> i8 {
+    if code & 1 == 0 {
+        -1
+    } else {
+        1
+    }
+}
+
+fn encode_2bit(value: i8) -> u8 {
+    match value {
+        i8::MIN..=-2 => 0,
+        -1 => 1,
+        0 | 1 => 2,
+        _ => 3,
+    }
+}
+
+fn decode_2bit(code: u8) -> i8 {
+    match code & 0b11 {
+        0 => -3,
+        1 => -1,
+        2 => 1,
+        _ => 3,
+    }
+}
+
+fn read_packed_sketch(
+    bytes: &[u8],
+    sketch_start: usize,
+    _sketch_dim: usize,
+    block_size: usize,
+    residual_bits: u8,
+    dim: usize,
+    lane: usize,
+) -> Result<i8, String> {
+    if residual_bits == 8 {
+        return Ok(bytes[sketch_start + dim * block_size + lane] as i8);
+    }
+    let bit_idx = (dim * block_size + lane) * residual_bits as usize;
+    let byte = sketch_start + bit_idx / 8;
+    let shift = (bit_idx % 8) as u8;
+    let code = bytes
+        .get(byte)
+        .ok_or_else(|| "invalid packed sketch bytes".to_string())?
+        >> shift;
+    Ok(match residual_bits {
+        1 => decode_1bit(code),
+        2 => decode_2bit(code),
+        _ => unreachable!("validated residual_bits"),
+    })
 }
 
 #[cfg(test)]
@@ -359,5 +494,22 @@ mod tests {
         assert_eq!(layout.residual(0, 1), 5);
         assert_eq!(layout.sketch(0, 0, 1), 6);
         assert_eq!(layout.id_at(0), Some(VectorId::new(7)));
+    }
+
+    #[test]
+    fn packs_two_bit_residual_sketches() {
+        let mut layout = BlockSoaLayout::with_shape_and_residual_bits(1, 2, 4, 2);
+        layout
+            .push_quantized(VectorId::new(1), &[7], 0, &[-3, 1])
+            .unwrap();
+        layout
+            .push_quantized(VectorId::new(2), &[8], 0, &[-1, 3])
+            .unwrap();
+
+        assert_eq!(layout.sketch(0, 0, 0), -3);
+        assert_eq!(layout.sketch(0, 0, 1), -1);
+        assert_eq!(layout.sketch(0, 1, 0), 1);
+        assert_eq!(layout.sketch(0, 1, 1), 3);
+        assert_eq!(layout.raw_block_bytes().len(), 4 * (2 + 2 + 4) + 2);
     }
 }

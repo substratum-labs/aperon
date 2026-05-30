@@ -40,8 +40,26 @@ fn build(args: &[String]) -> Result<(), String> {
     let output_path = flags.required_path("--output")?;
     let local_dim = flags.optional_nonzero_usize("--local-dim")?;
     let sketch_dim = flags.optional_usize("--sketch-dim")?.unwrap_or(0);
+    let residual_bits = flags.optional_u8("--residual-bits")?.unwrap_or(8);
     let block_size = flags.optional_nonzero_usize("--block-size")?.unwrap_or(64);
     let grains = flags.optional_nonzero_usize("--grains")?.unwrap_or(1);
+    let adaptive_min_local_dim = flags.optional_nonzero_usize("--adaptive-min-local-dim")?;
+    let adaptive_max_local_dim = flags.optional_nonzero_usize("--adaptive-max-local-dim")?;
+    let adaptive_min_sketch_dim = flags
+        .optional_usize("--adaptive-min-sketch-dim")?
+        .unwrap_or(0);
+    let adaptive_max_sketch_dim = flags
+        .optional_usize("--adaptive-max-sketch-dim")?
+        .unwrap_or(0);
+    let adaptive_min_residual_bits = flags
+        .optional_u8("--adaptive-min-residual-bits")?
+        .unwrap_or(1);
+    let adaptive_max_residual_bits = flags
+        .optional_u8("--adaptive-max-residual-bits")?
+        .unwrap_or(2);
+    let adaptive_variance_target = flags
+        .optional_f32("--adaptive-variance-target")?
+        .unwrap_or(0.9);
     flags.finish()?;
 
     let raw = load_raw_vectors(File::open(&vectors_path).map_err(format_io)?).map_err(format_io)?;
@@ -63,6 +81,24 @@ fn build(args: &[String]) -> Result<(), String> {
 
     let mut index =
         AperonIndex::with_options(dim, local_dim.unwrap_or(dim), sketch_dim, block_size);
+    index.set_residual_bits(residual_bits)?;
+    if adaptive_min_local_dim.is_some() || adaptive_max_local_dim.is_some() {
+        let min_local_dim = adaptive_min_local_dim.ok_or_else(|| {
+            "--adaptive-min-local-dim requires --adaptive-max-local-dim".to_string()
+        })?;
+        let max_local_dim = adaptive_max_local_dim.ok_or_else(|| {
+            "--adaptive-max-local-dim requires --adaptive-min-local-dim".to_string()
+        })?;
+        index.enable_adaptive_quantization(
+            min_local_dim,
+            max_local_dim,
+            adaptive_min_sketch_dim,
+            adaptive_max_sketch_dim,
+            adaptive_min_residual_bits,
+            adaptive_max_residual_bits,
+            adaptive_variance_target,
+        )?;
+    }
     for (idx, vector) in raw.vectors.chunks_exact(dim).enumerate() {
         index.insert(VectorId::new(idx as u64), vector.to_vec())?;
     }
@@ -291,6 +327,26 @@ impl<'a> Flags<'a> {
             .transpose()
     }
 
+    fn optional_u8(&mut self, name: &str) -> Result<Option<u8>, String> {
+        self.optional_string(name)?
+            .map(|value| {
+                value
+                    .parse::<u8>()
+                    .map_err(|_| format!("{name} must be an integer"))
+            })
+            .transpose()
+    }
+
+    fn optional_f32(&mut self, name: &str) -> Result<Option<f32>, String> {
+        self.optional_string(name)?
+            .map(|value| {
+                value
+                    .parse::<f32>()
+                    .map_err(|_| format!("{name} must be a number"))
+            })
+            .transpose()
+    }
+
     fn optional_nonzero_usize(&mut self, name: &str) -> Result<Option<usize>, String> {
         self.optional_usize(name)?
             .map(|value| {
@@ -338,7 +394,7 @@ fn format_io(err: io::Error) -> String {
 fn usage() -> String {
     [
         "usage:",
-        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--block-size N]",
+        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N]",
         "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
         "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
     ]

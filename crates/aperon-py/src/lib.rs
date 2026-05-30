@@ -17,12 +17,22 @@ struct PyAperonIndex {
 #[pymethods]
 impl PyAperonIndex {
     #[new]
-    #[pyo3(signature = (dim, local_dim=None, sketch_dim=0, block_size=64, rerank_factor=4))]
-    fn new(dim: usize, local_dim: Option<usize>, sketch_dim: usize, block_size: usize, rerank_factor: usize) -> Self {
+    #[pyo3(signature = (dim, local_dim=None, sketch_dim=0, block_size=64, rerank_factor=4, residual_bits=8))]
+    fn new(
+        dim: usize,
+        local_dim: Option<usize>,
+        sketch_dim: usize,
+        block_size: usize,
+        rerank_factor: usize,
+        residual_bits: u8,
+    ) -> PyResult<Self> {
         let mut inner =
             AperonIndex::with_options(dim, local_dim.unwrap_or(dim), sketch_dim, block_size);
+        inner
+            .set_residual_bits(residual_bits)
+            .map_err(value_error)?;
         inner.set_rerank_factor(rerank_factor);
-        Self { inner }
+        Ok(Self { inner })
     }
 
     fn set_rerank_factor(&mut self, factor: usize) {
@@ -104,6 +114,39 @@ impl PyAperonIndex {
             .map_err(value_error)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        min_local_dim,
+        max_local_dim,
+        min_sketch_dim=0,
+        max_sketch_dim=0,
+        min_residual_bits=1,
+        max_residual_bits=2,
+        variance_target=0.9
+    ))]
+    fn enable_adaptive_quantization(
+        &mut self,
+        min_local_dim: usize,
+        max_local_dim: usize,
+        min_sketch_dim: usize,
+        max_sketch_dim: usize,
+        min_residual_bits: u8,
+        max_residual_bits: u8,
+        variance_target: f32,
+    ) -> PyResult<()> {
+        self.inner
+            .enable_adaptive_quantization(
+                min_local_dim,
+                max_local_dim,
+                min_sketch_dim,
+                max_sketch_dim,
+                min_residual_bits,
+                max_residual_bits,
+                variance_target,
+            )
+            .map_err(value_error)
+    }
+
     #[pyo3(signature = (query, top_k, nprobe=None, rerank_factor=None))]
     fn search(
         &self,
@@ -113,7 +156,9 @@ impl PyAperonIndex {
         rerank_factor: Option<usize>,
     ) -> PyResult<Vec<(u64, f64)>> {
         let results = match (nprobe, rerank_factor) {
-            (Some(np), Some(rf)) => self.inner.search_with_nprobe_internal(&query, top_k, np, rf),
+            (Some(np), Some(rf)) => self
+                .inner
+                .search_with_nprobe_internal(&query, top_k, np, rf),
             (Some(np), None) => self.inner.search_with_nprobe(&query, top_k, np),
             (None, Some(rf)) => self.inner.search_internal(&query, top_k, rf),
             (None, None) => self.inner.search(&query, top_k),
@@ -139,7 +184,9 @@ impl PyAperonIndex {
         for row in array.outer_iter() {
             let query: Vec<f32> = row.iter().copied().collect();
             let results = match (nprobe, rerank_factor) {
-                (Some(np), Some(rf)) => self.inner.search_with_nprobe_internal(&query, top_k, np, rf),
+                (Some(np), Some(rf)) => self
+                    .inner
+                    .search_with_nprobe_internal(&query, top_k, np, rf),
                 (Some(np), None) => self.inner.search_with_nprobe(&query, top_k, np),
                 (None, Some(rf)) => self.inner.search_internal(&query, top_k, rf),
                 (None, None) => self.inner.search(&query, top_k),
@@ -162,6 +209,18 @@ impl PyAperonIndex {
         out.set_item("grains", stats.grains)?;
         out.set_item("vectors", stats.vectors)?;
         out.set_item("grain_sizes", stats.grain_sizes)?;
+        out.set_item("residual_bits", stats.residual_bits)?;
+        out.set_item("encoded_bytes", stats.encoded_bytes)?;
+        out.set_item("grain_local_dims", stats.grain_local_dims)?;
+        out.set_item("grain_sketch_dims", stats.grain_sketch_dims)?;
+        out.set_item(
+            "grain_residual_bits",
+            stats
+                .grain_residual_bits
+                .into_iter()
+                .map(usize::from)
+                .collect::<Vec<_>>(),
+        )?;
         Ok(out)
     }
 
@@ -248,7 +307,7 @@ mod tests {
     fn stats_returns_python_dict() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let mut index = PyAperonIndex::new(2, None, 0, 4, 4);
+            let mut index = PyAperonIndex::new(2, None, 0, 4, 4, 8).unwrap();
             let id = 7_u64.into_pyobject(py).unwrap();
             let vector = vec![1.0, 2.0].into_pyobject(py).unwrap();
             index.insert(id.as_any(), Some(vector.as_any())).unwrap();
@@ -298,7 +357,7 @@ mod tests {
     #[allow(deprecated)]
     fn stats_returns_python_grain_sizes_for_multi_grain_index() {
         pyo3::prepare_freethreaded_python();
-        let mut index = PyAperonIndex::new(2, Some(2), 0, 2, 4);
+        let mut index = PyAperonIndex::new(2, Some(2), 0, 2, 4, 8).unwrap();
         Python::with_gil(|py| {
             for cluster in 0..4 {
                 let base = cluster as f32 * 100.0;
@@ -333,7 +392,7 @@ mod tests {
             process::id(),
             unique_suffix()
         ));
-        let mut index = PyAperonIndex::new(2, Some(2), 0, 4, 4);
+        let mut index = PyAperonIndex::new(2, Some(2), 0, 4, 4, 8).unwrap();
         Python::with_gil(|py| {
             for (id, vector) in [
                 (0_u64, vec![0.0, 0.0]),
@@ -379,7 +438,7 @@ mod tests {
     fn insert_many_accepts_python_sequences() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let mut index = PyAperonIndex::new(2, None, 0, 4, 4);
+            let mut index = PyAperonIndex::new(2, None, 0, 4, 4, 8).unwrap();
             let ids = vec![10_u64, 11_u64].into_pyobject(py).unwrap();
             let matrix = vec![vec![1.0, 0.0], vec![2.0, 0.0]]
                 .into_pyobject(py)
@@ -388,7 +447,10 @@ mod tests {
             let inserted = index.insert_many(ids.as_any(), matrix.as_any()).unwrap();
 
             assert_eq!(inserted, 2);
-            assert_eq!(index.search(vec![1.8, 0.0], 1, None, None).unwrap()[0].0, 11);
+            assert_eq!(
+                index.search(vec![1.8, 0.0], 1, None, None).unwrap()[0].0,
+                11
+            );
         });
     }
 
@@ -397,7 +459,7 @@ mod tests {
     fn search_reranks_and_improves_accuracy_py() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let mut index = PyAperonIndex::new(3, Some(2), 1, 4, 4);
+            let mut index = PyAperonIndex::new(3, Some(2), 1, 4, 4, 8).unwrap();
             let ids = vec![1_u64, 2_u64, 3_u64].into_pyobject(py).unwrap();
             let matrix = vec![
                 vec![0.0, 0.0, 0.0],

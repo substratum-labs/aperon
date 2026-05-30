@@ -5,6 +5,7 @@ use crate::{
     Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
 };
 use std::collections::HashMap;
+use std::mem::size_of;
 
 /// Minimal in-memory index skeleton.
 #[derive(Clone, Debug)]
@@ -12,6 +13,7 @@ pub struct AperonIndex {
     dim: usize,
     local_dim: usize,
     sketch_dim: usize,
+    residual_bits: u8,
     block_size: usize,
     grains: Vec<Grain>,
     centroids: Vec<Vec<f32>>,
@@ -22,6 +24,7 @@ pub struct AperonIndex {
     split_threshold: Option<usize>,
     rerank_factor: usize,
     vector_locations: HashMap<VectorId, (usize, usize)>,
+    adaptive_quantization: Option<AdaptiveQuantizationConfig>,
 }
 
 impl AperonIndex {
@@ -31,6 +34,7 @@ impl AperonIndex {
             dim,
             local_dim,
             sketch_dim: 0,
+            residual_bits: 8,
             block_size: DEFAULT_BLOCK_SIZE,
             grains: vec![Grain::new(GrainId::new(0), dim)],
             centroids: vec![vec![0.0; dim]],
@@ -41,6 +45,7 @@ impl AperonIndex {
             split_threshold: None,
             rerank_factor: 4,
             vector_locations: HashMap::new(),
+            adaptive_quantization: None,
         }
     }
 
@@ -54,6 +59,7 @@ impl AperonIndex {
             dim,
             local_dim: local_dim.min(dim),
             sketch_dim,
+            residual_bits: 8,
             block_size,
             grains: vec![Grain::new(GrainId::new(0), dim)],
             centroids: vec![vec![0.0; dim]],
@@ -64,6 +70,7 @@ impl AperonIndex {
             split_threshold: None,
             rerank_factor: 4,
             vector_locations: HashMap::new(),
+            adaptive_quantization: None,
         }
     }
 
@@ -73,6 +80,40 @@ impl AperonIndex {
 
     pub fn rerank_factor(&self) -> usize {
         self.rerank_factor
+    }
+
+    pub fn set_residual_bits(&mut self, bits: u8) -> Result<(), String> {
+        crate::layout::validate_residual_bits(bits)?;
+        self.residual_bits = bits;
+        Ok(())
+    }
+
+    pub fn residual_bits(&self) -> u8 {
+        self.residual_bits
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enable_adaptive_quantization(
+        &mut self,
+        min_local_dim: usize,
+        max_local_dim: usize,
+        min_sketch_dim: usize,
+        max_sketch_dim: usize,
+        min_residual_bits: u8,
+        max_residual_bits: u8,
+        variance_target: f32,
+    ) -> Result<(), String> {
+        self.adaptive_quantization = Some(AdaptiveQuantizationConfig::new(
+            self.dim,
+            min_local_dim,
+            max_local_dim,
+            min_sketch_dim,
+            max_sketch_dim,
+            min_residual_bits,
+            max_residual_bits,
+            variance_target,
+        )?);
+        Ok(())
     }
 
     fn update_vector_locations(&mut self) {
@@ -95,12 +136,14 @@ impl AperonIndex {
                 let local_dim = single.local_dim as usize;
                 let sketch_dim = single.sketch_dim as usize;
                 let block_size = single.block_size as usize;
+                let residual_bits = single.residual_bits;
                 let grain = Grain::from_legacy_single(GrainId::new(0), single)?;
                 let ids = grain.vector_ids().to_vec();
                 Self {
                     dim,
                     local_dim,
                     sketch_dim,
+                    residual_bits,
                     block_size,
                     centroids: vec![grain.centroid().to_vec()],
                     grain_ids: vec![ids],
@@ -111,6 +154,7 @@ impl AperonIndex {
                     split_threshold: None,
                     rerank_factor: 4,
                     vector_locations: HashMap::new(),
+                    adaptive_quantization: None,
                 }
             }
             LegacyIndex::Multi(multi) => {
@@ -118,6 +162,7 @@ impl AperonIndex {
                 let local_dim = multi.local_dim as usize;
                 let sketch_dim = multi.sketch_dim as usize;
                 let block_size = multi.block_size as usize;
+                let residual_bits = multi.residual_bits;
                 let grains = multi
                     .grains
                     .into_iter()
@@ -144,6 +189,7 @@ impl AperonIndex {
                     dim,
                     local_dim,
                     sketch_dim,
+                    residual_bits,
                     block_size,
                     grains,
                     centroids,
@@ -154,6 +200,7 @@ impl AperonIndex {
                     split_threshold: None,
                     rerank_factor: 4,
                     vector_locations: HashMap::new(),
+                    adaptive_quantization: None,
                 }
             }
         };
@@ -212,15 +259,7 @@ impl AperonIndex {
     }
 
     pub fn rebuild_single_grain(&mut self) -> Result<(), String> {
-        self.grains = vec![Grain::build(
-            GrainId::new(0),
-            &self.raw_vectors,
-            &self.ids,
-            self.dim,
-            self.local_dim,
-            self.sketch_dim,
-            self.block_size,
-        )?];
+        self.grains = vec![self.build_grain(0, &self.raw_vectors, &self.ids)?];
         self.centroids = vec![mean_vector(&self.raw_vectors, self.dim)];
         self.grain_ids = vec![self.ids.clone()];
         self.update_vector_locations();
@@ -252,24 +291,8 @@ impl AperonIndex {
         }
 
         self.grains = vec![
-            Grain::build(
-                GrainId::new(0),
-                &vectors0,
-                &ids0,
-                self.dim,
-                self.local_dim,
-                self.sketch_dim,
-                self.block_size,
-            )?,
-            Grain::build(
-                GrainId::new(1),
-                &vectors1,
-                &ids1,
-                self.dim,
-                self.local_dim,
-                self.sketch_dim,
-                self.block_size,
-            )?,
+            self.build_grain(0, &vectors0, &ids0)?,
+            self.build_grain(1, &vectors1, &ids1)?,
         ];
         self.centroids = vec![split.centroid0, split.centroid1];
         self.grain_ids = vec![ids0, ids1];
@@ -302,15 +325,7 @@ impl AperonIndex {
                 continue;
             }
             let grain_idx = grains.len();
-            grains.push(Grain::build(
-                GrainId::new(grain_idx as u64),
-                &vectors,
-                &ids,
-                self.dim,
-                self.local_dim,
-                self.sketch_dim,
-                self.block_size,
-            )?);
+            grains.push(self.build_grain(grain_idx, &vectors, &ids)?);
             centroids.push(mean_vector(&vectors, self.dim));
             grain_ids.push(ids);
         }
@@ -437,7 +452,7 @@ impl AperonIndex {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.id.cmp(&b.id))
-            });
+        });
         reranked.truncate(top_k);
         Ok(reranked)
     }
@@ -458,7 +473,10 @@ impl AperonIndex {
             return Ok((dist + remaining) as f64);
         }
 
-        Err(format!("VectorId {:?} location not found for reranking", id))
+        Err(format!(
+            "VectorId {:?} location not found for reranking",
+            id
+        ))
     }
 
     fn routed_grains(&self, query: &[f32]) -> Result<Vec<&Grain>, String> {
@@ -525,28 +543,13 @@ impl AperonIndex {
             return Ok(());
         }
 
-        self.grains[grain_idx] = Grain::build(
-            GrainId::new(grain_idx as u64),
-            &vectors0,
-            &ids0,
-            self.dim,
-            self.local_dim,
-            self.sketch_dim,
-            self.block_size,
-        )?;
+        self.grains[grain_idx] = self.build_grain(grain_idx, &vectors0, &ids0)?;
         self.centroids[grain_idx] = split.centroid0;
         self.grain_ids[grain_idx] = ids0;
 
         let new_idx = self.grains.len();
-        self.grains.push(Grain::build(
-            GrainId::new(new_idx as u64),
-            &vectors1,
-            &ids1,
-            self.dim,
-            self.local_dim,
-            self.sketch_dim,
-            self.block_size,
-        )?);
+        self.grains
+            .push(self.build_grain(new_idx, &vectors1, &ids1)?);
         self.centroids.push(split.centroid1);
         self.grain_ids.push(ids1);
 
@@ -554,14 +557,59 @@ impl AperonIndex {
         Ok(())
     }
 
+    fn build_grain(
+        &self,
+        grain_idx: usize,
+        vectors: &[Vec<f32>],
+        ids: &[VectorId],
+    ) -> Result<Grain, String> {
+        let shape = self
+            .adaptive_quantization
+            .as_ref()
+            .map(|config| config.select_shape(vectors, self.dim))
+            .unwrap_or(GrainShape {
+                local_dim: self.local_dim,
+                sketch_dim: self.sketch_dim,
+                residual_bits: self.residual_bits,
+            });
+        Grain::build_with_residual_bits(
+            GrainId::new(grain_idx as u64),
+            vectors,
+            ids,
+            self.dim,
+            shape.local_dim,
+            shape.sketch_dim,
+            self.block_size,
+            shape.residual_bits,
+        )
+    }
+
     pub fn stats(&self) -> IndexStats {
         let grain_sizes = self.grains.iter().map(Grain::len).collect::<Vec<_>>();
         let vectors = grain_sizes.iter().sum();
+        let encoded_bytes = self.grains.iter().map(Grain::encoded_bytes).sum::<usize>()
+            + self.centroids.len() * self.dim * size_of::<f32>();
+        let grain_local_dims = self.grains.iter().map(Grain::local_dim).collect::<Vec<_>>();
+        let grain_sketch_dims = self
+            .grains
+            .iter()
+            .map(Grain::sketch_dim)
+            .collect::<Vec<_>>();
+        let grain_residual_bits = self
+            .grains
+            .iter()
+            .map(Grain::residual_bits)
+            .collect::<Vec<_>>();
         IndexStats {
             dim: self.dim,
             grains: self.grains.len(),
             vectors,
             grain_sizes,
+            residual_bits: self.residual_bits,
+            encoded_bytes,
+            grain_local_dims,
+            grain_sketch_dims,
+            grain_residual_bits,
         }
     }
 
@@ -584,6 +632,7 @@ impl AperonIndex {
             local_dim: self.local_dim as u32,
             block_size: self.block_size as u32,
             sketch_dim: self.sketch_dim as u32,
+            residual_bits: self.residual_bits,
             centroids: self
                 .centroids
                 .iter()
@@ -604,6 +653,7 @@ impl AperonIndex {
             local_dim: grain.local_dim() as u32,
             block_size: grain.block_size() as u32,
             sketch_dim: grain.sketch_dim() as u32,
+            residual_bits: grain.residual_bits(),
             mean: grain.mean().to_vec(),
             projection: grain.projection().to_vec(),
             proj_scales: grain.proj_scales().to_vec(),
@@ -622,6 +672,94 @@ pub struct IndexStats {
     pub grains: usize,
     pub vectors: usize,
     pub grain_sizes: Vec<usize>,
+    pub residual_bits: u8,
+    pub encoded_bytes: usize,
+    pub grain_local_dims: Vec<usize>,
+    pub grain_sketch_dims: Vec<usize>,
+    pub grain_residual_bits: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GrainShape {
+    local_dim: usize,
+    sketch_dim: usize,
+    residual_bits: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdaptiveQuantizationConfig {
+    min_local_dim: usize,
+    max_local_dim: usize,
+    min_sketch_dim: usize,
+    max_sketch_dim: usize,
+    min_residual_bits: u8,
+    max_residual_bits: u8,
+    variance_target: f32,
+}
+
+impl AdaptiveQuantizationConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        dim: usize,
+        min_local_dim: usize,
+        max_local_dim: usize,
+        min_sketch_dim: usize,
+        max_sketch_dim: usize,
+        min_residual_bits: u8,
+        max_residual_bits: u8,
+        variance_target: f32,
+    ) -> Result<Self, String> {
+        if min_local_dim == 0 || max_local_dim == 0 || min_local_dim > max_local_dim {
+            return Err("invalid adaptive local_dim range".to_string());
+        }
+        if min_sketch_dim > max_sketch_dim {
+            return Err("invalid adaptive sketch_dim range".to_string());
+        }
+        crate::layout::validate_residual_bits(min_residual_bits)?;
+        crate::layout::validate_residual_bits(max_residual_bits)?;
+        if residual_bit_rank(min_residual_bits) > residual_bit_rank(max_residual_bits) {
+            return Err("invalid adaptive residual_bits range".to_string());
+        }
+        if !variance_target.is_finite() || !(0.0..=1.0).contains(&variance_target) {
+            return Err("variance_target must be in [0, 1]".to_string());
+        }
+        Ok(Self {
+            min_local_dim: min_local_dim.min(dim).max(1),
+            max_local_dim: max_local_dim.min(dim).max(1),
+            min_sketch_dim: min_sketch_dim.min(dim),
+            max_sketch_dim: max_sketch_dim.min(dim),
+            min_residual_bits,
+            max_residual_bits,
+            variance_target,
+        })
+    }
+
+    fn select_shape(self, vectors: &[Vec<f32>], dim: usize) -> GrainShape {
+        let effective_dim = effective_axis_dim(vectors, dim, self.variance_target);
+        let local_dim = effective_dim.clamp(self.min_local_dim, self.max_local_dim);
+        let remaining = effective_dim.saturating_sub(local_dim);
+        let sketch_dim = remaining.clamp(self.min_sketch_dim, self.max_sketch_dim);
+        let residual_bits = if local_dim >= self.max_local_dim || sketch_dim >= self.max_sketch_dim
+        {
+            self.max_residual_bits
+        } else {
+            self.min_residual_bits
+        };
+        GrainShape {
+            local_dim,
+            sketch_dim,
+            residual_bits,
+        }
+    }
+}
+
+fn residual_bit_rank(bits: u8) -> usize {
+    match bits {
+        1 => 0,
+        2 => 1,
+        8 => 2,
+        _ => usize::MAX,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -656,6 +794,34 @@ fn k_means(vectors: &[Vec<f32>], dim: usize, k: usize) -> KMeansSplit {
         assignments,
         centroids,
     }
+}
+
+fn effective_axis_dim(vectors: &[Vec<f32>], dim: usize, variance_target: f32) -> usize {
+    if vectors.is_empty() || dim == 0 {
+        return 1;
+    }
+    let mean = mean_vector(vectors, dim);
+    let mut variances = vec![0.0_f32; dim];
+    for vector in vectors {
+        for d in 0..dim {
+            let diff = vector[d] - mean[d];
+            variances[d] += diff * diff;
+        }
+    }
+    variances.sort_by(|a, b| b.total_cmp(a));
+    let total = variances.iter().sum::<f32>();
+    if total <= 0.0 {
+        return 1;
+    }
+    let target = total * variance_target;
+    let mut cumulative = 0.0_f32;
+    for (idx, variance) in variances.iter().enumerate() {
+        cumulative += variance;
+        if cumulative >= target {
+            return idx + 1;
+        }
+    }
+    dim
 }
 
 fn seed_centroids(vectors: &[Vec<f32>], dim: usize, k: usize) -> Vec<Vec<f32>> {
@@ -709,10 +875,9 @@ fn assign_to_centroids_balanced(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) ->
     let mut regret_indices = (0..n).collect::<Vec<usize>>();
     let mut regrets = vec![0.0_f32; n];
 
-    for i in 0..n {
-        let v = &vectors[i];
-        for j in 0..k {
-            let dist = l2_squared(v, &centroids[j]).unwrap_or(f32::INFINITY);
+    for (i, v) in vectors.iter().enumerate() {
+        for (j, centroid) in centroids.iter().enumerate().take(k) {
+            let dist = l2_squared(v, centroid).unwrap_or(f32::INFINITY);
             vec_centroid_dists[i].push((j, dist));
         }
         vec_centroid_dists[i].sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -744,9 +909,9 @@ fn assign_to_centroids_balanced(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) ->
         if !assigned {
             let mut best_c = 0;
             let mut min_count = usize::MAX;
-            for c_idx in 0..k {
-                if centroid_counts[c_idx] < min_count {
-                    min_count = centroid_counts[c_idx];
+            for (c_idx, count) in centroid_counts.iter().enumerate().take(k) {
+                if *count < min_count {
+                    min_count = *count;
                     best_c = c_idx;
                 }
             }
@@ -933,6 +1098,39 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_quantization_builds_variable_width_grains() {
+        let mut index = AperonIndex::with_options(4, 4, 0, 2);
+        index
+            .enable_adaptive_quantization(1, 4, 0, 2, 1, 2, 0.8)
+            .unwrap();
+
+        for i in 0..8 {
+            index.insert(i as u64, [i as f32, 0.0, 0.0, 0.0]).unwrap();
+        }
+        for i in 0..8 {
+            let x = i as f32;
+            index.insert(100 + i as u64, [x, x, x, x]).unwrap();
+        }
+
+        index.rebuild_two_grains().unwrap();
+
+        let stats = index.stats();
+        assert_eq!(stats.grains, 2);
+        assert!(stats.grain_local_dims.iter().any(|dim| *dim < 4));
+        assert!(stats.grain_local_dims.iter().any(|dim| *dim > 1));
+        assert!(stats
+            .grain_residual_bits
+            .iter()
+            .all(|bits| *bits == 1 || *bits == 2));
+
+        let loaded = AperonIndex::from_legacy_index(index.to_legacy_index().unwrap()).unwrap();
+        let loaded_stats = loaded.stats();
+        assert_eq!(loaded_stats.grain_local_dims, stats.grain_local_dims);
+        assert_eq!(loaded_stats.grain_sketch_dims, stats.grain_sketch_dims);
+        assert_eq!(loaded_stats.grain_residual_bits, stats.grain_residual_bits);
+    }
+
+    #[test]
     fn search_with_nprobe_clamps_to_available_grains() {
         let mut index = AperonIndex::with_options(2, 2, 0, 2);
         for cluster in 0..4 {
@@ -992,6 +1190,30 @@ mod tests {
         // exact L2 distance squared from [9.0, 0.0, 0.0] to [10.0, 0.0, 0.0] is 1.0.
         // The reconstructed vector will be close to [10.0, 0.0, 0.0].
         let rerank_dist = results_rerank[0].distance;
-        assert!((rerank_dist - 1.0).abs() < 1.0, "rerank distance {} not close to 1.0", rerank_dist);
+        assert!(
+            (rerank_dist - 1.0).abs() < 1.0,
+            "rerank distance {} not close to 1.0",
+            rerank_dist
+        );
+    }
+
+    #[test]
+    fn vlbrd_two_bit_round_trip_preserves_searchability() {
+        let mut index = AperonIndex::with_options(3, 2, 2, 4);
+        index.set_residual_bits(2).unwrap();
+        index.insert(1, [0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, [10.0, 0.0, 0.0]).unwrap();
+        index.insert(3, [0.0, 10.0, 1.0]).unwrap();
+        index.insert(4, [0.0, 0.0, 10.0]).unwrap();
+        index.rebuild_single_grain().unwrap();
+
+        let stats = index.stats();
+        assert_eq!(stats.residual_bits, 2);
+        assert!(stats.encoded_bytes > 0);
+
+        let loaded = AperonIndex::from_legacy_index(index.to_legacy_index().unwrap()).unwrap();
+        assert_eq!(loaded.residual_bits(), 2);
+        let results = loaded.search(&[9.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, VectorId::new(2));
     }
 }
