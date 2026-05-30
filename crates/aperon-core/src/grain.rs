@@ -5,6 +5,7 @@ use crate::quantization::{
     scaled_weight,
 };
 use crate::scan::{scan_block_into, ScanWeights};
+use crate::shared::{reconstruct_shared, SharedGrainEncoding, SharedQuantizer};
 use std::mem::size_of;
 
 /// Stable identifier for a local Aperon grain.
@@ -34,6 +35,11 @@ pub struct Grain {
     sketch_projection: Vec<f32>,
     sketch_scales: Vec<f32>,
     residual_bits: u8,
+    shared_quantizer: Option<SharedQuantizer>,
+    shared_column_indices: Vec<usize>,
+    pq_codes: Vec<u8>,
+    pq_error_scale: f32,
+    pq_error_norms: Vec<u8>,
     distance_unit: f64,
     coord_weights: Vec<i64>,
     residual_weight: i64,
@@ -53,6 +59,11 @@ impl Grain {
             sketch_projection: Vec::new(),
             sketch_scales: Vec::new(),
             residual_bits: DEFAULT_RESIDUAL_BITS,
+            shared_quantizer: None,
+            shared_column_indices: Vec::new(),
+            pq_codes: Vec::new(),
+            pq_error_scale: 1.0,
+            pq_error_norms: Vec::new(),
             distance_unit: 1.0,
             coord_weights: vec![1; dim],
             residual_weight: 1,
@@ -184,6 +195,11 @@ impl Grain {
             sketch_projection,
             sketch_scales,
             residual_bits,
+            shared_quantizer: None,
+            shared_column_indices: Vec::new(),
+            pq_codes: Vec::new(),
+            pq_error_scale: 1.0,
+            pq_error_norms: Vec::new(),
             distance_unit: 1.0,
             coord_weights: Vec::new(),
             residual_weight: 1,
@@ -231,6 +247,69 @@ impl Grain {
             sketch_projection: legacy.sketch_projection,
             sketch_scales: legacy.sketch_scales,
             residual_bits: legacy.residual_bits,
+            shared_quantizer: None,
+            shared_column_indices: Vec::new(),
+            pq_codes: Vec::new(),
+            pq_error_scale: 1.0,
+            pq_error_norms: Vec::new(),
+            distance_unit: 1.0,
+            coord_weights: Vec::new(),
+            residual_weight: 1,
+            sketch_weights: Vec::new(),
+        };
+        grain.build_distance_weights();
+        Ok(grain)
+    }
+
+    pub fn build_shared(
+        id: GrainId,
+        ids: &[VectorId],
+        source_dim: usize,
+        mean: Vec<f32>,
+        block_size: usize,
+        quantizer: SharedQuantizer,
+        encoding: SharedGrainEncoding,
+    ) -> Result<Self, String> {
+        if ids.len() * encoding.column_indices.len() != encoding.qcoords.len() {
+            return Err("shared qcoord payload length mismatch".to_string());
+        }
+        if ids.len() * quantizer.config.pq_subquantizers != encoding.pq_codes.len() {
+            return Err("shared pq code payload length mismatch".to_string());
+        }
+        if !encoding.error_norms.is_empty() && ids.len() != encoding.error_norms.len() {
+            return Err("shared pq error payload length mismatch".to_string());
+        }
+        let mut layout = BlockSoaLayout::with_shape_and_residual_bits(
+            encoding.column_indices.len(),
+            0,
+            block_size,
+            DEFAULT_RESIDUAL_BITS,
+        );
+        for (row, id) in ids.iter().copied().enumerate() {
+            let start = row * encoding.column_indices.len();
+            layout.push_quantized(
+                id,
+                &encoding.qcoords[start..start + encoding.column_indices.len()],
+                0,
+                &[],
+            )?;
+        }
+        let mut grain = Self {
+            id,
+            layout,
+            source_dim,
+            mean,
+            projection: Vec::new(),
+            proj_scales: encoding.coord_scales,
+            residual_scale: 1.0,
+            sketch_projection: Vec::new(),
+            sketch_scales: Vec::new(),
+            residual_bits: DEFAULT_RESIDUAL_BITS,
+            shared_quantizer: Some(quantizer),
+            shared_column_indices: encoding.column_indices,
+            pq_codes: encoding.pq_codes,
+            pq_error_scale: encoding.error_scale,
+            pq_error_norms: encoding.error_norms,
             distance_unit: 1.0,
             coord_weights: Vec::new(),
             residual_weight: 1,
@@ -296,12 +375,90 @@ impl Grain {
         self.residual_bits
     }
 
+    pub fn is_shared_quantized(&self) -> bool {
+        self.shared_quantizer.is_some()
+    }
+
+    pub fn shared_quantizer(&self) -> Option<&SharedQuantizer> {
+        self.shared_quantizer.as_ref()
+    }
+
+    pub fn shared_column_indices(&self) -> &[usize] {
+        &self.shared_column_indices
+    }
+
+    pub fn pq_codes(&self) -> &[u8] {
+        &self.pq_codes
+    }
+
+    pub fn pq_error_scale(&self) -> f32 {
+        self.pq_error_scale
+    }
+
+    pub fn pq_error_norms(&self) -> &[u8] {
+        &self.pq_error_norms
+    }
+
     /// Serialize the block data to the on-disk wire format.
     pub fn raw_block_bytes(&self) -> Vec<u8> {
         self.layout.raw_block_bytes()
     }
 
+    pub fn shared_compact_block_bytes(&self) -> Vec<u8> {
+        let local_dim = self.local_dim();
+        let block_size = self.block_size();
+        let num_blocks = self.len().div_ceil(block_size);
+        let bytes_per_block = block_size * (local_dim + size_of::<u32>());
+        let mut out = Vec::with_capacity(num_blocks * bytes_per_block);
+        for block in 0..num_blocks {
+            let lanes = self.layout.block_len(block);
+            for dim in 0..local_dim {
+                for lane in 0..block_size {
+                    let value = if lane < lanes {
+                        self.layout
+                            .coord(block, dim, lane)
+                            .clamp(i8::MIN as i16, i8::MAX as i16) as i8
+                            as u8
+                    } else {
+                        0
+                    };
+                    out.push(value);
+                }
+            }
+            for lane in 0..block_size {
+                let id = if lane < lanes {
+                    let ordinal = block * block_size + lane;
+                    self.layout.ids()[ordinal]
+                        .as_u32()
+                        .unwrap_or(crate::layout::DUMMY_ID)
+                } else {
+                    crate::layout::DUMMY_ID
+                };
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        out
+    }
+
     pub fn encoded_bytes(&self) -> usize {
+        if self.is_shared_quantized() {
+            let pq_bits = self
+                .shared_quantizer
+                .as_ref()
+                .map(|q| q.config.pq_bits)
+                .unwrap_or(8);
+            let pq_bytes = if pq_bits == 8 {
+                self.pq_codes.len()
+            } else {
+                self.pq_codes.len().div_ceil(2)
+            };
+            return self.shared_compact_block_bytes().len()
+                + self.mean.len() * size_of::<f32>()
+                + self.proj_scales.len() * size_of::<f32>()
+                + self.shared_column_indices.len()
+                + pq_bytes;
+        }
+        let shared_payload = 0;
         self.layout.raw_block_bytes().len()
             + self.mean.len() * size_of::<f32>()
             + self.projection.len() * size_of::<f32>()
@@ -309,6 +466,8 @@ impl Grain {
             + size_of::<f32>()
             + self.sketch_projection.len() * size_of::<f32>()
             + self.sketch_scales.len() * size_of::<f32>()
+            + self.shared_column_indices.len()
+            + shared_payload
     }
 
     pub fn vector_ids(&self) -> &[VectorId] {
@@ -382,6 +541,25 @@ impl Grain {
             .zip(&self.mean)
             .map(|(value, mean)| value - mean)
             .collect::<Vec<_>>();
+        if let Some(quantizer) = &self.shared_quantizer {
+            let coords = self
+                .shared_column_indices
+                .iter()
+                .zip(&self.proj_scales)
+                .map(|(&col, scale)| {
+                    let mut dot = 0.0_f32;
+                    for (d, value) in centered.iter().enumerate() {
+                        dot += value * quantizer.basis[d * quantizer.config.basis_cols + col];
+                    }
+                    quantize_i16(dot, *scale)
+                })
+                .collect::<Vec<_>>();
+            return Ok(QueryProjection {
+                coords,
+                residual: 0,
+                sketches: Vec::new(),
+            });
+        }
         let z = project_one(&centered, &self.projection, self.local_dim());
         let coords = z
             .iter()
@@ -468,6 +646,28 @@ impl Grain {
         let sketch_dim = self.sketch_dim();
         let source_dim = self.source_dim;
 
+        if let Some(quantizer) = &self.shared_quantizer {
+            let mut qcoords = vec![0_i16; local_dim];
+            for (k, value) in qcoords.iter_mut().enumerate() {
+                *value = self.layout.coord(block, k, lane);
+            }
+            let code_start = ordinal * quantizer.config.pq_subquantizers;
+            return Ok(reconstruct_shared(
+                &self.mean,
+                &quantizer.basis,
+                self.source_dim,
+                quantizer.config.basis_cols,
+                &self.shared_column_indices,
+                &self.proj_scales,
+                &qcoords,
+                &quantizer.pq_codebooks,
+                quantizer.config.pq_subquantizers,
+                quantizer.config.pq_bits,
+                &quantizer.opq_rotation,
+                &self.pq_codes[code_start..code_start + quantizer.config.pq_subquantizers],
+            ));
+        }
+
         // 1. Unquantize coords: z_i
         let mut z = vec![0.0_f32; local_dim];
         for (k, value) in z.iter_mut().enumerate() {
@@ -516,6 +716,13 @@ impl Grain {
         let lane = ordinal % self.block_size();
 
         let residual_q = self.layout.residual(block, lane);
+        if self.is_shared_quantized() {
+            return Ok(self
+                .pq_error_norms
+                .get(ordinal)
+                .map(|value| *value as f32 * self.pq_error_scale)
+                .unwrap_or(0.0));
+        }
         let total_residual_norm_sq = residual_q as f32 * self.residual_scale;
 
         let sketch_dim = self.sketch_dim();

@@ -60,6 +60,11 @@ fn build(args: &[String]) -> Result<(), String> {
     let adaptive_variance_target = flags
         .optional_f32("--adaptive-variance-target")?
         .unwrap_or(0.9);
+    let shared_basis_cols = flags.optional_nonzero_usize("--shared-basis-cols")?;
+    let shared_local_dim = flags.optional_nonzero_usize("--shared-local-dim")?;
+    let shared_pq_subquantizers = flags.optional_nonzero_usize("--shared-pq-subquantizers")?;
+    let shared_pq_bits = flags.optional_u8("--shared-pq-bits")?.unwrap_or(4);
+    let shared_opq = flags.optional_bool("--shared-opq")?;
     flags.finish()?;
 
     let raw = load_raw_vectors(File::open(&vectors_path).map_err(format_io)?).map_err(format_io)?;
@@ -97,6 +102,22 @@ fn build(args: &[String]) -> Result<(), String> {
             adaptive_min_residual_bits,
             adaptive_max_residual_bits,
             adaptive_variance_target,
+        )?;
+    }
+    if shared_basis_cols.is_some()
+        || shared_local_dim.is_some()
+        || shared_pq_subquantizers.is_some()
+        || shared_opq
+    {
+        let basis_cols = shared_basis_cols.unwrap_or(64);
+        let local_dim = shared_local_dim.unwrap_or(local_dim.unwrap_or(dim).min(basis_cols));
+        let pq_subquantizers = shared_pq_subquantizers.unwrap_or(8);
+        index.enable_shared_basis_pq(
+            basis_cols,
+            local_dim,
+            pq_subquantizers,
+            shared_pq_bits,
+            shared_opq,
         )?;
     }
     for (idx, vector) in raw.vectors.chunks_exact(dim).enumerate() {
@@ -179,6 +200,8 @@ fn eval(args: &[String]) -> Result<(), String> {
     let top_k = flags.optional_usize("--top-k")?.unwrap_or(10);
     let nprobe = flags.optional_usize("--nprobe")?;
     let rerank_factor = flags.optional_usize("--rerank-factor")?;
+    let candidate_k = flags.optional_usize("--candidate-k")?.unwrap_or(100);
+    let raw_rerank = flags.optional_bool("--raw-rerank")?;
     flags.finish()?;
 
     let legacy =
@@ -219,13 +242,32 @@ fn eval(args: &[String]) -> Result<(), String> {
 
     let dim = index.dim();
     let raw_vectors = raw.vectors.chunks_exact(dim).collect::<Vec<_>>();
+    if raw_rerank {
+        let ids = (0..raw.num_vectors)
+            .map(|idx| VectorId::new(u64::from(idx)))
+            .collect::<Vec<_>>();
+        let vectors = raw_vectors
+            .iter()
+            .map(|vector| vector.to_vec())
+            .collect::<Vec<_>>();
+        index.attach_raw_vectors(&ids, &vectors)?;
+    }
     let denominator = top_k.min(raw_vectors.len());
     let mut recall_sum = 0.0_f64;
+    let mut candidate_recall_sum = 0.0_f64;
 
     for query in queries.vectors.chunks_exact(dim) {
-        let predicted = match nprobe {
-            Some(nprobe) => index.search_with_nprobe(query, top_k, nprobe)?,
-            None => index.search(query, top_k)?,
+        let predicted = if raw_rerank {
+            let nprobe = nprobe.unwrap_or(1);
+            let candidates = index.candidate_pool_with_nprobe(query, nprobe, candidate_k)?;
+            let expected_for_candidates = brute_force_top_k(&raw_vectors, query, top_k)?;
+            candidate_recall_sum += recall_at_k(&candidates, &expected_for_candidates, denominator);
+            index.search_tiered_with_nprobe(query, top_k, nprobe, candidate_k)?
+        } else {
+            match nprobe {
+                Some(nprobe) => index.search_with_nprobe(query, top_k, nprobe)?,
+                None => index.search(query, top_k)?,
+            }
         };
         let expected = brute_force_top_k(&raw_vectors, query, top_k)?;
         recall_sum += recall_at_k(&predicted, &expected, denominator);
@@ -239,8 +281,27 @@ fn eval(args: &[String]) -> Result<(), String> {
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    writeln!(out, "queries,top_k,recall@{top_k}").map_err(format_io)?;
-    writeln!(out, "{},{},{}", queries.num_queries, top_k, recall).map_err(format_io)?;
+    if raw_rerank {
+        let candidate_recall = if queries.num_queries == 0 {
+            0.0
+        } else {
+            candidate_recall_sum / f64::from(queries.num_queries)
+        };
+        writeln!(
+            out,
+            "queries,top_k,candidate_k,recall@{top_k},candidate_recall@{candidate_k}"
+        )
+        .map_err(format_io)?;
+        writeln!(
+            out,
+            "{},{},{},{},{}",
+            queries.num_queries, top_k, candidate_k, recall, candidate_recall
+        )
+        .map_err(format_io)?;
+    } else {
+        writeln!(out, "queries,top_k,recall@{top_k}").map_err(format_io)?;
+        writeln!(out, "{},{},{}", queries.num_queries, top_k, recall).map_err(format_io)?;
+    }
     out.flush().map_err(format_io)
 }
 
@@ -347,6 +408,14 @@ impl<'a> Flags<'a> {
             .transpose()
     }
 
+    fn optional_bool(&mut self, name: &str) -> Result<bool, String> {
+        let Some(idx) = self.args.iter().position(|arg| arg == name) else {
+            return Ok(false);
+        };
+        self.used[idx] = true;
+        Ok(true)
+    }
+
     fn optional_nonzero_usize(&mut self, name: &str) -> Result<Option<usize>, String> {
         self.optional_usize(name)?
             .map(|value| {
@@ -394,9 +463,9 @@ fn format_io(err: io::Error) -> String {
 fn usage() -> String {
     [
         "usage:",
-        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N]",
+        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N] [--shared-basis-cols N --shared-local-dim N --shared-pq-subquantizers N --shared-pq-bits 4|8 --shared-opq]",
         "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
-        "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
+        "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N] [--raw-rerank --candidate-k N]",
     ]
     .join("\n")
 }

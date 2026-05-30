@@ -96,6 +96,21 @@ impl PyAperonIndex {
         Ok(count)
     }
 
+    fn attach_raw_vectors(
+        &mut self,
+        ids: &Bound<'_, PyAny>,
+        matrix: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let ids = extract_ids(ids)?;
+        let vectors = extract_matrix(matrix)?;
+        let count = vectors.len();
+        let ids = ids.into_iter().map(VectorId::new).collect::<Vec<_>>();
+        self.inner
+            .attach_raw_vectors(&ids, &vectors)
+            .map_err(value_error)?;
+        Ok(count)
+    }
+
     fn rebuild_single_grain(&mut self) -> PyResult<()> {
         self.inner.rebuild_single_grain().map_err(value_error)
     }
@@ -144,6 +159,20 @@ impl PyAperonIndex {
                 max_residual_bits,
                 variance_target,
             )
+            .map_err(value_error)
+    }
+
+    #[pyo3(signature = (basis_cols=64, local_dim=16, pq_subquantizers=8, pq_bits=4, opq=false))]
+    fn enable_shared_basis_pq(
+        &mut self,
+        basis_cols: usize,
+        local_dim: usize,
+        pq_subquantizers: usize,
+        pq_bits: u8,
+        opq: bool,
+    ) -> PyResult<()> {
+        self.inner
+            .enable_shared_basis_pq(basis_cols, local_dim, pq_subquantizers, pq_bits, opq)
             .map_err(value_error)
     }
 
@@ -200,6 +229,67 @@ impl PyAperonIndex {
             all_results.push(mapped);
         }
         Ok(all_results)
+    }
+
+    #[pyo3(signature = (query, top_k, nprobe, candidate_k=100))]
+    fn search_tiered(
+        &self,
+        query: Vec<f32>,
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> PyResult<Vec<(u64, f64)>> {
+        let results = self
+            .inner
+            .search_tiered_with_nprobe(&query, top_k, nprobe, candidate_k)
+            .map_err(value_error)?;
+        Ok(results
+            .into_iter()
+            .map(|scored| (scored.id.get(), scored.distance))
+            .collect())
+    }
+
+    #[pyo3(signature = (queries, top_k, nprobe, candidate_k=100))]
+    fn search_many_tiered(
+        &self,
+        queries: PyReadonlyArray2<'_, f32>,
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let array = queries.as_array();
+        let mut all_results = Vec::with_capacity(array.shape()[0]);
+        for row in array.outer_iter() {
+            let query = row.iter().copied().collect::<Vec<_>>();
+            let results = self
+                .inner
+                .search_tiered_with_nprobe(&query, top_k, nprobe, candidate_k)
+                .map_err(value_error)?;
+            all_results.push(
+                results
+                    .into_iter()
+                    .map(|scored| (scored.id.get(), scored.distance))
+                    .collect(),
+            );
+        }
+        Ok(all_results)
+    }
+
+    #[pyo3(signature = (query, nprobe, candidate_k=100))]
+    fn candidates(
+        &self,
+        query: Vec<f32>,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> PyResult<Vec<(u64, f64)>> {
+        let results = self
+            .inner
+            .candidate_pool_with_nprobe(&query, nprobe, candidate_k)
+            .map_err(value_error)?;
+        Ok(results
+            .into_iter()
+            .map(|scored| (scored.id.get(), scored.distance))
+            .collect())
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

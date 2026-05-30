@@ -1,7 +1,9 @@
 use std::io::{self, Read, Write};
 
-pub const LEGACY_VERSION: u32 = 3;
+pub const LEGACY_VERSION: u32 = 4;
 pub const MIN_SUPPORTED_VERSION: u32 = 1;
+const V4_FORMAT_LEGACY: u8 = 0;
+const V4_FORMAT_SHARED_PQ: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawVectors {
@@ -45,6 +47,33 @@ pub struct LegacyMultiGrain {
     pub residual_bits: u8,
     pub centroids: Vec<f32>,
     pub grains: Vec<LegacySingleGrain>,
+    pub shared: Option<LegacySharedQuantizer>,
+    pub shared_grains: Vec<LegacySharedGrain>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacySharedQuantizer {
+    pub basis_cols: u32,
+    pub pq_subquantizers: u32,
+    pub pq_bits: u8,
+    pub opq: bool,
+    pub basis: Vec<f32>,
+    pub opq_rotation: Vec<f32>,
+    pub pq_codebooks: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacySharedGrain {
+    pub num_vectors: u32,
+    pub local_dim: u32,
+    pub block_size: u32,
+    pub mean: Vec<f32>,
+    pub column_indices: Vec<u8>,
+    pub coord_scales: Vec<f32>,
+    pub block_data: Vec<u8>,
+    pub pq_codes: Vec<u8>,
+    pub pq_error_scale: f32,
+    pub pq_error_norms: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,7 +129,38 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
     let block_size = read_u32(reader)?;
     let sketch_dim = read_u32(reader)?;
     let residual_bits = if version >= 2 { read_u8(reader)? } else { 8 };
+    let format = if version >= 4 {
+        read_u8(reader)?
+    } else {
+        V4_FORMAT_LEGACY
+    };
     let centroids = read_f32_vec(reader, num_centroids as usize * dimension as usize)?;
+    if format == V4_FORMAT_SHARED_PQ {
+        let shared = read_shared_quantizer(reader, dimension)?;
+        let mut shared_grains = Vec::with_capacity(num_centroids as usize);
+        for _ in 0..num_centroids {
+            shared_grains.push(read_shared_grain(reader, dimension, &shared)?);
+        }
+        return Ok(LegacyMultiGrain {
+            num_centroids,
+            num_vectors,
+            dimension,
+            local_dim,
+            block_size,
+            sketch_dim,
+            residual_bits,
+            centroids,
+            grains: Vec::new(),
+            shared: Some(shared),
+            shared_grains,
+        });
+    }
+    if format != V4_FORMAT_LEGACY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported v4 index format",
+        ));
+    }
     let mut grains = Vec::with_capacity(num_centroids as usize);
     for _ in 0..num_centroids {
         grains.push(read_embedded_single(
@@ -123,6 +183,8 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
         residual_bits,
         centroids,
         grains,
+        shared: None,
+        shared_grains: Vec::new(),
     })
 }
 
@@ -228,6 +290,72 @@ fn read_magic(reader: &mut impl Read) -> io::Result<[u8; 4]> {
     let mut magic = [0; 4];
     reader.read_exact(&mut magic)?;
     Ok(magic)
+}
+
+fn read_shared_quantizer(
+    reader: &mut impl Read,
+    dimension: u32,
+) -> io::Result<LegacySharedQuantizer> {
+    let basis_cols = read_u32(reader)?;
+    let pq_subquantizers = read_u32(reader)?;
+    let pq_bits = read_u8(reader)?;
+    let opq = read_u8(reader)? != 0;
+    if !matches!(pq_bits, 4 | 8) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pq_bits must be 4 or 8",
+        ));
+    }
+    let vocabulary = 1_usize << pq_bits;
+    Ok(LegacySharedQuantizer {
+        basis_cols,
+        pq_subquantizers,
+        pq_bits,
+        opq,
+        basis: read_f32_vec(reader, dimension as usize * basis_cols as usize)?,
+        opq_rotation: read_f32_vec(reader, dimension as usize * dimension as usize)?,
+        pq_codebooks: read_f32_vec(reader, vocabulary * dimension as usize)?,
+    })
+}
+
+fn read_shared_grain(
+    reader: &mut impl Read,
+    dimension: u32,
+    shared: &LegacySharedQuantizer,
+) -> io::Result<LegacySharedGrain> {
+    let num_vectors = read_u32(reader)?;
+    let local_dim = read_u32(reader)?;
+    let block_size = read_u32(reader)?;
+    validate_nonzero(local_dim, "local_dim")?;
+    validate_nonzero(block_size, "block_size")?;
+    let mean = read_f32_vec(reader, dimension as usize)?;
+    let mut column_indices = vec![0_u8; local_dim as usize];
+    reader.read_exact(&mut column_indices)?;
+    let coord_scales = read_f32_vec(reader, local_dim as usize)?;
+    let num_blocks = num_vectors.div_ceil(block_size);
+    let block_bytes = block_size as usize * (local_dim as usize + size_of::<u32>());
+    let mut block_data = vec![0; num_blocks as usize * block_bytes];
+    reader.read_exact(&mut block_data)?;
+    let pq_code_values = num_vectors as usize * shared.pq_subquantizers as usize;
+    let pq_code_bytes = if shared.pq_bits == 8 {
+        pq_code_values
+    } else {
+        pq_code_values.div_ceil(2)
+    };
+    let mut pq_codes = vec![0_u8; pq_code_bytes];
+    reader.read_exact(&mut pq_codes)?;
+    Ok(LegacySharedGrain {
+        num_vectors,
+        local_dim,
+        block_size,
+        mean,
+        column_indices,
+        coord_scales,
+        block_data,
+        pq_codes,
+        pq_error_scale: 1.0,
+        pq_error_norms: Vec::new(),
+    })
 }
 
 fn expect_magic(reader: &mut impl Read, expected: &[u8; 4]) -> io::Result<()> {
@@ -348,13 +476,52 @@ pub fn write_legacy_index(mut writer: impl Write, index: &LegacyIndex) -> io::Re
             write_u32(&mut writer, multi.block_size)?;
             write_u32(&mut writer, multi.sketch_dim)?;
             write_u8(&mut writer, multi.residual_bits)?;
+            write_u8(
+                &mut writer,
+                if multi.shared.is_some() {
+                    V4_FORMAT_SHARED_PQ
+                } else {
+                    V4_FORMAT_LEGACY
+                },
+            )?;
             write_f32_vec(&mut writer, &multi.centroids)?;
+            if let Some(shared) = &multi.shared {
+                write_shared_quantizer(&mut writer, shared)?;
+                for grain in &multi.shared_grains {
+                    write_shared_grain(&mut writer, grain)?;
+                }
+                return Ok(());
+            }
             for grain in &multi.grains {
                 write_embedded_single(&mut writer, grain)?
             }
             Ok(())
         }
     }
+}
+
+fn write_shared_quantizer(
+    writer: &mut impl Write,
+    shared: &LegacySharedQuantizer,
+) -> io::Result<()> {
+    write_u32(writer, shared.basis_cols)?;
+    write_u32(writer, shared.pq_subquantizers)?;
+    write_u8(writer, shared.pq_bits)?;
+    write_u8(writer, u8::from(shared.opq))?;
+    write_f32_vec(writer, &shared.basis)?;
+    write_f32_vec(writer, &shared.opq_rotation)?;
+    write_f32_vec(writer, &shared.pq_codebooks)
+}
+
+fn write_shared_grain(writer: &mut impl Write, grain: &LegacySharedGrain) -> io::Result<()> {
+    write_u32(writer, grain.num_vectors)?;
+    write_u32(writer, grain.local_dim)?;
+    write_u32(writer, grain.block_size)?;
+    write_f32_vec(writer, &grain.mean)?;
+    writer.write_all(&grain.column_indices)?;
+    write_f32_vec(writer, &grain.coord_scales)?;
+    writer.write_all(&grain.block_data)?;
+    writer.write_all(&grain.pq_codes)
 }
 
 /// Write a single grain body (mean, projection, scales, block_data) — no magic/version prefix.

@@ -1,5 +1,11 @@
+use crate::shared::{
+    packed_pq_bytes, train_shared_quantizer, unpack_pq_bytes, SharedBuildGrain,
+    SharedGrainEncoding, SharedQuantizationConfig, SharedQuantizer,
+};
 use crate::{
-    binary::{LegacyIndex, LegacyMultiGrain, LegacySingleGrain},
+    binary::{
+        LegacyIndex, LegacyMultiGrain, LegacySharedGrain, LegacySharedQuantizer, LegacySingleGrain,
+    },
     distance::l2_squared,
     grain::ScoredVector,
     Grain, GrainId, VectorId, DEFAULT_BLOCK_SIZE,
@@ -25,6 +31,8 @@ pub struct AperonIndex {
     rerank_factor: usize,
     vector_locations: HashMap<VectorId, (usize, usize)>,
     adaptive_quantization: Option<AdaptiveQuantizationConfig>,
+    shared_quantization: Option<SharedQuantizationConfig>,
+    shared_quantizer: Option<SharedQuantizer>,
 }
 
 impl AperonIndex {
@@ -46,6 +54,8 @@ impl AperonIndex {
             rerank_factor: 4,
             vector_locations: HashMap::new(),
             adaptive_quantization: None,
+            shared_quantization: None,
+            shared_quantizer: None,
         }
     }
 
@@ -71,6 +81,8 @@ impl AperonIndex {
             rerank_factor: 4,
             vector_locations: HashMap::new(),
             adaptive_quantization: None,
+            shared_quantization: None,
+            shared_quantizer: None,
         }
     }
 
@@ -116,6 +128,25 @@ impl AperonIndex {
         Ok(())
     }
 
+    pub fn enable_shared_basis_pq(
+        &mut self,
+        basis_cols: usize,
+        local_dim: usize,
+        pq_subquantizers: usize,
+        pq_bits: u8,
+        opq: bool,
+    ) -> Result<(), String> {
+        self.shared_quantization = Some(SharedQuantizationConfig::new(
+            self.dim,
+            basis_cols,
+            local_dim,
+            pq_subquantizers,
+            pq_bits,
+            opq,
+        )?);
+        Ok(())
+    }
+
     fn update_vector_locations(&mut self) {
         self.vector_locations.clear();
         for (g_idx, ids) in self.grain_ids.iter().enumerate() {
@@ -155,6 +186,8 @@ impl AperonIndex {
                     rerank_factor: 4,
                     vector_locations: HashMap::new(),
                     adaptive_quantization: None,
+                    shared_quantization: None,
+                    shared_quantizer: None,
                 }
             }
             LegacyIndex::Multi(multi) => {
@@ -163,6 +196,96 @@ impl AperonIndex {
                 let sketch_dim = multi.sketch_dim as usize;
                 let block_size = multi.block_size as usize;
                 let residual_bits = multi.residual_bits;
+                if let Some(shared) = multi.shared {
+                    let config = SharedQuantizationConfig::new(
+                        dim,
+                        shared.basis_cols as usize,
+                        multi.local_dim as usize,
+                        shared.pq_subquantizers as usize,
+                        shared.pq_bits,
+                        shared.opq,
+                    )?;
+                    let quantizer = SharedQuantizer {
+                        config,
+                        basis: shared.basis,
+                        opq_rotation: shared.opq_rotation,
+                        pq_codebooks: shared.pq_codebooks,
+                    };
+                    let centroids = multi
+                        .centroids
+                        .chunks_exact(dim)
+                        .map(|chunk| chunk.to_vec())
+                        .collect::<Vec<_>>();
+                    let grains = multi
+                        .shared_grains
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, grain)| {
+                            let unpacked = unpack_pq_bytes(
+                                &grain.pq_codes,
+                                grain.num_vectors as usize * quantizer.config.pq_subquantizers,
+                                quantizer.config.pq_bits,
+                            );
+                            let encoding = SharedGrainEncoding {
+                                column_indices: grain
+                                    .column_indices
+                                    .iter()
+                                    .map(|value| *value as usize)
+                                    .collect(),
+                                coord_scales: grain.coord_scales,
+                                qcoords: qcoords_from_block_data(
+                                    grain.local_dim as usize,
+                                    grain.block_size as usize,
+                                    grain.num_vectors as usize,
+                                    &grain.block_data,
+                                )?,
+                                pq_codes: unpacked,
+                                error_scale: grain.pq_error_scale,
+                                error_norms: grain.pq_error_norms,
+                            };
+                            Grain::build_shared(
+                                GrainId::new(idx as u64),
+                                &ids_from_block_data(
+                                    grain.local_dim as usize,
+                                    grain.block_size as usize,
+                                    grain.num_vectors as usize,
+                                    &grain.block_data,
+                                )?,
+                                dim,
+                                grain.mean,
+                                grain.block_size as usize,
+                                quantizer.clone(),
+                                encoding,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let grain_ids = grains
+                        .iter()
+                        .map(|grain| grain.vector_ids().to_vec())
+                        .collect::<Vec<_>>();
+                    let mut out = Self {
+                        dim,
+                        local_dim,
+                        sketch_dim,
+                        residual_bits,
+                        block_size,
+                        grains,
+                        centroids,
+                        grain_ids,
+                        id_to_index: HashMap::new(),
+                        ids: Vec::new(),
+                        raw_vectors: Vec::new(),
+                        split_threshold: None,
+                        rerank_factor: 4,
+                        vector_locations: HashMap::new(),
+                        adaptive_quantization: None,
+                        shared_quantization: Some(config),
+                        shared_quantizer: Some(quantizer),
+                    };
+                    out.update_vector_locations();
+                    return Ok(out);
+                }
+
                 let grains = multi
                     .grains
                     .into_iter()
@@ -201,6 +324,8 @@ impl AperonIndex {
                     rerank_factor: 4,
                     vector_locations: HashMap::new(),
                     adaptive_quantization: None,
+                    shared_quantization: None,
+                    shared_quantizer: None,
                 }
             }
         };
@@ -254,6 +379,35 @@ impl AperonIndex {
             .is_some_and(|threshold| self.grain_ids[route].len() >= threshold)
         {
             self.split_grain(route)?;
+        }
+        Ok(())
+    }
+
+    pub fn attach_raw_vectors(
+        &mut self,
+        ids: &[VectorId],
+        vectors: &[Vec<f32>],
+    ) -> Result<(), String> {
+        if ids.len() != vectors.len() {
+            return Err("ids and vectors length mismatch".to_string());
+        }
+        for vector in vectors {
+            if vector.len() != self.dim {
+                return Err(format!(
+                    "dimension mismatch: expected {}, got {}",
+                    self.dim,
+                    vector.len()
+                ));
+            }
+        }
+
+        self.id_to_index.clear();
+        self.ids.clear();
+        self.raw_vectors.clear();
+        for (idx, (id, vector)) in ids.iter().copied().zip(vectors).enumerate() {
+            self.id_to_index.insert(id, idx);
+            self.ids.push(id);
+            self.raw_vectors.push(vector.clone());
         }
         Ok(())
     }
@@ -320,14 +474,45 @@ impl AperonIndex {
         let mut grains = Vec::new();
         let mut centroids = Vec::new();
         let mut grain_ids = Vec::new();
+        let mut build_grains = Vec::new();
         for (ids, vectors) in bucket_ids.into_iter().zip(bucket_vectors) {
             if ids.is_empty() {
                 continue;
             }
-            let grain_idx = grains.len();
-            grains.push(self.build_grain(grain_idx, &vectors, &ids)?);
-            centroids.push(mean_vector(&vectors, self.dim));
+            let mean = mean_vector(&vectors, self.dim);
+            centroids.push(mean.clone());
+            build_grains.push(SharedBuildGrain {
+                ids: ids.clone(),
+                vectors: vectors.clone(),
+                mean: mean.clone(),
+            });
+            if self.shared_quantization.is_none() {
+                let grain_idx = grains.len();
+                grains.push(self.build_grain(grain_idx, &vectors, &ids)?);
+            }
             grain_ids.push(ids);
+        }
+
+        if let Some(config) = self.shared_quantization {
+            let (quantizer, encodings) =
+                train_shared_quantizer(&self.raw_vectors, &build_grains, self.dim, config)?;
+            grains = build_grains
+                .into_iter()
+                .zip(encodings)
+                .enumerate()
+                .map(|(idx, (grain, encoding))| {
+                    Grain::build_shared(
+                        GrainId::new(idx as u64),
+                        &grain.ids,
+                        self.dim,
+                        grain.mean,
+                        self.block_size,
+                        quantizer.clone(),
+                        encoding,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.shared_quantizer = Some(quantizer);
         }
 
         if grains.len() <= 1 {
@@ -448,6 +633,59 @@ impl AperonIndex {
             });
         }
 
+        reranked.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        reranked.truncate(top_k);
+        Ok(reranked)
+    }
+
+    pub fn candidate_pool_with_nprobe(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        if candidate_k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut routes = self.route(query)?;
+        let probe_count = nprobe.max(1).min(routes.len());
+        routes.truncate(probe_count);
+
+        let mut candidates = Vec::new();
+        for route in routes {
+            candidates.extend(self.grains[route].scan(query, candidate_k)?);
+        }
+        candidates.sort_by_key(|c| c.id);
+        candidates.dedup_by_key(|c| c.id);
+        candidates.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        candidates.truncate(candidate_k);
+        Ok(candidates)
+    }
+
+    pub fn search_tiered_with_nprobe(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        let candidates = self.candidate_pool_with_nprobe(query, nprobe, candidate_k)?;
+        let mut reranked = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let dist = self.rerank_distance(query, candidate.id)?;
+            reranked.push(ScoredVector {
+                id: candidate.id,
+                distance: dist,
+            });
+        }
         reranked.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
@@ -589,6 +827,16 @@ impl AperonIndex {
         let vectors = grain_sizes.iter().sum();
         let encoded_bytes = self.grains.iter().map(Grain::encoded_bytes).sum::<usize>()
             + self.centroids.len() * self.dim * size_of::<f32>();
+        let encoded_bytes = encoded_bytes
+            + self
+                .shared_quantizer
+                .as_ref()
+                .map(|q| {
+                    q.basis.len() * size_of::<f32>()
+                        + q.opq_rotation.len() * size_of::<f32>()
+                        + q.pq_codebooks.len() * size_of::<f32>()
+                })
+                .unwrap_or(0);
         let grain_local_dims = self.grains.iter().map(Grain::local_dim).collect::<Vec<_>>();
         let grain_sketch_dims = self
             .grains
@@ -643,6 +891,44 @@ impl AperonIndex {
                 .iter()
                 .map(|grain| self.legacy_single_for_grain(grain))
                 .collect(),
+            shared: self
+                .shared_quantizer
+                .as_ref()
+                .map(|q| LegacySharedQuantizer {
+                    basis_cols: q.config.basis_cols as u32,
+                    pq_subquantizers: q.config.pq_subquantizers as u32,
+                    pq_bits: q.config.pq_bits,
+                    opq: q.config.opq,
+                    basis: q.basis.clone(),
+                    opq_rotation: q.opq_rotation.clone(),
+                    pq_codebooks: q.pq_codebooks.clone(),
+                }),
+            shared_grains: if self.shared_quantizer.is_some() {
+                self.grains
+                    .iter()
+                    .map(|grain| LegacySharedGrain {
+                        num_vectors: grain.len() as u32,
+                        local_dim: grain.local_dim() as u32,
+                        block_size: grain.block_size() as u32,
+                        mean: grain.mean().to_vec(),
+                        column_indices: grain
+                            .shared_column_indices()
+                            .iter()
+                            .map(|idx| *idx as u8)
+                            .collect(),
+                        coord_scales: grain.proj_scales().to_vec(),
+                        block_data: grain.shared_compact_block_bytes(),
+                        pq_codes: packed_pq_bytes(
+                            grain.pq_codes(),
+                            self.shared_quantizer.as_ref().unwrap().config.pq_bits,
+                        ),
+                        pq_error_scale: 1.0,
+                        pq_error_norms: Vec::new(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }))
     }
 
@@ -1025,6 +1311,59 @@ fn mean_vector(vectors: &[Vec<f32>], dim: usize) -> Vec<f32> {
     mean
 }
 
+fn qcoords_from_block_data(
+    local_dim: usize,
+    block_size: usize,
+    num_vectors: usize,
+    bytes: &[u8],
+) -> Result<Vec<i16>, String> {
+    use std::mem::size_of;
+
+    let bytes_per_block = block_size * (local_dim + size_of::<u32>());
+    if bytes.len() != num_vectors.div_ceil(block_size) * bytes_per_block {
+        return Err("shared block data length mismatch".to_string());
+    }
+    let mut out = vec![0_i16; num_vectors * local_dim];
+    for ordinal in 0..num_vectors {
+        let block = ordinal / block_size;
+        let lane = ordinal % block_size;
+        let block_start = block * bytes_per_block;
+        for dim in 0..local_dim {
+            let offset = block_start + dim * block_size + lane;
+            out[ordinal * local_dim + dim] = bytes[offset] as i8 as i16;
+        }
+    }
+    Ok(out)
+}
+
+fn ids_from_block_data(
+    local_dim: usize,
+    block_size: usize,
+    num_vectors: usize,
+    bytes: &[u8],
+) -> Result<Vec<VectorId>, String> {
+    use std::mem::size_of;
+
+    let bytes_per_block = block_size * (local_dim + size_of::<u32>());
+    if bytes.len() != num_vectors.div_ceil(block_size) * bytes_per_block {
+        return Err("shared block data length mismatch".to_string());
+    }
+    let id_base = local_dim * block_size;
+    let mut out = Vec::with_capacity(num_vectors);
+    for ordinal in 0..num_vectors {
+        let block = ordinal / block_size;
+        let lane = ordinal % block_size;
+        let offset = block * bytes_per_block + id_base + lane * size_of::<u32>();
+        let id = u32::from_le_bytes(
+            bytes[offset..offset + size_of::<u32>()]
+                .try_into()
+                .map_err(|_| "invalid shared id bytes")?,
+        );
+        out.push(VectorId::new(u64::from(id)));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,5 +1554,30 @@ mod tests {
         assert_eq!(loaded.residual_bits(), 2);
         let results = loaded.search(&[9.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].id, VectorId::new(2));
+    }
+
+    #[test]
+    fn shared_basis_pq_round_trip_preserves_reconstruction_path() {
+        let mut index = AperonIndex::with_options(4, 2, 0, 4);
+        index.enable_shared_basis_pq(4, 2, 2, 4, true).unwrap();
+        for i in 0..16 {
+            let x = i as f32;
+            index
+                .insert(i as u64, [x, x * 0.5, (i % 4) as f32, 1.0])
+                .unwrap();
+        }
+
+        index.rebuild_n_grains(4).unwrap();
+        let stats = index.stats();
+        assert_eq!(stats.grains, 4);
+        assert!(stats.encoded_bytes > 0);
+
+        let legacy = index.to_legacy_index().unwrap();
+        let loaded = AperonIndex::from_legacy_index(legacy).unwrap();
+        assert_eq!(loaded.stats().grain_local_dims, vec![2, 2, 2, 2]);
+        let results = loaded
+            .search_with_nprobe(&[10.1, 5.0, 2.0, 1.0], 3, 4)
+            .unwrap();
+        assert_eq!(results[0].id, VectorId::new(10));
     }
 }

@@ -247,6 +247,75 @@ fn eval_reports_recall_at_10_against_brute_force() {
     assert_eq!(lines.next(), Some("2,10,1"));
 }
 
+#[test]
+fn eval_raw_rerank_reports_candidate_recall() {
+    let dir = TestDir::new("eval_raw_rerank_reports_candidate_recall");
+    let vectors = dir.path("vectors.hntr");
+    let index = dir.path("index.hntl");
+    let queries = dir.path("queries.hntq");
+    write_raw_vectors(
+        File::create(&vectors).unwrap(),
+        &RawVectors {
+            num_vectors: 4,
+            dimension: 2,
+            vectors: vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+        },
+    )
+    .unwrap();
+    write_queries(
+        File::create(&queries).unwrap(),
+        &QuerySet {
+            num_queries: 1,
+            dimension: 2,
+            vectors: vec![9.0, 0.0],
+        },
+    )
+    .unwrap();
+
+    let build = Command::new(env!("CARGO_BIN_EXE_aperon"))
+        .args([
+            "build",
+            "--vectors",
+            vectors.to_str().unwrap(),
+            "--output",
+            index.to_str().unwrap(),
+            "--local-dim",
+            "2",
+            "--block-size",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&build);
+
+    let eval = Command::new(env!("CARGO_BIN_EXE_aperon"))
+        .args([
+            "eval",
+            "--index",
+            index.to_str().unwrap(),
+            "--vectors",
+            vectors.to_str().unwrap(),
+            "--queries",
+            queries.to_str().unwrap(),
+            "--raw-rerank",
+            "--candidate-k",
+            "2",
+            "--top-k",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert_success(&eval);
+    let stdout = String::from_utf8(eval.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("queries,top_k,candidate_k,recall@2,candidate_recall@2")
+    );
+    assert_eq!(lines.next(), Some("1,2,2,1,1"));
+}
+
 fn assert_success(output: &std::process::Output) {
     assert!(
         output.status.success(),
