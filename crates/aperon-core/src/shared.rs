@@ -336,8 +336,9 @@ fn train_pq_codebooks(
             points.extend_from_slice(&values[row * dim + m * subdim..row * dim + (m + 1) * subdim]);
         }
         let centroids = kmeans_flat(&points, rows, subdim, vocabulary.min(rows.max(1)));
+        let centroid_count = centroids.len() / subdim;
         for code in 0..vocabulary {
-            let src = (code % centroids.len().max(1)) * subdim;
+            let src = (code % centroid_count.max(1)) * subdim;
             let dst = (m * vocabulary + code) * subdim;
             if centroids.is_empty() {
                 continue;
@@ -579,4 +580,24 @@ fn deterministic_unit_vector(dim: usize, component: usize) -> Vec<f32> {
         }
     }
     vector
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pq_training_wraps_codebook_rows_when_vocabulary_exceeds_points() {
+        let values = [
+            1.0_f32, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+
+        let codebooks = train_pq_codebooks(&values, 4, 2, 256);
+
+        assert_eq!(codebooks.len(), 2 * 256 * 2);
+        assert!(codebooks.iter().all(|value| value.is_finite()));
+    }
 }

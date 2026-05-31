@@ -1,17 +1,224 @@
 # Aperon
 
-Aperon is the production Rust implementation of the HNTL/HNCTL vector search
-design validated in `aperon-paper`.
+Aperon is a compact Rust vector search engine with Python bindings. It stores
+vectors in manifold-local grains, scans compressed Block-SoA payloads, and can
+run either as a self-contained compressed index or as a small hot filter in
+front of raw/cold-vector reranking.
 
-This repository starts as a small cargo workspace with two crates:
+The workspace contains:
 
-- `aperon-core`: core index, grain, layout, distance, quantization, and routing
-  modules.
-- `aperon-cli`: command-line entry point for future build, inspect, and query
-  workflows.
+- `aperon-core`: index, routing, quantization, binary formats, and search.
+- `aperon-cli`: `aperon build`, `aperon query`, and `aperon eval`.
 - `aperon-py`: PyO3 bindings published as the `aperon` Python package.
 
-## Development
+## Requirements
+
+- Rust stable with Cargo.
+- Python 3.9+.
+- `maturin` for local Python development installs.
+
+## Quickstart From Clone
+
+```bash
+git clone https://github.com/substrate-lab/aperon.git
+cd aperon
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install maturin numpy
+
+cargo build --workspace
+maturin develop --release
+```
+
+Generate a tiny deterministic dataset in Aperon's binary formats:
+
+```bash
+python examples/generate_toy.py --out tmp/aperon-toy
+```
+
+Build a multi-grain index:
+
+```bash
+cargo run -p aperon-cli -- build \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --output tmp/aperon-toy/index.hntm \
+  --grains 4 \
+  --local-dim 4 \
+  --block-size 8
+```
+
+Query it:
+
+```bash
+cargo run -p aperon-cli -- query \
+  --index tmp/aperon-toy/index.hntm \
+  --queries tmp/aperon-toy/queries.hntq \
+  --top-k 3 \
+  --nprobe 2
+```
+
+Evaluate Recall@K against brute-force search:
+
+```bash
+cargo run -p aperon-cli -- eval \
+  --index tmp/aperon-toy/index.hntm \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --queries tmp/aperon-toy/queries.hntq \
+  --top-k 3 \
+  --nprobe 2
+```
+
+Expected eval output shape:
+
+```text
+queries,top_k,recall@3
+4,3,1
+```
+
+## Python API
+
+```python
+import numpy as np
+import aperon
+
+rng = np.random.default_rng(7)
+vectors = rng.normal(size=(128, 16)).astype(np.float32)
+queries = vectors[:4].copy()
+ids = np.arange(len(vectors), dtype=np.uint64)
+
+idx = aperon.AperonIndex(dim=16, local_dim=8, block_size=16)
+idx.insert_many(ids, vectors)
+idx.rebuild_n_grains(8)
+
+print(idx.search(queries[0], top_k=5, nprobe=4))
+print(idx.stats())
+```
+
+## Mode A: Self-Contained Compressed Search
+
+Mode A stores the compressed index and reconstructs/reranks from its own
+payload. It does not require raw vectors at query time.
+
+CLI:
+
+```bash
+cargo run -p aperon-cli -- build \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --output tmp/aperon-toy/mode-a.hntm \
+  --grains 4 \
+  --shared-basis-cols 4 \
+  --shared-local-dim 4 \
+  --shared-pq-subquantizers 2 \
+  --shared-pq-bits 8 \
+  --shared-opq \
+  --block-size 8
+
+cargo run -p aperon-cli -- eval \
+  --index tmp/aperon-toy/mode-a.hntm \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --queries tmp/aperon-toy/queries.hntq \
+  --top-k 3 \
+  --nprobe 4
+```
+
+Python:
+
+```python
+import numpy as np
+import aperon
+
+vectors = np.random.default_rng(1).normal(size=(256, 32)).astype(np.float32)
+ids = np.arange(len(vectors), dtype=np.uint64)
+
+idx = aperon.AperonIndex(32, local_dim=16, block_size=32)
+idx.enable_shared_basis_pq(
+    basis_cols=16,
+    local_dim=8,
+    pq_subquantizers=4,
+    pq_bits=8,
+    opq=True,
+)
+idx.insert_many(ids, vectors)
+idx.rebuild_n_grains(8)
+idx.save("tmp/mode-a.hntm")
+
+loaded = aperon.AperonIndex.load("tmp/mode-a.hntm")
+print(loaded.search(vectors[0], top_k=5, nprobe=4))
+```
+
+## Mode B: Hot Filter With Raw-Vector Rerank
+
+Mode B uses a smaller resident index to generate candidates, then reranks those
+candidates against attached raw vectors. In production, the raw vectors can live
+in a colder tier; the current API attaches them in memory.
+
+CLI:
+
+```bash
+cargo run -p aperon-cli -- build \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --output tmp/aperon-toy/mode-b.hntm \
+  --grains 4 \
+  --local-dim 2 \
+  --sketch-dim 2 \
+  --residual-bits 2 \
+  --block-size 8
+
+cargo run -p aperon-cli -- eval \
+  --index tmp/aperon-toy/mode-b.hntm \
+  --vectors tmp/aperon-toy/vectors.hntr \
+  --queries tmp/aperon-toy/queries.hntq \
+  --top-k 3 \
+  --nprobe 4 \
+  --raw-rerank \
+  --candidate-k 12
+```
+
+Python:
+
+```python
+import numpy as np
+import aperon
+
+vectors = np.random.default_rng(2).normal(size=(256, 32)).astype(np.float32)
+ids = np.arange(len(vectors), dtype=np.uint64)
+
+idx = aperon.AperonIndex(
+    dim=32,
+    local_dim=8,
+    sketch_dim=8,
+    block_size=32,
+    residual_bits=2,
+)
+idx.insert_many(ids, vectors)
+idx.rebuild_n_grains(8)
+idx.attach_raw_vectors(ids, vectors)
+
+print(idx.candidates(vectors[0], nprobe=4, candidate_k=50)[:5])
+print(idx.search_tiered(vectors[0], top_k=5, nprobe=4, candidate_k=50))
+```
+
+## CLI Reference
+
+```text
+aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N] [--shared-basis-cols N --shared-local-dim N --shared-pq-subquantizers N --shared-pq-bits 4|8 --shared-opq]
+aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]
+aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N] [--raw-rerank --candidate-k N]
+```
+
+`HNTR` and `HNTQ` are little-endian float32 matrix formats:
+
+```text
+4 bytes magic: HNTR or HNTQ
+u32 version: currently 4
+u32 row count
+u32 dimension
+row_count * dimension float32 values
+```
+
+## Development Checks
 
 ```bash
 cargo fmt --all -- --check
@@ -20,40 +227,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p aperon-py --features extension-module
 ```
 
-## Python
-
-```python
-import numpy as np
-import aperon
-
-idx = aperon.AperonIndex(3)
-idx.insert(np.array([1.0, 0.0, 0.0], dtype=np.float32))
-idx.insert_many(
-    [10, 11],
-    np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-)
-print(aperon.__version__, idx.stats())
-```
-
-## Status
-
-T-121 and T-119 are **[DONE]**. The workspace now contains a production-quality
-Rust port of the validated compact scan path:
-
-- memory-safe Block-SoA storage for quantized coordinates, residuals, sketches,
-  and vector ids;
-- C++ parity quantization semantics (ties-to-even / banker's rounding);
-- PCA-based local grain build, query projection, weighted quantized scan,
-  dynamic grain splitting, two-grain centroid routing, and top-k search;
-- architecture-specific L2 SIMD dispatch for AVX2/FMA and AArch64 NEON with
-  scalar fallback;
-- block-level integer scan dispatch for quantized Block-SoA grains with
-  deterministic scalar parity coverage;
-- HNTR/HNTQ/HNTL/HNTM binary format loaders;
-- `aperon build --grains N`, `aperon query`, and `aperon eval` CLI workflows
-  for HNTR/HNTQ/HNTL/HNTM files, including brute-force Recall@K evaluation;
-- PyO3 bindings for insert, rebuild, split configuration, search, dict stats,
-  save/load, numpy vector insert, and batch insert.
-
-Next up (roadmap):
-- Python packaging and API polish beyond the core T-128 surface
+For benchmark methodology and current siftsmall results, see
+`benchmarks/README.md`.
