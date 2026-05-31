@@ -65,6 +65,9 @@ fn build(args: &[String]) -> Result<(), String> {
     let shared_pq_subquantizers = flags.optional_nonzero_usize("--shared-pq-subquantizers")?;
     let shared_pq_bits = flags.optional_u8("--shared-pq-bits")?.unwrap_or(4);
     let shared_opq = flags.optional_bool("--shared-opq")?;
+    let lattice_routing = flags.optional_bool("--enable-lattice-routing")?;
+    let lattice_routing_dim = flags.optional_nonzero_usize("--routing-dim")?.unwrap_or(4);
+    let lattice_spacing = flags.optional_f32("--spacing")?.unwrap_or(0.5);
     flags.finish()?;
 
     let raw = load_raw_vectors(File::open(&vectors_path).map_err(format_io)?).map_err(format_io)?;
@@ -124,6 +127,9 @@ fn build(args: &[String]) -> Result<(), String> {
         index.insert(VectorId::new(idx as u64), vector.to_vec())?;
     }
     index.rebuild_n_grains(grains)?;
+    if lattice_routing {
+        index.enable_lattice_routing(lattice_routing_dim, lattice_spacing)?;
+    }
     let legacy = index
         .to_legacy_index()
         .ok_or_else(|| "failed to build a serializable index".to_string())?;
@@ -463,7 +469,7 @@ fn format_io(err: io::Error) -> String {
 fn usage() -> String {
     [
         "usage:",
-        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N] [--shared-basis-cols N --shared-local-dim N --shared-pq-subquantizers N --shared-pq-bits 4|8 --shared-opq]",
+        "  aperon build --vectors <HNTR> --output <HNTL|HNTM> [--grains N] [--local-dim N] [--sketch-dim N] [--residual-bits 1|2|8] [--block-size N] [--adaptive-min-local-dim N --adaptive-max-local-dim N] [--shared-basis-cols N --shared-local-dim N --shared-pq-subquantizers N --shared-pq-bits 4|8 --shared-opq] [--enable-lattice-routing] [--routing-dim N] [--spacing F]",
         "  aperon query --index <HNTL|HNTM> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N]",
         "  aperon eval --index <HNTL|HNTM> --vectors <HNTR> --queries <HNTQ> [--top-k N] [--nprobe N] [--rerank-factor N] [--raw-rerank --candidate-k N]",
     ]

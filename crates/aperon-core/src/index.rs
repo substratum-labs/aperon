@@ -4,7 +4,8 @@ use crate::shared::{
 };
 use crate::{
     binary::{
-        LegacyIndex, LegacyMultiGrain, LegacySharedGrain, LegacySharedQuantizer, LegacySingleGrain,
+        LegacyIndex, LegacyLatticeRouter, LegacyMultiGrain, LegacySharedGrain,
+        LegacySharedQuantizer, LegacySingleGrain,
     },
     distance::l2_squared,
     grain::ScoredVector,
@@ -33,6 +34,8 @@ pub struct AperonIndex {
     adaptive_quantization: Option<AdaptiveQuantizationConfig>,
     shared_quantization: Option<SharedQuantizationConfig>,
     shared_quantizer: Option<SharedQuantizer>,
+    lattice_router: Option<crate::routing::LatticeRouter>,
+    hlr_router: Option<crate::routing::HierarchicalLatticeRouter>,
 }
 
 impl AperonIndex {
@@ -56,6 +59,8 @@ impl AperonIndex {
             adaptive_quantization: None,
             shared_quantization: None,
             shared_quantizer: None,
+            lattice_router: None,
+            hlr_router: None,
         }
     }
 
@@ -83,6 +88,8 @@ impl AperonIndex {
             adaptive_quantization: None,
             shared_quantization: None,
             shared_quantizer: None,
+            lattice_router: None,
+            hlr_router: None,
         }
     }
 
@@ -188,6 +195,8 @@ impl AperonIndex {
                     adaptive_quantization: None,
                     shared_quantization: None,
                     shared_quantizer: None,
+                    lattice_router: None,
+                    hlr_router: None,
                 }
             }
             LegacyIndex::Multi(multi) => {
@@ -263,6 +272,46 @@ impl AperonIndex {
                         .iter()
                         .map(|grain| grain.vector_ids().to_vec())
                         .collect::<Vec<_>>();
+                    let lattice_router = if let Some(legacy_router) = multi.lattice_router {
+                        let mut map = HashMap::new();
+                        for (key, values) in legacy_router
+                            .map_keys
+                            .into_iter()
+                            .zip(legacy_router.map_values)
+                        {
+                            map.insert(key, values.into_iter().map(|idx| idx as usize).collect());
+                        }
+                        let r_dim = legacy_router.routing_dim as usize;
+                        let mut projection = vec![0.0; r_dim * dim];
+                        for d in 0..dim {
+                            for j in 0..r_dim {
+                                projection[j * dim + d] = legacy_router.projection[d * r_dim + j];
+                            }
+                        }
+                        let num_centroids = centroids.len();
+                        let mut centroids_coords = vec![0_i16; num_centroids * r_dim];
+                        for (g_idx, centroid) in centroids.iter().enumerate() {
+                            for j in 0..r_dim {
+                                let mut dot = 0.0;
+                                for d in 0..dim {
+                                    dot += centroid[d] * projection[j * dim + d];
+                                }
+                                centroids_coords[g_idx * r_dim + j] =
+                                    (dot / legacy_router.spacing).round() as i16;
+                            }
+                        }
+                        Some(crate::routing::LatticeRouter {
+                            dim,
+                            routing_dim: r_dim,
+                            spacing: legacy_router.spacing,
+                            projection,
+                            lattice_map: map,
+                            centroids_coords,
+                            num_centroids,
+                        })
+                    } else {
+                        None
+                    };
                     let mut out = Self {
                         dim,
                         local_dim,
@@ -281,6 +330,8 @@ impl AperonIndex {
                         adaptive_quantization: None,
                         shared_quantization: Some(config),
                         shared_quantizer: Some(quantizer),
+                        lattice_router,
+                        hlr_router: None,
                     };
                     out.update_vector_locations();
                     return Ok(out);
@@ -308,6 +359,46 @@ impl AperonIndex {
                         centroids.len()
                     ));
                 }
+                let lattice_router = if let Some(legacy_router) = multi.lattice_router {
+                    let mut map = HashMap::new();
+                    for (key, values) in legacy_router
+                        .map_keys
+                        .into_iter()
+                        .zip(legacy_router.map_values)
+                    {
+                        map.insert(key, values.into_iter().map(|idx| idx as usize).collect());
+                    }
+                    let r_dim = legacy_router.routing_dim as usize;
+                    let mut projection = vec![0.0; r_dim * dim];
+                    for d in 0..dim {
+                        for j in 0..r_dim {
+                            projection[j * dim + d] = legacy_router.projection[d * r_dim + j];
+                        }
+                    }
+                    let num_centroids = centroids.len();
+                    let mut centroids_coords = vec![0_i16; num_centroids * r_dim];
+                    for (g_idx, centroid) in centroids.iter().enumerate() {
+                        for j in 0..r_dim {
+                            let mut dot = 0.0;
+                            for d in 0..dim {
+                                dot += centroid[d] * projection[j * dim + d];
+                            }
+                            centroids_coords[g_idx * r_dim + j] =
+                                (dot / legacy_router.spacing).round() as i16;
+                        }
+                    }
+                    Some(crate::routing::LatticeRouter {
+                        dim,
+                        routing_dim: r_dim,
+                        spacing: legacy_router.spacing,
+                        projection,
+                        lattice_map: map,
+                        centroids_coords,
+                        num_centroids,
+                    })
+                } else {
+                    None
+                };
                 Self {
                     dim,
                     local_dim,
@@ -326,6 +417,8 @@ impl AperonIndex {
                     adaptive_quantization: None,
                     shared_quantization: None,
                     shared_quantizer: None,
+                    lattice_router,
+                    hlr_router: None,
                 }
             }
         };
@@ -341,6 +434,85 @@ impl AperonIndex {
             ));
         }
         self.split_threshold = Some(split_threshold);
+        Ok(())
+    }
+
+    pub fn enable_lattice_routing(
+        &mut self,
+        routing_dim: usize,
+        spacing: f32,
+    ) -> Result<(), String> {
+        if self.centroids.is_empty() {
+            return Err(
+                "cannot enable lattice routing: no centroids exist. Build/rebuild index first."
+                    .to_string(),
+            );
+        }
+        let router =
+            crate::routing::LatticeRouter::new(self.dim, routing_dim, spacing, &self.centroids)?;
+        self.lattice_router = Some(router);
+        Ok(())
+    }
+
+    pub fn lattice_router(&self) -> Option<&crate::routing::LatticeRouter> {
+        self.lattice_router.as_ref()
+    }
+
+    fn update_lattice_router(&mut self) -> Result<(), String> {
+        if let Some(existing) = &self.lattice_router {
+            let routing_dim = existing.routing_dim;
+            let spacing = existing.spacing;
+            let router = crate::routing::LatticeRouter::new(
+                self.dim,
+                routing_dim,
+                spacing,
+                &self.centroids,
+            )?;
+            self.lattice_router = Some(router);
+        }
+        Ok(())
+    }
+
+    pub fn enable_hlr_routing(
+        &mut self,
+        layer_configs: &[crate::routing::HierarchicalLatticeLayerConfig],
+    ) -> Result<(), String> {
+        if self.centroids.is_empty() {
+            return Err(
+                "cannot enable HLR routing: no centroids exist. Build/rebuild index first."
+                    .to_string(),
+            );
+        }
+        let router = crate::routing::HierarchicalLatticeRouter::new(
+            self.dim,
+            layer_configs,
+            &self.centroids,
+        )?;
+        self.hlr_router = Some(router);
+        Ok(())
+    }
+
+    pub fn hlr_router(&self) -> Option<&crate::routing::HierarchicalLatticeRouter> {
+        self.hlr_router.as_ref()
+    }
+
+    fn update_hlr_router(&mut self) -> Result<(), String> {
+        if let Some(existing) = &self.hlr_router {
+            let configs: Vec<crate::routing::HierarchicalLatticeLayerConfig> = existing
+                .layers
+                .iter()
+                .map(|layer| crate::routing::HierarchicalLatticeLayerConfig {
+                    routing_dim: layer.routing_dim,
+                    spacing: layer.spacing,
+                })
+                .collect();
+            let router = crate::routing::HierarchicalLatticeRouter::new(
+                self.dim,
+                &configs,
+                &self.centroids,
+            )?;
+            self.hlr_router = Some(router);
+        }
         Ok(())
     }
 
@@ -362,7 +534,7 @@ impl AperonIndex {
         let route = if self.grains.len() == 1 {
             0
         } else {
-            self.route(&vector)?[0]
+            self.route(&vector, None)?[0]
         };
 
         self.grains[route].insert(id, vector.clone())?;
@@ -417,6 +589,8 @@ impl AperonIndex {
         self.centroids = vec![mean_vector(&self.raw_vectors, self.dim)];
         self.grain_ids = vec![self.ids.clone()];
         self.update_vector_locations();
+        self.update_lattice_router()?;
+        self.update_hlr_router()?;
         Ok(())
     }
 
@@ -451,6 +625,8 @@ impl AperonIndex {
         self.centroids = vec![split.centroid0, split.centroid1];
         self.grain_ids = vec![ids0, ids1];
         self.update_vector_locations();
+        self.update_lattice_router()?;
+        self.update_hlr_router()?;
         Ok(())
     }
 
@@ -523,6 +699,8 @@ impl AperonIndex {
         self.centroids = centroids;
         self.grain_ids = grain_ids;
         self.update_vector_locations();
+        self.update_lattice_router()?;
+        self.update_hlr_router()?;
         Ok(())
     }
 
@@ -594,7 +772,7 @@ impl AperonIndex {
         rerank_factor: usize,
     ) -> Result<Vec<ScoredVector>, String> {
         if rerank_factor == 0 {
-            let mut routes = self.route(query)?;
+            let mut routes = self.route(query, Some(nprobe))?;
             let probe_count = nprobe.max(1).min(routes.len());
             routes.truncate(probe_count);
 
@@ -611,7 +789,7 @@ impl AperonIndex {
             return Ok(results);
         }
 
-        let mut routes = self.route(query)?;
+        let mut routes = self.route(query, Some(nprobe))?;
         let probe_count = nprobe.max(1).min(routes.len());
         routes.truncate(probe_count);
 
@@ -651,7 +829,7 @@ impl AperonIndex {
         if candidate_k == 0 {
             return Ok(Vec::new());
         }
-        let mut routes = self.route(query)?;
+        let mut routes = self.route(query, Some(nprobe))?;
         let probe_count = nprobe.max(1).min(routes.len());
         routes.truncate(probe_count);
 
@@ -719,19 +897,61 @@ impl AperonIndex {
 
     fn routed_grains(&self, query: &[f32]) -> Result<Vec<&Grain>, String> {
         Ok(self
-            .route(query)?
+            .route(query, None)?
             .into_iter()
             .map(|idx| &self.grains[idx])
             .collect())
     }
 
-    fn route(&self, query: &[f32]) -> Result<Vec<usize>, String> {
+    fn route(&self, query: &[f32], nprobe: Option<usize>) -> Result<Vec<usize>, String> {
         if query.len() != self.dim {
             return Err(format!(
                 "dimension mismatch: expected {}, got {}",
                 self.dim,
                 query.len()
             ));
+        }
+
+        if let Some(router) = &self.hlr_router {
+            let np = nprobe.unwrap_or(1);
+            let limit = (np * 2 + 16).min(self.centroids.len());
+            let mut routed = router.route_nprobe(query, limit);
+
+            // Sort these routed candidate centroids by exact L2 distance
+            routed.sort_by(|&a, &b| {
+                let dist_a = l2_squared(query, &self.centroids[a]).unwrap_or(f32::INFINITY);
+                let dist_b = l2_squared(query, &self.centroids[b]).unwrap_or(f32::INFINITY);
+                dist_a.total_cmp(&dist_b).then_with(|| a.cmp(&b))
+            });
+
+            let mut all_routes = routed;
+            for idx in 0..self.centroids.len() {
+                if !all_routes.contains(&idx) {
+                    all_routes.push(idx);
+                }
+            }
+            return Ok(all_routes);
+        }
+
+        if let Some(router) = &self.lattice_router {
+            let np = nprobe.unwrap_or(1);
+            let limit = (np * 2 + 16).min(self.centroids.len());
+            let mut routed = router.route_nprobe(query, limit);
+
+            // Sort these routed candidate centroids by exact L2 distance
+            routed.sort_by(|&a, &b| {
+                let dist_a = l2_squared(query, &self.centroids[a]).unwrap_or(f32::INFINITY);
+                let dist_b = l2_squared(query, &self.centroids[b]).unwrap_or(f32::INFINITY);
+                dist_a.total_cmp(&dist_b).then_with(|| a.cmp(&b))
+            });
+
+            let mut all_routes = routed;
+            for idx in 0..self.centroids.len() {
+                if !all_routes.contains(&idx) {
+                    all_routes.push(idx);
+                }
+            }
+            return Ok(all_routes);
         }
 
         let mut routes = self
@@ -929,6 +1149,28 @@ impl AperonIndex {
             } else {
                 Vec::new()
             },
+            lattice_router: self.lattice_router.as_ref().map(|router| {
+                let mut map_keys = Vec::new();
+                let mut map_values = Vec::new();
+                for (key, values) in &router.lattice_map {
+                    map_keys.push(key.clone());
+                    map_values.push(values.iter().map(|&idx| idx as u32).collect());
+                }
+                let mut legacy_projection = vec![0.0; router.dim * router.routing_dim];
+                for d in 0..router.dim {
+                    for j in 0..router.routing_dim {
+                        legacy_projection[d * router.routing_dim + j] =
+                            router.projection[j * router.dim + d];
+                    }
+                }
+                LegacyLatticeRouter {
+                    routing_dim: router.routing_dim as u32,
+                    spacing: router.spacing,
+                    projection: legacy_projection,
+                    map_keys,
+                    map_values,
+                }
+            }),
         }))
     }
 
@@ -1576,6 +1818,62 @@ mod tests {
         let loaded = AperonIndex::from_legacy_index(legacy).unwrap();
         assert_eq!(loaded.stats().grain_local_dims, vec![2, 2, 2, 2]);
         let results = loaded
+            .search_with_nprobe(&[10.1, 5.0, 2.0, 1.0], 3, 4)
+            .unwrap();
+        assert_eq!(results[0].id, VectorId::new(10));
+    }
+
+    #[test]
+    fn lattice_routing_round_trip() {
+        let mut index = AperonIndex::with_options(4, 2, 0, 4);
+        for i in 0..16 {
+            let x = i as f32;
+            index
+                .insert(i as u64, [x, x * 0.5, (i % 4) as f32, 1.0])
+                .unwrap();
+        }
+
+        index.rebuild_n_grains(4).unwrap();
+        index.enable_lattice_routing(4, 0.5).unwrap();
+
+        assert!(index.lattice_router().is_some());
+
+        let legacy = index.to_legacy_index().unwrap();
+        let loaded = AperonIndex::from_legacy_index(legacy).unwrap();
+
+        assert!(loaded.lattice_router().is_some());
+        let results = loaded
+            .search_with_nprobe(&[10.1, 5.0, 2.0, 1.0], 3, 4)
+            .unwrap();
+        assert_eq!(results[0].id, VectorId::new(10));
+    }
+
+    #[test]
+    fn hlr_routing_round_trip() {
+        let mut index = AperonIndex::with_options(4, 2, 0, 4);
+        for i in 0..16 {
+            let x = i as f32;
+            index
+                .insert(i as u64, [x, x * 0.5, (i % 4) as f32, 1.0])
+                .unwrap();
+        }
+
+        index.rebuild_n_grains(4).unwrap();
+        let configs = vec![
+            crate::routing::HierarchicalLatticeLayerConfig {
+                routing_dim: 2,
+                spacing: 1.0,
+            },
+            crate::routing::HierarchicalLatticeLayerConfig {
+                routing_dim: 2,
+                spacing: 0.5,
+            },
+        ];
+        index.enable_hlr_routing(&configs).unwrap();
+
+        assert!(index.hlr_router().is_some());
+
+        let results = index
             .search_with_nprobe(&[10.1, 5.0, 2.0, 1.0], 3, 4)
             .unwrap();
         assert_eq!(results[0].id, VectorId::new(10));

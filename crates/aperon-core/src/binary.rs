@@ -4,6 +4,8 @@ pub const LEGACY_VERSION: u32 = 4;
 pub const MIN_SUPPORTED_VERSION: u32 = 1;
 const V4_FORMAT_LEGACY: u8 = 0;
 const V4_FORMAT_SHARED_PQ: u8 = 1;
+const V4_FORMAT_LATTICE_LEGACY: u8 = 2;
+const V4_FORMAT_LATTICE_SHARED_PQ: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawVectors {
@@ -49,6 +51,16 @@ pub struct LegacyMultiGrain {
     pub grains: Vec<LegacySingleGrain>,
     pub shared: Option<LegacySharedQuantizer>,
     pub shared_grains: Vec<LegacySharedGrain>,
+    pub lattice_router: Option<LegacyLatticeRouter>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyLatticeRouter {
+    pub routing_dim: u32,
+    pub spacing: f32,
+    pub projection: Vec<f32>,
+    pub map_keys: Vec<Vec<i16>>,
+    pub map_values: Vec<Vec<u32>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,12 +147,21 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
         V4_FORMAT_LEGACY
     };
     let centroids = read_f32_vec(reader, num_centroids as usize * dimension as usize)?;
-    if format == V4_FORMAT_SHARED_PQ {
+
+    let is_shared = format == V4_FORMAT_SHARED_PQ || format == V4_FORMAT_LATTICE_SHARED_PQ;
+    let has_lattice = format == V4_FORMAT_LATTICE_LEGACY || format == V4_FORMAT_LATTICE_SHARED_PQ;
+
+    if is_shared {
         let shared = read_shared_quantizer(reader, dimension)?;
         let mut shared_grains = Vec::with_capacity(num_centroids as usize);
         for _ in 0..num_centroids {
             shared_grains.push(read_shared_grain(reader, dimension, &shared)?);
         }
+        let lattice_router = if has_lattice {
+            Some(read_lattice_router(reader, dimension)?)
+        } else {
+            None
+        };
         return Ok(LegacyMultiGrain {
             num_centroids,
             num_vectors,
@@ -153,14 +174,17 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
             grains: Vec::new(),
             shared: Some(shared),
             shared_grains,
+            lattice_router,
         });
     }
-    if format != V4_FORMAT_LEGACY {
+
+    if format != V4_FORMAT_LEGACY && format != V4_FORMAT_LATTICE_LEGACY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported v4 index format",
         ));
     }
+
     let mut grains = Vec::with_capacity(num_centroids as usize);
     for _ in 0..num_centroids {
         grains.push(read_embedded_single(
@@ -173,6 +197,11 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
             residual_bits,
         )?);
     }
+    let lattice_router = if has_lattice {
+        Some(read_lattice_router(reader, dimension)?)
+    } else {
+        None
+    };
     Ok(LegacyMultiGrain {
         num_centroids,
         num_vectors,
@@ -185,6 +214,7 @@ fn read_multi_after_magic(reader: &mut impl Read) -> io::Result<LegacyMultiGrain
         grains,
         shared: None,
         shared_grains: Vec::new(),
+        lattice_router,
     })
 }
 
@@ -316,6 +346,54 @@ fn read_shared_quantizer(
         opq_rotation: read_f32_vec(reader, dimension as usize * dimension as usize)?,
         pq_codebooks: read_f32_vec(reader, vocabulary * dimension as usize)?,
     })
+}
+
+fn read_lattice_router(reader: &mut impl Read, dimension: u32) -> io::Result<LegacyLatticeRouter> {
+    let routing_dim = read_u32(reader)?;
+    let spacing = read_f32(reader)?;
+    let projection = read_f32_vec(reader, dimension as usize * routing_dim as usize)?;
+    let num_entries = read_u32(reader)?;
+    let mut map_keys = Vec::with_capacity(num_entries as usize);
+    let mut map_values = Vec::with_capacity(num_entries as usize);
+    for _ in 0..num_entries {
+        let mut key = vec![0_i16; routing_dim as usize];
+        for val in &mut key {
+            let mut bytes = [0; 2];
+            reader.read_exact(&mut bytes)?;
+            *val = i16::from_le_bytes(bytes);
+        }
+        map_keys.push(key);
+        let list_len = read_u32(reader)?;
+        let mut val_list = Vec::with_capacity(list_len as usize);
+        for _ in 0..list_len {
+            val_list.push(read_u32(reader)?);
+        }
+        map_values.push(val_list);
+    }
+    Ok(LegacyLatticeRouter {
+        routing_dim,
+        spacing,
+        projection,
+        map_keys,
+        map_values,
+    })
+}
+
+fn write_lattice_router(writer: &mut impl Write, router: &LegacyLatticeRouter) -> io::Result<()> {
+    write_u32(writer, router.routing_dim)?;
+    write_f32(writer, router.spacing)?;
+    write_f32_vec(writer, &router.projection)?;
+    write_u32(writer, router.map_keys.len() as u32)?;
+    for (key, values) in router.map_keys.iter().zip(&router.map_values) {
+        for &val in key {
+            writer.write_all(&val.to_le_bytes())?;
+        }
+        write_u32(writer, values.len() as u32)?;
+        for &val in values {
+            write_u32(writer, val)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_shared_grain(
@@ -476,24 +554,26 @@ pub fn write_legacy_index(mut writer: impl Write, index: &LegacyIndex) -> io::Re
             write_u32(&mut writer, multi.block_size)?;
             write_u32(&mut writer, multi.sketch_dim)?;
             write_u8(&mut writer, multi.residual_bits)?;
-            write_u8(
-                &mut writer,
-                if multi.shared.is_some() {
-                    V4_FORMAT_SHARED_PQ
-                } else {
-                    V4_FORMAT_LEGACY
-                },
-            )?;
+            let format = match (&multi.shared, &multi.lattice_router) {
+                (Some(_), Some(_)) => V4_FORMAT_LATTICE_SHARED_PQ,
+                (Some(_), None) => V4_FORMAT_SHARED_PQ,
+                (None, Some(_)) => V4_FORMAT_LATTICE_LEGACY,
+                (None, None) => V4_FORMAT_LEGACY,
+            };
+            write_u8(&mut writer, format)?;
             write_f32_vec(&mut writer, &multi.centroids)?;
             if let Some(shared) = &multi.shared {
                 write_shared_quantizer(&mut writer, shared)?;
                 for grain in &multi.shared_grains {
                     write_shared_grain(&mut writer, grain)?;
                 }
-                return Ok(());
+            } else {
+                for grain in &multi.grains {
+                    write_embedded_single(&mut writer, grain)?
+                }
             }
-            for grain in &multi.grains {
-                write_embedded_single(&mut writer, grain)?
+            if let Some(router) = &multi.lattice_router {
+                write_lattice_router(&mut writer, router)?;
             }
             Ok(())
         }

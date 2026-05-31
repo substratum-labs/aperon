@@ -15,7 +15,10 @@ pub use grain::{Grain, GrainId, ScoredVector};
 pub use index::{AperonIndex, IndexStats};
 pub use layout::{BlockSoaLayout, VectorId, DEFAULT_BLOCK_SIZE};
 pub use quantization::{QuantizationError, Quantizer};
-pub use routing::{CentroidRouter, Route};
+pub use routing::{
+    CentroidRouter, HierarchicalLatticeLayer, HierarchicalLatticeLayerConfig,
+    HierarchicalLatticeRouter, HtlaDiagnostics, HtlaRoute, HtlaRouter, LatticeRouter, Route,
+};
 
 #[cfg(test)]
 mod tests {

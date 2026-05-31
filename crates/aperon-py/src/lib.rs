@@ -1,6 +1,6 @@
 use aperon_core::{
     binary::{load_legacy_index, write_legacy_index},
-    AperonIndex, VectorId,
+    AperonIndex, HierarchicalLatticeLayerConfig, HierarchicalLatticeRouter, HtlaRouter, VectorId,
 };
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -12,6 +12,132 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[pyclass(name = "AperonIndex")]
 struct PyAperonIndex {
     inner: AperonIndex,
+}
+
+#[pyclass(name = "HlrRouter")]
+struct PyHlrRouter {
+    inner: HierarchicalLatticeRouter,
+}
+
+#[pyclass(name = "HtlaRouter")]
+struct PyHtlaRouter {
+    inner: HtlaRouter,
+}
+
+#[pymethods]
+impl PyHlrRouter {
+    #[new]
+    #[pyo3(signature = (dim, vectors, layer_configs))]
+    fn new(
+        dim: usize,
+        vectors: &Bound<'_, PyAny>,
+        layer_configs: Vec<(usize, f32)>,
+    ) -> PyResult<Self> {
+        let vectors = extract_matrix(vectors)?;
+        let configs = hlr_configs(layer_configs);
+        let inner = HierarchicalLatticeRouter::new(dim, &configs, &vectors).map_err(value_error)?;
+        Ok(Self { inner })
+    }
+
+    fn route(&self, query: Vec<f32>, nprobe: usize) -> Vec<usize> {
+        self.inner.route_nprobe(&query, nprobe)
+    }
+
+    fn route_many(&self, queries: PyReadonlyArray2<'_, f32>, nprobe: usize) -> Vec<Vec<usize>> {
+        queries
+            .as_array()
+            .outer_iter()
+            .map(|row| {
+                let query = row.iter().copied().collect::<Vec<_>>();
+                self.inner.route_nprobe(&query, nprobe)
+            })
+            .collect()
+    }
+
+    fn residual_energy(&self) -> Vec<f32> {
+        self.inner.residual_energy.clone()
+    }
+}
+
+#[pymethods]
+impl PyHtlaRouter {
+    #[new]
+    #[pyo3(signature = (dim, vectors, levels, chart_dim))]
+    fn new(
+        dim: usize,
+        vectors: &Bound<'_, PyAny>,
+        levels: usize,
+        chart_dim: usize,
+    ) -> PyResult<Self> {
+        let vectors = extract_matrix(vectors)?;
+        let inner = HtlaRouter::new(dim, &vectors, levels, chart_dim).map_err(value_error)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (query, beam, pool, final_nprobe=16))]
+    fn route(
+        &self,
+        query: Vec<f32>,
+        beam: usize,
+        pool: usize,
+        final_nprobe: usize,
+    ) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let route = self.inner.route(&query, beam, pool, final_nprobe);
+            let dict = PyDict::new(py);
+            dict.set_item("candidates", route.candidates)?;
+            dict.set_item("final_nprobe", route.final_nprobe)?;
+            dict.set_item("fallback", route.fallback)?;
+            dict.set_item("working_set_bytes", route.working_set_bytes)?;
+            Ok(dict.into())
+        })
+    }
+
+    #[pyo3(signature = (queries, beam, pool, final_nprobe=16))]
+    fn route_many(
+        &self,
+        queries: PyReadonlyArray2<'_, f32>,
+        beam: usize,
+        pool: usize,
+        final_nprobe: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        Python::with_gil(|py| {
+            queries
+                .as_array()
+                .outer_iter()
+                .map(|row| {
+                    let query = row.iter().copied().collect::<Vec<_>>();
+                    let route = self.inner.route(&query, beam, pool, final_nprobe);
+                    let dict = PyDict::new(py);
+                    dict.set_item("candidates", route.candidates)?;
+                    dict.set_item("final_nprobe", route.final_nprobe)?;
+                    dict.set_item("fallback", route.fallback)?;
+                    dict.set_item("working_set_bytes", route.working_set_bytes)?;
+                    Ok(dict.into())
+                })
+                .collect()
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.inner.resident_bytes()
+    }
+
+    fn diagnostics(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let d = &self.inner.diagnostics;
+            let dict = PyDict::new(py);
+            dict.set_item("pca_energy", d.pca_energy.clone())?;
+            dict.set_item("d80", d.d80.clone())?;
+            dict.set_item("d90", d.d90.clone())?;
+            dict.set_item("d95", d.d95.clone())?;
+            dict.set_item("residual_energy", d.residual_energy.clone())?;
+            dict.set_item("radius_shrink", d.radius_shrink.clone())?;
+            dict.set_item("norm_sep_p10", d.norm_sep_p10)?;
+            dict.set_item("norm_sep_p25", d.norm_sep_p25)?;
+            Ok(dict.into())
+        })
+    }
 }
 
 #[pymethods]
@@ -174,6 +300,23 @@ impl PyAperonIndex {
         self.inner
             .enable_shared_basis_pq(basis_cols, local_dim, pq_subquantizers, pq_bits, opq)
             .map_err(value_error)
+    }
+
+    #[pyo3(signature = (routing_dim=4, spacing=0.5))]
+    fn enable_lattice_routing(&mut self, routing_dim: usize, spacing: f32) -> PyResult<()> {
+        self.inner
+            .enable_lattice_routing(routing_dim, spacing)
+            .map_err(value_error)
+    }
+
+    /// Enable Hierarchical Lattice Routing (HLR) with multi-layer residual PCA.
+    ///
+    /// Args:
+    ///     layer_configs: List of (routing_dim, spacing) tuples, one per HLR layer.
+    #[pyo3(signature = (layer_configs))]
+    fn enable_hlr_routing(&mut self, layer_configs: Vec<(usize, f32)>) -> PyResult<()> {
+        let configs = hlr_configs(layer_configs);
+        self.inner.enable_hlr_routing(&configs).map_err(value_error)
     }
 
     #[pyo3(signature = (query, top_k, nprobe=None, rerank_factor=None))]
@@ -342,7 +485,19 @@ impl PyAperonIndex {
 fn aperon(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", VERSION)?;
     module.add_class::<PyAperonIndex>()?;
+    module.add_class::<PyHlrRouter>()?;
+    module.add_class::<PyHtlaRouter>()?;
     Ok(())
+}
+
+fn hlr_configs(layer_configs: Vec<(usize, f32)>) -> Vec<HierarchicalLatticeLayerConfig> {
+    layer_configs
+        .into_iter()
+        .map(|(routing_dim, spacing)| HierarchicalLatticeLayerConfig {
+            routing_dim,
+            spacing,
+        })
+        .collect()
 }
 
 fn extract_vector(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {

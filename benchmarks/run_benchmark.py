@@ -1,316 +1,674 @@
-import os
+#!/usr/bin/env python3
+"""Reproducible siftsmall benchmark harness for Aperon Mode A/Mode B."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import platform
 import tempfile
 import time
-import numpy as np
-import hnswlib
-import aperon
+from dataclasses import dataclass, asdict
+from pathlib import Path
 
-def read_fvecs(filename):
-    fv = np.fromfile(filename, dtype=np.float32)
-    if fv.size == 0:
+
+TOP_K = 10
+aperon = None
+hnswlib = None
+np = None
+
+
+@dataclass(frozen=True)
+class BenchmarkRow:
+    method: str
+    profile: str
+    build_time_s: float
+    latency_ms_per_query: float
+    qps: float
+    resident_memory_bytes: int
+    index_disk_bytes: int
+    cold_disk_bytes: int
+    hnsw_memory_ratio: float | None
+    candidate_k: int | None
+    candidate_recall_at_10: float | None
+    final_recall_at_10: float
+    notes: str
+
+
+def read_fvecs(path: Path) -> np.ndarray:
+    raw = np.fromfile(path, dtype=np.float32)
+    if raw.size == 0:
         return np.zeros((0, 0), dtype=np.float32)
-    dim = fv.view(np.int32)[0]
-    fv = fv.reshape(-1, 1 + dim)
-    if not np.all(fv.view(np.int32)[:, 0] == dim):
-        raise IOError("Non-uniform vector sizes in " + filename)
-    return fv[:, 1:].copy()
+    dim = raw.view(np.int32)[0]
+    vectors = raw.reshape(-1, dim + 1)
+    if not np.all(vectors.view(np.int32)[:, 0] == dim):
+        raise ValueError(f"non-uniform vector sizes in {path}")
+    return vectors[:, 1:].copy()
 
-def read_ivecs(filename):
-    iv = np.fromfile(filename, dtype=np.int32)
-    if iv.size == 0:
+
+def read_ivecs(path: Path) -> np.ndarray:
+    raw = np.fromfile(path, dtype=np.int32)
+    if raw.size == 0:
         return np.zeros((0, 0), dtype=np.int32)
-    dim = iv[0]
-    iv = iv.reshape(-1, 1 + dim)
-    if not np.all(iv[:, 0] == dim):
-        raise IOError("Non-uniform vector sizes in " + filename)
-    return iv[:, 1:].copy()
+    dim = raw[0]
+    vectors = raw.reshape(-1, dim + 1)
+    if not np.all(vectors[:, 0] == dim):
+        raise ValueError(f"non-uniform vector sizes in {path}")
+    return vectors[:, 1:].copy()
 
-def get_balance_stats(grain_sizes):
-    if not grain_sizes:
-        return "N/A"
-    sizes = np.array(grain_sizes)
-    return f"min={sizes.min()}, max={sizes.max()}, std={sizes.std():.1f}"
 
-def hnsw_serialized_bytes(index):
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        path = tmp.name
+def recall_against_top10(results: list[list[int]], gt_top10, result_limit: int | None = TOP_K) -> float:
+    recalls = []
+    for idx, retrieved in enumerate(results):
+        considered = retrieved if result_limit is None else retrieved[:result_limit]
+        recalls.append(len(set(considered) & set(gt_top10[idx])) / TOP_K)
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+def import_runtime_deps() -> None:
+    global aperon, hnswlib, np
     try:
-        index.save_index(path)
-        return os.path.getsize(path)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+        import aperon as aperon_module
+        import hnswlib as hnswlib_module
+        import numpy as numpy_module
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "missing benchmark dependency. Run:\n"
+            "  python3 -m venv .venv\n"
+            "  source .venv/bin/activate\n"
+            "  pip install maturin numpy hnswlib\n"
+            "  maturin develop --release"
+        ) from exc
+    aperon = aperon_module
+    hnswlib = hnswlib_module
+    np = numpy_module
 
-def main():
-    print("\033[1;36m=== ANN Benchmark: Aperon vs HNSW ===\033[0m")
-    
-    # Paths
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base_dir, "data", "siftsmall")
-    
-    base_file = os.path.join(data_dir, "siftsmall_base.fvecs")
-    query_file = os.path.join(data_dir, "siftsmall_query.fvecs")
-    gt_file = os.path.join(data_dir, "siftsmall_groundtruth.ivecs")
-    
-    if not (os.path.exists(base_file) and os.path.exists(query_file) and os.path.exists(gt_file)):
-        print("\033[1;31mError: Dataset files not found. Run download first.\033[0m")
-        return
-        
-    print("\033[32mLoading siftsmall dataset...\033[0m")
+
+def hnsw_serialized_bytes(index) -> int:
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        index.save_index(str(path))
+        return path.stat().st_size
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def time_queries(fn, query_count: int, runs: int) -> tuple[float, float]:
+    start = time.perf_counter()
+    for _ in range(runs):
+        fn()
+    elapsed = time.perf_counter() - start
+    qps = (query_count * runs) / elapsed if elapsed else 0.0
+    latency_ms = (elapsed / (query_count * runs)) * 1000.0 if query_count and runs else 0.0
+    return latency_ms, qps
+
+
+def save_index_bytes(index):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".hntm") as tmp:
+        path = Path(tmp.name)
+    try:
+        index.save(path)
+        disk_bytes = path.stat().st_size
+        loaded = aperon.AperonIndex.load(path)
+        return loaded, disk_bytes
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def build_hnsw(xb: np.ndarray, xq: np.ndarray, gt_top10: np.ndarray, ef_values: list[int]) -> list[BenchmarkRow]:
+    index = hnswlib.Index(space="l2", dim=xb.shape[1])
+    start = time.perf_counter()
+    index.init_index(max_elements=len(xb), ef_construction=200, M=16)
+    index.add_items(xb, np.arange(len(xb)))
+    build_time = time.perf_counter() - start
+    disk_bytes = hnsw_serialized_bytes(index)
+
+    rows = []
+    for ef in ef_values:
+        index.set_ef(ef)
+
+        def query_once() -> None:
+            index.knn_query(xq, k=TOP_K)
+
+        query_once()
+        latency_ms, qps = time_queries(query_once, len(xq), runs=20)
+        labels, _ = index.knn_query(xq, k=TOP_K)
+        final_recall = recall_against_top10(labels.tolist(), gt_top10)
+        rows.append(
+            BenchmarkRow(
+                method="HNSW",
+                profile=f"M=16 ef_construction=200 ef={ef}",
+                build_time_s=build_time,
+                latency_ms_per_query=latency_ms,
+                qps=qps,
+                resident_memory_bytes=disk_bytes,
+                index_disk_bytes=disk_bytes,
+                cold_disk_bytes=0,
+                hnsw_memory_ratio=1.0,
+                candidate_k=None,
+                candidate_recall_at_10=None,
+                final_recall_at_10=final_recall,
+                notes="serialized HNSW index bytes used as resident-memory baseline",
+            )
+        )
+    return rows
+
+
+def build_mode_a(
+    xb: np.ndarray,
+    xq: np.ndarray,
+    gt_top10: np.ndarray,
+    hnsw_bytes: int,
+    grains: int,
+    nprobe: int,
+) -> BenchmarkRow:
+    ids = np.arange(len(xb), dtype=np.uint64)
+    index = aperon.AperonIndex(xb.shape[1], local_dim=32, sketch_dim=0, block_size=64)
+
+    start = time.perf_counter()
+    index.insert_many(ids, xb)
+    index.rebuild_n_grains(grains)
+    build_time = time.perf_counter() - start
+    stats = index.stats()
+    loaded, disk_bytes = save_index_bytes(index)
+
+    def query_once() -> None:
+        loaded.search_many(xq, TOP_K, nprobe)
+
+    query_once()
+    latency_ms, qps = time_queries(query_once, len(xq), runs=20)
+    results = loaded.search_many(xq, TOP_K, nprobe)
+    final_recall = recall_against_top10([[int(item[0]) for item in row] for row in results], gt_top10)
+    resident_bytes = int(stats["encoded_bytes"])
+    return BenchmarkRow(
+        method="Aperon Mode A",
+        profile=f"self-contained recon-only local_dim=32 grains={grains} nprobe={nprobe}",
+        build_time_s=build_time,
+        latency_ms_per_query=latency_ms,
+        qps=qps,
+        resident_memory_bytes=resident_bytes,
+        index_disk_bytes=disk_bytes,
+        cold_disk_bytes=0,
+        hnsw_memory_ratio=resident_bytes / hnsw_bytes if hnsw_bytes else None,
+        candidate_k=None,
+        candidate_recall_at_10=None,
+        final_recall_at_10=final_recall,
+        notes="save/load recon-only search; no raw vectors attached at query time",
+    )
+
+
+def build_mode_b(
+    xb: np.ndarray,
+    xq: np.ndarray,
+    gt_top10: np.ndarray,
+    hnsw_bytes: int,
+    raw_vector_bytes: int,
+    grains: int,
+    nprobe: int,
+    candidate_values: list[int],
+) -> list[BenchmarkRow]:
+    ids = np.arange(len(xb), dtype=np.uint64)
+    index = aperon.AperonIndex(
+        xb.shape[1],
+        local_dim=8,
+        sketch_dim=8,
+        block_size=64,
+        residual_bits=2,
+    )
+
+    start = time.perf_counter()
+    index.insert_many(ids, xb)
+    index.rebuild_n_grains(grains)
+    build_time = time.perf_counter() - start
+    stats = index.stats()
+    _, disk_bytes = save_index_bytes(index)
+    index.attach_raw_vectors(ids, xb)
+    resident_bytes = int(stats["encoded_bytes"])
+
+    rows = []
+    for candidate_k in candidate_values:
+
+        def query_once() -> None:
+            index.search_many_tiered(xq, TOP_K, nprobe, candidate_k)
+
+        query_once()
+        latency_ms, qps = time_queries(query_once, len(xq), runs=20)
+
+        candidate_results = []
+        final_results = []
+        for query in xq:
+            candidate_results.append(
+                [int(item[0]) for item in index.candidates(query, nprobe, candidate_k)]
+            )
+            final_results.append(
+                [int(item[0]) for item in index.search_tiered(query, TOP_K, nprobe, candidate_k)]
+            )
+
+        rows.append(
+            BenchmarkRow(
+                method="Aperon Mode B",
+                profile=f"hot filter raw-rerank grains={grains} nprobe={nprobe}",
+                build_time_s=build_time,
+                latency_ms_per_query=latency_ms,
+                qps=qps,
+                resident_memory_bytes=resident_bytes,
+                index_disk_bytes=disk_bytes,
+                cold_disk_bytes=raw_vector_bytes,
+                hnsw_memory_ratio=resident_bytes / hnsw_bytes if hnsw_bytes else None,
+                candidate_k=candidate_k,
+                candidate_recall_at_10=recall_against_top10(candidate_results, gt_top10, result_limit=None),
+                final_recall_at_10=recall_against_top10(final_results, gt_top10),
+                notes="resident bytes exclude raw vectors; cold bytes report raw siftsmall base file size",
+            )
+        )
+    return rows
+
+
+def build_mode_b_lattice(
+    xb: np.ndarray,
+    xq: np.ndarray,
+    gt_top10: np.ndarray,
+    hnsw_bytes: int,
+    raw_vector_bytes: int,
+    grains: int,
+    nprobe: int,
+    candidate_values: list[int],
+    routing_dim: int = 4,
+    spacing: float = 2.0,
+) -> list[BenchmarkRow]:
+    ids = np.arange(len(xb), dtype=np.uint64)
+    index = aperon.AperonIndex(
+        xb.shape[1],
+        local_dim=8,
+        sketch_dim=8,
+        block_size=64,
+        residual_bits=2,
+    )
+
+    start = time.perf_counter()
+    index.insert_many(ids, xb)
+    index.rebuild_n_grains(grains)
+    index.enable_lattice_routing(routing_dim, spacing)
+    build_time = time.perf_counter() - start
+    stats = index.stats()
+    loaded, disk_bytes = save_index_bytes(index)
+    loaded.attach_raw_vectors(ids, xb)
+    resident_bytes = int(stats["encoded_bytes"])
+
+    rows = []
+    for candidate_k in candidate_values:
+
+        def query_once() -> None:
+            loaded.search_many_tiered(xq, TOP_K, nprobe, candidate_k)
+
+        query_once()
+        latency_ms, qps = time_queries(query_once, len(xq), runs=20)
+
+        candidate_results = []
+        final_results = []
+        for query in xq:
+            candidate_results.append(
+                [int(item[0]) for item in loaded.candidates(query, nprobe, candidate_k)]
+            )
+            final_results.append(
+                [int(item[0]) for item in loaded.search_tiered(query, TOP_K, nprobe, candidate_k)]
+            )
+
+        rows.append(
+            BenchmarkRow(
+                method="Aperon Mode B (Lattice)",
+                profile=f"hot filter raw-rerank grains={grains} nprobe={nprobe} r_dim={routing_dim} spacing={spacing}",
+                build_time_s=build_time,
+                latency_ms_per_query=latency_ms,
+                qps=qps,
+                resident_memory_bytes=resident_bytes,
+                index_disk_bytes=disk_bytes,
+                cold_disk_bytes=raw_vector_bytes,
+                hnsw_memory_ratio=resident_bytes / hnsw_bytes if hnsw_bytes else None,
+                candidate_k=candidate_k,
+                candidate_recall_at_10=recall_against_top10(candidate_results, gt_top10, result_limit=None),
+                final_recall_at_10=recall_against_top10(final_results, gt_top10),
+                notes="resident bytes exclude raw vectors; O(1) lattice routing enabled",
+            )
+        )
+    return rows
+
+
+def build_mode_b_hlr(
+    xb: np.ndarray,
+    xq: np.ndarray,
+    gt_top10: np.ndarray,
+    hnsw_bytes: int,
+    raw_vector_bytes: int,
+    grains: int,
+    nprobe: int,
+    candidate_values: list[int],
+    hlr_layer_configs: list[tuple[int, float]] | None = None,
+) -> list[BenchmarkRow]:
+    if hlr_layer_configs is None:
+        hlr_layer_configs = [(2, 2.0), (2, 1.0)]
+    ids = np.arange(len(xb), dtype=np.uint64)
+    index = aperon.AperonIndex(
+        xb.shape[1],
+        local_dim=8,
+        sketch_dim=8,
+        block_size=64,
+        residual_bits=2,
+    )
+
+    start = time.perf_counter()
+    index.insert_many(ids, xb)
+    index.rebuild_n_grains(grains)
+    index.enable_hlr_routing(hlr_layer_configs)
+    build_time = time.perf_counter() - start
+    stats = index.stats()
+    loaded, disk_bytes = save_index_bytes(index)
+    loaded.attach_raw_vectors(ids, xb)
+    resident_bytes = int(stats["encoded_bytes"])
+
+    hlr_desc = "+".join(f"{d}d/{s:.1f}s" for d, s in hlr_layer_configs)
+    rows = []
+    for candidate_k in candidate_values:
+
+        def query_once() -> None:
+            loaded.search_many_tiered(xq, TOP_K, nprobe, candidate_k)
+
+        query_once()
+        latency_ms, qps = time_queries(query_once, len(xq), runs=20)
+
+        candidate_results = []
+        final_results = []
+        for query in xq:
+            candidate_results.append(
+                [int(item[0]) for item in loaded.candidates(query, nprobe, candidate_k)]
+            )
+            final_results.append(
+                [int(item[0]) for item in loaded.search_tiered(query, TOP_K, nprobe, candidate_k)]
+            )
+
+        rows.append(
+            BenchmarkRow(
+                method="Aperon Mode B (HLR)",
+                profile=f"hot filter raw-rerank grains={grains} nprobe={nprobe} hlr=[{hlr_desc}]",
+                build_time_s=build_time,
+                latency_ms_per_query=latency_ms,
+                qps=qps,
+                resident_memory_bytes=resident_bytes,
+                index_disk_bytes=disk_bytes,
+                cold_disk_bytes=raw_vector_bytes,
+                hnsw_memory_ratio=resident_bytes / hnsw_bytes if hnsw_bytes else None,
+                candidate_k=candidate_k,
+                candidate_recall_at_10=recall_against_top10(candidate_results, gt_top10, result_limit=None),
+                final_recall_at_10=recall_against_top10(final_results, gt_top10),
+                notes=f"resident bytes exclude raw vectors; HLR routing [{hlr_desc}]",
+            )
+        )
+    return rows
+
+
+def sample_centroids(xb: np.ndarray, k: int) -> np.ndarray:
+    if k >= len(xb):
+        return xb.copy()
+    indices = np.linspace(0, len(xb) - 1, num=k, dtype=np.int64)
+    return xb[indices].copy()
+
+
+def exact_centroid_top10(centroids: np.ndarray, queries: np.ndarray) -> list[list[int]]:
+    exact = []
+    limit = min(TOP_K, len(centroids))
+    for query in queries:
+        diff = centroids - query
+        dists = np.einsum("ij,ij->i", diff, diff)
+        if limit < len(centroids):
+            idx = np.argpartition(dists, limit - 1)[:limit]
+            idx = idx[np.argsort(dists[idx], kind="stable")]
+        else:
+            idx = np.argsort(dists, kind="stable")
+        exact.append([int(value) for value in idx[:limit]])
+    return exact
+
+
+def build_hlr_router_scale(
+    xb: np.ndarray,
+    xq: np.ndarray,
+    hnsw_bytes: int,
+    grains: int,
+    nprobe: int,
+    hlr_layer_configs: list[tuple[int, float]],
+) -> BenchmarkRow:
+    centroids = sample_centroids(xb, grains)
+    start = time.perf_counter()
+    router = aperon.HlrRouter(xb.shape[1], centroids, hlr_layer_configs)
+    build_time = time.perf_counter() - start
+
+    def query_once() -> None:
+        router.route_many(xq, nprobe)
+
+    query_once()
+    latency_ms, qps = time_queries(query_once, len(xq), runs=200)
+    routed = router.route_many(xq, nprobe)
+    exact = exact_centroid_top10(centroids, xq)
+    route_recall = recall_against_top10(routed, exact, result_limit=None)
+    hlr_desc = "+".join(f"{d}d/{s:.1f}s" for d, s in hlr_layer_configs)
+    resident_bytes = int(centroids.nbytes)
+
+    return BenchmarkRow(
+        method="Aperon HLR Router",
+        profile=f"route-only centroids={len(centroids)} nprobe={nprobe} hlr=[{hlr_desc}]",
+        build_time_s=build_time,
+        latency_ms_per_query=latency_ms,
+        qps=qps,
+        resident_memory_bytes=resident_bytes,
+        index_disk_bytes=0,
+        cold_disk_bytes=0,
+        hnsw_memory_ratio=resident_bytes / hnsw_bytes if hnsw_bytes else None,
+        candidate_k=nprobe,
+        candidate_recall_at_10=route_recall,
+        final_recall_at_10=route_recall,
+        notes="route-only HLR scale check; recall is exact-centroid top-10 coverage by routed centroids",
+    )
+
+
+def markdown_report(rows: list[BenchmarkRow], dataset_dir: Path, xb: np.ndarray, xq: np.ndarray) -> str:
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    lines = [
+        "# Aperon Reproducible Benchmark (siftsmall)",
+        "",
+        "This report is generated by `python benchmarks/run_benchmark.py`.",
+        "",
+        "## Dataset",
+        f"- Dataset path: `{dataset_dir}`",
+        f"- Base vectors: {len(xb):,} x {xb.shape[1]} float32",
+        f"- Query vectors: {len(xq):,} x {xq.shape[1]} float32",
+        "- Ground truth: siftsmall top-100 neighbors, evaluated as Recall@10",
+        "",
+        "## Environment",
+        f"- Generated at: {generated_at}",
+        f"- Python: {platform.python_version()}",
+        f"- Platform: {platform.platform()}",
+        f"- NumPy: {np.__version__}",
+        "",
+        "## Results",
+        "",
+        "| Method | Profile | Build s | Latency ms/q | QPS | Resident bytes | Index disk bytes | Cold bytes | HNSW ratio | Candidate k | Candidate Recall@10 | Final Recall@10 | Notes |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
+    ]
+    for row in rows:
+        ratio = "n/a" if row.hnsw_memory_ratio is None else f"{row.hnsw_memory_ratio:.4f}x"
+        candidate_k = "n/a" if row.candidate_k is None else str(row.candidate_k)
+        candidate_recall = (
+            "n/a"
+            if row.candidate_recall_at_10 is None
+            else f"{row.candidate_recall_at_10:.4f}"
+        )
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    row.method,
+                    row.profile,
+                    f"{row.build_time_s:.4f}",
+                    f"{row.latency_ms_per_query:.4f}",
+                    f"{row.qps:.1f}",
+                    f"{row.resident_memory_bytes:,}",
+                    f"{row.index_disk_bytes:,}",
+                    f"{row.cold_disk_bytes:,}",
+                    ratio,
+                    candidate_k,
+                    candidate_recall,
+                    f"{row.final_recall_at_10:.4f}",
+                    row.notes,
+                ]
+            )
+            + " |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Metric Definitions",
+            "- `Resident bytes`: bytes expected to stay in DRAM for the search structure. For HNSW this is approximated by serialized index bytes. For Aperon this is `stats()[\"encoded_bytes\"]`.",
+            "- `Index disk bytes`: bytes of the serialized index file written by the benchmark.",
+            "- `Cold bytes`: external payload needed for exact rerank. Mode B reports the raw `siftsmall_base.fvecs` file size; Mode A and HNSW do not require this benchmark-side cold payload.",
+            "- `Candidate Recall@10`: fraction of true top-10 neighbors present in the Mode B hot-filter candidate set before exact rerank.",
+            "- `Final Recall@10`: final top-10 recall after the method's ranking path: HNSW graph search, Mode A save/load recon-only search, or Mode B hot-filter plus raw rerank.",
+            "- `Aperon HLR Router` rows are route-only scale checks over sampled siftsmall centroids. Their recall columns report exact-centroid top-10 coverage by the HLR routed centroid set.",
+            "- HLR `residual_energy` is measured after per-layer residual centering. Entry 0 is input mean squared norm; later entries are centered residual variance after subtracting each PCA layer.",
+            "",
+            "## Reproduction",
+            "```bash",
+            "python3 -m venv .venv",
+            "source .venv/bin/activate",
+            "pip install maturin numpy hnswlib",
+            "maturin develop --release",
+            "benchmarks/run_all.sh",
+            "```",
+            "",
+            "`benchmarks/run_all.sh` forwards arguments to `python benchmarks/run_benchmark.py`. Use `python benchmarks/run_benchmark.py --help` to change `nprobe`, `candidate_k`, or output paths. The script also writes machine-readable rows to `benchmarks/latest.json`.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    default_data = Path(__file__).resolve().parent / "data" / "siftsmall"
+    parser.add_argument("--data-dir", type=Path, default=default_data)
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "README.md")
+    parser.add_argument("--json-output", type=Path, default=Path(__file__).resolve().parent / "latest.json")
+    parser.add_argument("--mode-a-grains", type=int, default=16)
+    parser.add_argument("--mode-a-nprobe", type=int, default=8)
+    parser.add_argument("--mode-b-grains", type=int, default=16)
+    parser.add_argument("--mode-b-nprobe", type=int, default=16)
+    parser.add_argument("--candidate-k", type=int, nargs="+", default=[50, 100, 200])
+    parser.add_argument("--hnsw-ef", type=int, nargs="+", default=[50, 100, 200])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    import_runtime_deps()
+    base_file = args.data_dir / "siftsmall_base.fvecs"
+    query_file = args.data_dir / "siftsmall_query.fvecs"
+    gt_file = args.data_dir / "siftsmall_groundtruth.ivecs"
+    missing = [path for path in [base_file, query_file, gt_file] if not path.exists()]
+    if missing:
+        raise SystemExit(f"missing siftsmall files: {', '.join(str(path) for path in missing)}")
+
     xb = read_fvecs(base_file)
     xq = read_fvecs(query_file)
-    gt = read_ivecs(gt_file)
-    
-    print(f"Base vectors shape: {xb.shape}")
-    print(f"Query vectors shape: {xq.shape}")
-    print(f"Ground truth shape: {gt.shape}")
-    
-    gt_top10 = gt[:, :10]
-    
-    results = []
-    
-    # ==========================================
-    # 1. HNSW Benchmark
-    # ==========================================
-    print("\n\033[1;33mBuilding HNSW Index (M=16, ef_construction=200)...\033[0m")
-    hnsw_index = hnswlib.Index(space="l2", dim=128)
-    t_start = time.perf_counter()
-    hnsw_index.init_index(max_elements=len(xb), ef_construction=200, M=16)
-    hnsw_index.add_items(xb)
-    t_build = time.perf_counter() - t_start
-    hnsw_bytes = hnsw_serialized_bytes(hnsw_index)
-    print(f"HNSW Build time: {t_build:.4f} seconds")
-    
-    for ef in [10, 20, 50, 100, 200, 400]:
-        hnsw_index.set_ef(ef)
-        # Warmup
-        for q in xq:
-            hnsw_index.knn_query(q, k=10)
-            
-        # Timing
-        num_runs = 50
-        t0 = time.perf_counter()
-        for _ in range(num_runs):
-            for q in xq:
-                hnsw_index.knn_query(q, k=10)
-        t1 = time.perf_counter()
-        
-        qps = (len(xq) * num_runs) / (t1 - t0)
-        
-        # Calculate Recall
-        recalls = []
-        for idx, q in enumerate(xq):
-            labels, _ = hnsw_index.knn_query(q, k=10)
-            retrieved = labels[0].tolist()
-            intersect = len(set(retrieved) & set(gt_top10[idx]))
-            recalls.append(intersect / 10.0)
-            
-        recall = np.mean(recalls)
-        print(f"HNSW (ef={ef:3d}) | Recall@10: {recall:.4f} | QPS: {qps:8.1f}")
-        results.append({
-            "Method": "HNSW",
-            "Params": f"M=16, ef={ef}",
-            "Recall@10": recall,
-            "QPS": qps,
-            "Memory": hnsw_bytes,
-            "HNSW Ratio": 1.0,
-            "Balance": "N/A (Graph)"
-        })
+    gt_top10 = read_ivecs(gt_file)[:, :TOP_K]
 
-    # ==========================================
-    # 2. Aperon Benchmark
-    # ==========================================
-    # Configurations to test:
-    # - Config 1: local_dim=32, sketch_dim=0
-    # - Config 2: local_dim=64, sketch_dim=0
-    # - Config 3: local_dim=64, sketch_dim=16 (8-bit residual sketching)
-    # - Config 4/5: low-memory VLBRD 2-bit/1-bit residual directions
-    # - Config 6: MAQ adaptive grain-local dimensions and bit widths
-    
-    aperon_configs = [
-        {"local_dim": 32, "sketch_dim": 0, "residual_bits": 8},
-        {"local_dim": 64, "sketch_dim": 0, "residual_bits": 8},
-        {"local_dim": 64, "sketch_dim": 16, "residual_bits": 8},
-        {"local_dim": 8, "sketch_dim": 8, "residual_bits": 2},
-        {"local_dim": 8, "sketch_dim": 8, "residual_bits": 1},
-        {
-            "local_dim": 8,
-            "sketch_dim": 8,
-            "residual_bits": 1,
-            "adaptive": (4, 16, 0, 8, 1, 2, 0.25),
-        },
-    ]
-    
-    for config in aperon_configs:
-        ld = config["local_dim"]
-        sd = config["sketch_dim"]
-        rb = config["residual_bits"]
-        adaptive = config.get("adaptive")
-        method = f"Aperon (ld={ld}, sd={sd}, rb={rb})"
-        if adaptive:
-            method = f"MAQ (ld={adaptive[0]}-{adaptive[1]}, sd={adaptive[2]}-{adaptive[3]}, rb={adaptive[4]}-{adaptive[5]}, vt={adaptive[6]})"
-        
-        for grains in [16, 32, 64]:
-            print(f"\n\033[1;35mBuilding {method} (grains={grains})...\033[0m")
-            ap_index = aperon.AperonIndex(128, ld, sd, 64, residual_bits=rb)
-            if adaptive:
-                ap_index.enable_adaptive_quantization(*adaptive)
-            ids = np.arange(len(xb), dtype=np.uint64)
-            
-            t_start = time.perf_counter()
-            ap_index.insert_many(ids, xb)
-            ap_index.rebuild_n_grains(grains)
-            t_build = time.perf_counter() - t_start
-            
-            stats = ap_index.stats()
-            grain_sizes = stats.get("grain_sizes", [])
-            encoded_bytes = stats.get("encoded_bytes", 0)
-            memory_ratio = encoded_bytes / hnsw_bytes if hnsw_bytes else 0.0
-            balance_str = get_balance_stats(grain_sizes)
-            shape_str = ""
-            if stats.get("grain_local_dims"):
-                shape_str = (
-                    f" | ld={min(stats['grain_local_dims'])}-{max(stats['grain_local_dims'])}"
-                    f", sd={min(stats['grain_sketch_dims'])}-{max(stats['grain_sketch_dims'])}"
-                    f", rb={sorted(set(stats['grain_residual_bits']))}"
-                )
-            print(f"Aperon Build time: {t_build:.4f} seconds | Encoded bytes: {encoded_bytes:,} ({memory_ratio:.3f}x HNSW) | Grains balance: {balance_str}")
-            if shape_str:
-                print(f"Grain shapes:{shape_str}")
+    print("Building HNSW baseline...", flush=True)
+    rows = build_hnsw(xb, xq, gt_top10, args.hnsw_ef)
+    hnsw_bytes = rows[0].resident_memory_bytes
 
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                index_path = tmp.name
-            try:
-                ap_index.save(index_path)
-                recon_index = aperon.AperonIndex.load(index_path)
-            finally:
-                if os.path.exists(index_path):
-                    os.remove(index_path)
-            
-            # Vary nprobe
-            nprobes = [1, 2, 4, 8, 16]
-            if grains >= 32:
-                nprobes.append(32)
-            if grains >= 64:
-                nprobes.append(64)
-                
-            for np_val in nprobes:
-                # 1. Warmup and measure Recall (using search_many)
-                raw_batch = ap_index.search_many(xq, 10, np_val)
-                recon_batch = recon_index.search_many(xq, 10, np_val)
-                raw_recalls = []
-                recon_recalls = []
-                for idx, res in enumerate(raw_batch):
-                    retrieved = [r[0] for r in res]
-                    intersect = len(set(retrieved) & set(gt_top10[idx]))
-                    raw_recalls.append(intersect / 10.0)
-                for idx, res in enumerate(recon_batch):
-                    retrieved = [r[0] for r in res]
-                    intersect = len(set(retrieved) & set(gt_top10[idx]))
-                    recon_recalls.append(intersect / 10.0)
-                raw_recall = np.mean(raw_recalls)
-                recon_recall = np.mean(recon_recalls)
-                
-                # 2. Timing using search_many (Optimization 1)
-                num_runs = 20
-                t0 = time.perf_counter()
-                for _ in range(num_runs):
-                    ap_index.search_many(xq, 10, np_val)
-                t1 = time.perf_counter()
-                qps_many = (len(xq) * num_runs) / (t1 - t0)
-                
-                # 3. Timing using search (old sequential boundary crossing) for reference in representative cases
-                # Only run sequential benchmark on nprobe=4 to avoid excessive overall runtime
-                if np_val == 4:
-                    t0 = time.perf_counter()
-                    for _ in range(num_runs):
-                        for q in xq:
-                            ap_index.search(q.tolist(), 10, np_val)
-                    t1 = time.perf_counter()
-                    qps_single = (len(xq) * num_runs) / (t1 - t0)
-                    print(f"{method} (grains={grains:2d}, nprobe={np_val:2d}) | raw Recall@10: {raw_recall:.4f} | recon Recall@10: {recon_recall:.4f} | search QPS: {qps_single:6.1f} | search_many QPS: {qps_many:6.1f}")
-                    results.append({
-                        "Method": method,
-                        "Params": f"grains={grains}, nprobe={np_val} (seq search)",
-                        "Raw Recall@10": raw_recall,
-                        "Recon Recall@10": recon_recall,
-                        "QPS": qps_single,
-                        "Memory": encoded_bytes,
-                        "HNSW Ratio": memory_ratio,
-                        "Balance": balance_str
-                    })
-                else:
-                    print(f"{method} (grains={grains:2d}, nprobe={np_val:2d}) | raw Recall@10: {raw_recall:.4f} | recon Recall@10: {recon_recall:.4f} | search_many QPS: {qps_many:6.1f}")
-                    
-                results.append({
-                    "Method": method,
-                    "Params": f"grains={grains}, nprobe={np_val}",
-                    "Raw Recall@10": raw_recall,
-                    "Recon Recall@10": recon_recall,
-                    "QPS": qps_many,
-                    "Memory": encoded_bytes,
-                    "HNSW Ratio": memory_ratio,
-                    "Balance": balance_str
-                })
+    print("Building Aperon Mode A...", flush=True)
+    rows.append(build_mode_a(xb, xq, gt_top10, hnsw_bytes, args.mode_a_grains, args.mode_a_nprobe))
 
-    # ==========================================
-    # 3. Generate Markdown Report
-    # ==========================================
-    report_path = os.path.join(base_dir, "README.md")
-    print(f"\n\033[1;32mWriting results to {report_path}...\033[0m")
-    
-    with open(report_path, "w") as f:
-        f.write("# Aperon vs HNSW Benchmark (siftsmall)\n\n")
-        f.write("This directory contains benchmarking results comparing the **Aperon** vector database (Rust + PyO3 bindings) against the standard **HNSW** (`hnswlib`) implementation on the `siftsmall` dataset, incorporating batch search, residual sketching, VLBRD packed residual directions, and balanced clustering optimizations.\n\n")
-        
-        f.write("## Dataset Characteristics\n")
-        f.write("- **Dataset**: SIFT10K (`siftsmall`)\n")
-        f.write("- **Base Vectors**: 10,000 (128-dimensional, L2 distance)\n")
-        f.write("- **Query Vectors**: 100\n")
-        f.write("- **Ground Truth**: Exact Top-100 nearest neighbors (evaluated at Recall@10)\n\n")
-        
-        f.write("## Comparison Table\n\n")
-        f.write("| Method | Parameters | Raw Recall@10 | Recon Recall@10 | QPS | Encoded Bytes | HNSW Ratio | Grains Balance |\n")
-        f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
-        for res in results:
-            raw_recall = res.get("Raw Recall@10", res.get("Recall@10", 0.0))
-            recon_recall = res.get("Recon Recall@10", raw_recall)
-            f.write(f"| {res['Method']} | {res['Params']} | {raw_recall:.4f} | {recon_recall:.4f} | {res['QPS']:.1f} | {res['Memory']:,} | {res['HNSW Ratio']:.3f}x | {res['Balance']} |\n")
-            
-        f.write("\n## Optimization Findings\n")
-        f.write("### 1. PyO3 Batching (`search_many`)\n")
-        f.write("- Bypassing the Python-to-Rust serialization boundary by calling `search_many` rather than sequential `search` loops yields a massive **10x to 25x QPS boost** (e.g., QPS going from ~4,000 to >40,000 in comparable configs).\n\n")
-        
-        f.write("### 2. Residual Sketching (`sketch_dim > 0`)\n")
-        f.write("- Activating residual sketching (`sd=16`) on top of PCA (`ld=64`) significantly improves Recall@10 with negligible latency cost. For instance, at `grains=16, nprobe=4`, recall rises to **96.5%** or higher, achieving close parity with HNSW while saving significant memory.\n\n")
-        
-        f.write("### 3. Balanced Clustering (K-Means)\n")
-        f.write("- Our regret-based balanced clustering ensures grain sizes are tightly clustered around the mean ($1.3 \\times$ limit), yielding a very low standard deviation and ensuring consistent query times by eliminating outlier grains.\n\n")
+    print("Building Aperon Mode B...", flush=True)
+    rows.extend(
+        build_mode_b(
+            xb,
+            xq,
+            gt_top10,
+            hnsw_bytes,
+            base_file.stat().st_size,
+            args.mode_b_grains,
+            args.mode_b_nprobe,
+            args.candidate_k,
+        )
+    )
 
-        f.write("### 4. VLBRD Packed Residual Directions (`residual_bits=1|2`)\n")
-        f.write("- VLBRD stores residual direction sketch lanes with 1-bit or 2-bit packed codes while keeping the reconstruction/rerank path active. The `Encoded Bytes` and `HNSW Ratio` columns report the index bytes needed for scan plus reconstruction metadata against the serialized HNSW baseline.\n\n")
-        
-        f.write("### 5. Manifold-Adaptive Quantization (MAQ)\n")
-        f.write("- MAQ selects per-grain physical widths from local variance decay and writes variable-width grains in the v3 multi-grain format. The benchmark reports raw-vector rerank and save/load compressed-only recon-rerank separately.\n\n")
+    print("Building Aperon Mode B (128 Grains, Centroid baseline)...", flush=True)
+    rows.extend(
+        build_mode_b(
+            xb,
+            xq,
+            gt_top10,
+            hnsw_bytes,
+            base_file.stat().st_size,
+            grains=128,
+            nprobe=16,
+            candidate_values=args.candidate_k,
+        )
+    )
 
-        f.write("\n## Methodology & Reproduction\n")
-        f.write("### Reproduction Steps\n")
-        f.write("1. Create and activate virtual environment:\n")
-        f.write("   ```bash\n")
-        f.write("   python3 -m venv .venv\n")
-        f.write("   source .venv/bin/activate\n")
-        f.write("   pip install numpy maturin hnswlib\n")
-        f.write("   ```\n")
-        f.write("2. Compile and install `aperon` locally in release mode:\n")
-        f.write("   ```bash\n")
-        f.write("   maturin develop --release\n")
-        f.write("   ```\n")
-        f.write("3. Run the benchmark script:\n")
-        f.write("   ```bash\n")
-        f.write("   python benchmarks/run_benchmark.py\n")
-        f.write("   ```\n")
+    print("Building Aperon Mode B (128 Grains, Lattice)...", flush=True)
+    rows.extend(
+        build_mode_b_lattice(
+            xb,
+            xq,
+            gt_top10,
+            hnsw_bytes,
+            base_file.stat().st_size,
+            grains=128,
+            nprobe=16,
+            candidate_values=args.candidate_k,
+            routing_dim=5,
+            spacing=100.0,
+        )
+    )
 
-    print("\033[1;32mBenchmark complete!\033[0m")
+    print("Building Aperon Mode B (128 Grains, HLR)...", flush=True)
+    rows.extend(
+        build_mode_b_hlr(
+            xb,
+            xq,
+            gt_top10,
+            hnsw_bytes,
+            base_file.stat().st_size,
+            grains=128,
+            nprobe=16,
+            candidate_values=args.candidate_k,
+            hlr_layer_configs=[(2, 2.0), (2, 1.0)],
+        )
+    )
+
+    for hlr_grains in [128, 1024, 4096]:
+        actual_grains = min(hlr_grains, len(xb))
+        print(f"Building Aperon HLR router scale check ({actual_grains} centroids)...", flush=True)
+        rows.append(
+            build_hlr_router_scale(
+                xb,
+                xq,
+                hnsw_bytes,
+                grains=actual_grains,
+                nprobe=16,
+                hlr_layer_configs=[(2, 2.0), (2, 1.0)],
+            )
+        )
+
+    args.output.write_text(markdown_report(rows, args.data_dir, xb, xq), encoding="utf-8")
+    args.json_output.write_text(
+        json.dumps([asdict(row) for row in rows], indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {args.output}", flush=True)
+    print(f"Wrote {args.json_output}", flush=True)
+
 
 if __name__ == "__main__":
     main()

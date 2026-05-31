@@ -830,7 +830,7 @@ fn identity_projection(dim: usize, k: usize) -> Vec<f32> {
     deterministic_projection(dim, k)
 }
 
-fn run_pca(vectors: &[Vec<f32>], dim: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn run_pca(vectors: &[Vec<f32>], dim: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     let flat = vectors
         .iter()
         .flat_map(|vector| vector.iter().copied())
