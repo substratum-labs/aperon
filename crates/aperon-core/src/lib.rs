@@ -5,6 +5,8 @@ pub mod distance;
 pub mod grain;
 pub mod index;
 pub mod layout;
+pub mod memory_sstable;
+pub mod pivot_prefix;
 pub mod quantization;
 pub mod routing;
 mod scan;
@@ -14,6 +16,14 @@ pub use distance::{l2_squared, Distance};
 pub use grain::{Grain, GrainId, ScoredVector};
 pub use index::{AperonIndex, IndexStats};
 pub use layout::{BlockSoaLayout, VectorId, DEFAULT_BLOCK_SIZE};
+pub use memory_sstable::{
+    MemoryHit, MemoryManifest, MemoryRecordInput, MemorySegment, RecallQuery, RecallResult,
+    RecallTrace,
+};
+pub use pivot_prefix::{
+    coverage, exact_topk, sample_centroids, DensePivotSketch, PivotPrefixConfig, PivotPrefixRouter,
+    PivotRouteScratch, PrefixScoreMode, RouteMetrics, DEFAULT_FINAL_NPROBE,
+};
 pub use quantization::{QuantizationError, Quantizer};
 pub use routing::{
     CentroidRouter, HierarchicalLatticeLayer, HierarchicalLatticeLayerConfig,

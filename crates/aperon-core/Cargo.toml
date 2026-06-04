@@ -8,3 +8,19 @@ repository.workspace = true
 [lib]
 name = "aperon_core"
 path = "src/lib.rs"
+
+[[bin]]
+name = "pivot_prefix_t171"
+path = "src/bin/pivot_prefix_t171.rs"
+
+[[bin]]
+name = "pivot_quant_t172"
+path = "src/bin/pivot_quant_t172.rs"
+
+[[bin]]
+name = "pivot_scale_t173"
+path = "src/bin/pivot_scale_t173.rs"
+
+[[bin]]
+name = "memory_sstable_proto"
+path = "src/bin/memory_sstable_proto.rs"
