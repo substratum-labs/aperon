@@ -15,3 +15,5 @@ categories = ["database-implementations", "algorithms"]
 aperon-core = { path = "crates/aperon-core" }
 numpy = "0.25.0"
 pyo3 = "0.25.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

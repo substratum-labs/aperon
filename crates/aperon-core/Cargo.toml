@@ -9,6 +9,10 @@ repository.workspace = true
 name = "aperon_core"
 path = "src/lib.rs"
 
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
 [[bin]]
 name = "pivot_prefix_t171"
 path = "src/bin/pivot_prefix_t171.rs"
@@ -24,3 +28,7 @@ path = "src/bin/pivot_scale_t173.rs"
 [[bin]]
 name = "memory_sstable_proto"
 path = "src/bin/memory_sstable_proto.rs"
+
+[[bin]]
+name = "memory_sstable_demo"
+path = "src/bin/memory_sstable_demo.rs"

@@ -1,0 +1,7 @@
+{
+  "scope_id": 7,
+  "symbols": ["prefix8"],
+  "embedding": [1.0, 0.0, 0.28, 0.0],
+  "limit": 3,
+  "candidate_budget": 8
+}
