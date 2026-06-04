@@ -55,9 +55,11 @@ fn main() {
     println!("segment_id={}", result.trace.segment_id);
     println!("access_paths={:?}", result.trace.access_paths);
     println!(
-        "candidates: filters={} symbols={} semantic_evals={} returned={}",
+        "candidates: filters={} symbols={} vector_generator={} vector={} semantic_evals={} returned={}",
         result.trace.candidates_after_filters,
         result.trace.candidates_after_symbols,
+        result.trace.vector_generator,
+        result.trace.vector_candidates,
         result.trace.semantic_evals,
         result.trace.returned
     );

@@ -93,6 +93,8 @@ pub struct RecallTrace {
     pub records_total: usize,
     pub candidates_after_filters: usize,
     pub candidates_after_symbols: usize,
+    pub vector_generator: &'static str,
+    pub vector_candidates: usize,
     pub semantic_evals: usize,
     pub returned: usize,
 }
@@ -133,6 +135,39 @@ pub struct MemorySpaceRecallResult {
 pub struct MemorySpace {
     pub manifest: MemoryManifestFile,
     pub segments: Vec<LoadedMemorySegment>,
+}
+
+pub trait MemoryVectorCandidateGenerator {
+    fn name(&self) -> &'static str;
+
+    fn candidates(
+        &self,
+        segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlatMemoryVectorCandidateGenerator;
+
+impl MemoryVectorCandidateGenerator for FlatMemoryVectorCandidateGenerator {
+    fn name(&self) -> &'static str {
+        "flat"
+    }
+
+    fn candidates(
+        &self,
+        _segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        let mut candidates = candidates_after_symbols.to_vec();
+        if let Some(budget) = query.candidate_budget {
+            candidates.truncate(budget);
+        }
+        Ok(candidates)
+    }
 }
 
 impl MemorySegment {
@@ -351,6 +386,14 @@ impl MemorySegment {
     }
 
     pub fn recall(&self, query: &RecallQuery) -> Result<RecallResult, String> {
+        self.recall_with_vector_candidate_generator(query, &FlatMemoryVectorCandidateGenerator)
+    }
+
+    pub fn recall_with_vector_candidate_generator(
+        &self,
+        query: &RecallQuery,
+        vector_candidate_generator: &impl MemoryVectorCandidateGenerator,
+    ) -> Result<RecallResult, String> {
         if let Some(embedding) = &query.embedding {
             if embedding.len() != self.dim {
                 return Err(format!(
@@ -393,9 +436,11 @@ impl MemorySegment {
         }
         let candidates_after_symbols = candidates.len();
 
-        if let Some(budget) = query.candidate_budget {
-            candidates.truncate(budget);
-        }
+        let candidates_after_symbols_slice = candidates.as_slice();
+        let candidates =
+            vector_candidate_generator.candidates(self, query, candidates_after_symbols_slice)?;
+        self.validate_vector_candidates(&candidates, candidates_after_symbols_slice)?;
+        let vector_candidates = candidates.len();
 
         let mut scored = Vec::with_capacity(candidates.len());
         if query.embedding.is_some() {
@@ -439,6 +484,8 @@ impl MemorySegment {
                 records_total: self.len(),
                 candidates_after_filters,
                 candidates_after_symbols,
+                vector_generator: vector_candidate_generator.name(),
+                vector_candidates,
                 semantic_evals: scored.len(),
                 returned: hits.len(),
             },
@@ -500,6 +547,29 @@ impl MemorySegment {
 
     fn embedding_row(&self, local_id: usize) -> &[f32] {
         &self.embeddings[local_id * self.dim..(local_id + 1) * self.dim]
+    }
+
+    fn validate_vector_candidates(
+        &self,
+        candidates: &[u32],
+        candidates_after_symbols: &[u32],
+    ) -> Result<(), String> {
+        for &local_id in candidates {
+            if local_id as usize >= self.len() {
+                return Err(format!(
+                    "vector candidate local id out of range: {} >= {}",
+                    local_id,
+                    self.len()
+                ));
+            }
+            if candidates_after_symbols.binary_search(&local_id).is_err() {
+                return Err(format!(
+                    "vector candidate local id was not produced by upstream filters: {}",
+                    local_id
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn score(&self, local_id: usize, semantic_distance: Option<f32>, symbol_matches: usize) -> f32 {
@@ -1420,6 +1490,74 @@ mod tests {
     }
 
     #[test]
+    fn flat_vector_candidate_generator_preserves_recall_behavior() {
+        let segment = sample_segment();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let default_result = segment.recall(&query).unwrap();
+        let explicit_flat_result = segment
+            .recall_with_vector_candidate_generator(&query, &FlatMemoryVectorCandidateGenerator)
+            .unwrap();
+
+        assert_eq!(explicit_flat_result, default_result);
+        assert_eq!(default_result.trace.vector_generator, "flat");
+        assert_eq!(default_result.trace.candidates_after_symbols, 2);
+        assert_eq!(default_result.trace.vector_candidates, 1);
+        assert_eq!(default_result.trace.semantic_evals, 1);
+    }
+
+    #[test]
+    fn recall_consumes_custom_bounded_vector_candidates() {
+        let segment = sample_segment();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            scope_id: Some(10),
+            limit: 3,
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &FixedCandidates(vec![1]))
+            .unwrap();
+
+        assert_eq!(result.trace.vector_generator, "fixed");
+        assert_eq!(result.trace.candidates_after_filters, 2);
+        assert_eq!(result.trace.candidates_after_symbols, 2);
+        assert_eq!(result.trace.vector_candidates, 1);
+        assert_eq!(result.trace.semantic_evals, 1);
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn recall_rejects_out_of_range_vector_candidates() {
+        let segment = sample_segment();
+        let error = segment
+            .recall_with_vector_candidate_generator(
+                &RecallQuery {
+                    limit: 3,
+                    ..RecallQuery::default()
+                },
+                &FixedCandidates(vec![segment.len() as u32]),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("out of range"));
+    }
+
+    #[test]
     fn segment_file_round_trip_accepts_short_symbol_terms() {
         let segment = MemorySegment::build(
             7,
@@ -1570,6 +1708,23 @@ mod tests {
         let checksum_start = bytes.len() - 8;
         let checksum = checksum64(&bytes[..checksum_start]);
         bytes[checksum_start..].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    struct FixedCandidates(Vec<u32>);
+
+    impl MemoryVectorCandidateGenerator for FixedCandidates {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+
+        fn candidates(
+            &self,
+            _segment: &MemorySegment,
+            _query: &RecallQuery,
+            _candidates_after_symbols: &[u32],
+        ) -> Result<Vec<u32>, String> {
+            Ok(self.0.clone())
+        }
     }
 
     fn record(

@@ -172,12 +172,14 @@ fn recall(manifest: &Path, query: &Path) -> Result<(), String> {
             );
         } else if let Some(trace) = &segment.trace {
             println!(
-                "trace segment_id={} access_paths={:?} records_total={} column_filters={} symbol_postings={} semantic_rerank={} returned={}",
+                "trace segment_id={} access_paths={:?} records_total={} column_filters={} symbol_postings={} vector_generator={} vector_candidates={} semantic_rerank={} returned={}",
                 trace.segment_id,
                 trace.access_paths,
                 trace.records_total,
                 trace.candidates_after_filters,
                 trace.candidates_after_symbols,
+                trace.vector_generator,
+                trace.vector_candidates,
                 trace.semantic_evals,
                 trace.returned
             );

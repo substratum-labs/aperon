@@ -63,6 +63,9 @@ struct Args {
 #[derive(Clone, Debug)]
 struct Scenario {
     name: String,
+    category: &'static str,
+    description: &'static str,
+    required: bool,
     records: Vec<BenchRecord>,
     queries: Vec<BenchQuery>,
 }
@@ -79,8 +82,61 @@ struct PathMetrics {
     semantic_evals: usize,
     filter_candidates: Option<usize>,
     symbol_candidates: Option<usize>,
+    vector_candidates: Option<usize>,
     correct: usize,
     queries: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchSummary<'a> {
+    schema_version: u32,
+    benchmark: &'static str,
+    scenario: BenchScenarioInfo<'a>,
+    artifacts: BenchArtifacts<'a>,
+    rows: Vec<BenchMetricRow<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchScenarioInfo<'a> {
+    name: &'a str,
+    category: &'a str,
+    required: bool,
+    description: &'a str,
+    records: usize,
+    queries: usize,
+    segments: usize,
+    embedding_dim: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchArtifacts<'a> {
+    out_dir: &'a str,
+    records_jsonl: &'a str,
+    manifest: &'a str,
+    child_manifest: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchMetricRow<'a> {
+    schema_version: u32,
+    benchmark: &'static str,
+    scenario: &'a str,
+    scenario_category: &'a str,
+    required_scenario: bool,
+    path: &'static str,
+    access_path: &'static str,
+    records: usize,
+    queries: usize,
+    build_ms: Option<f64>,
+    bytes: Option<u64>,
+    latency_us_per_query: f64,
+    semantic_evals_per_query: f64,
+    filter_candidates_per_query: Option<f64>,
+    symbol_candidates_per_query: Option<f64>,
+    vector_candidates_per_query: Option<f64>,
+    correct: usize,
+    fork_ms: Option<f64>,
+    fork_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,11 +154,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let tiny = tiny_scenario()?;
-    run_scenario(&tiny, &args.out.join("tiny"))?;
+    for scenario in required_scenarios()? {
+        run_scenario(&scenario, &args.out.join(&scenario.name))?;
+    }
 
     let small = synthetic_scenario(
         "synthetic-small",
+        "scale-smoke",
+        "small deterministic synthetic comparison for fast local smoke runs",
         1_000,
         10,
         args.queries.min(20).max(10),
@@ -113,6 +172,8 @@ fn run() -> Result<(), String> {
     if args.medium || args.records != 100_000 || args.segments != 100 || args.queries != 100 {
         let synthetic = synthetic_scenario(
             "synthetic-custom",
+            "scale-custom",
+            "caller-sized deterministic synthetic comparison",
             args.records,
             args.segments,
             args.queries,
@@ -122,6 +183,8 @@ fn run() -> Result<(), String> {
     } else {
         let medium = synthetic_scenario(
             "synthetic-medium",
+            "scale-medium",
+            "default deterministic synthetic comparison",
             args.records,
             args.segments,
             args.queries,
@@ -169,6 +232,15 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
     rows.push(run_in_memory_flat(&records, &scenario.queries));
     rows.push(run_vector_only(&records, &scenario.queries));
 
+    write_machine_readable_summary(
+        scenario,
+        out,
+        &jsonl_path,
+        &manifest_path,
+        &fork_path,
+        &rows,
+    )?;
+
     println!();
     println!(
         "scenario={} records={} queries={} out={}",
@@ -178,7 +250,7 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         out.display()
     );
     println!(
-        "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>10} {:>11} {:>10}",
+        "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>11} {:>10}",
         "path",
         "access_path",
         "build_ms",
@@ -187,13 +259,14 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         "sem/q",
         "filter/q",
         "symbol/q",
+        "vector/q",
         "correct",
         "fork_ms",
         "fork_b"
     );
     for row in rows {
         println!(
-            "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>10} {:>11} {:>10}",
+            "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>11} {:>10}",
             row.path,
             row.access_path,
             fmt_duration_ms(row.build_time),
@@ -202,6 +275,7 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
             row.semantic_evals / row.queries.max(1),
             fmt_avg(row.filter_candidates, row.queries),
             fmt_avg(row.symbol_candidates, row.queries),
+            fmt_avg(row.vector_candidates, row.queries),
             format!("{}/{}", row.correct, row.queries),
             fmt_duration_ms(row.fork_time),
             fmt_bytes(row.fork_bytes)
@@ -209,6 +283,90 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn write_machine_readable_summary(
+    scenario: &Scenario,
+    out: &Path,
+    records_jsonl: &Path,
+    manifest: &Path,
+    child_manifest: &Path,
+    rows: &[PathMetrics],
+) -> Result<(), String> {
+    let out_dir = out.display().to_string();
+    let records_jsonl = records_jsonl.display().to_string();
+    let manifest = manifest.display().to_string();
+    let child_manifest = child_manifest.display().to_string();
+    let metric_rows = rows
+        .iter()
+        .map(|row| metric_row(scenario, row))
+        .collect::<Vec<_>>();
+    let summary = BenchSummary {
+        schema_version: 1,
+        benchmark: "memory-sstable-five-layer-prep",
+        scenario: BenchScenarioInfo {
+            name: &scenario.name,
+            category: scenario.category,
+            required: scenario.required,
+            description: scenario.description,
+            records: scenario.records.len(),
+            queries: scenario.queries.len(),
+            segments: scenario_segment_count(scenario),
+            embedding_dim: scenario_embedding_dim(scenario),
+        },
+        artifacts: BenchArtifacts {
+            out_dir: &out_dir,
+            records_jsonl: &records_jsonl,
+            manifest: &manifest,
+            child_manifest: &child_manifest,
+        },
+        rows: metric_rows,
+    };
+
+    let summary_text = serde_json::to_string_pretty(&summary)
+        .map_err(|err| format!("serialize summary json: {err}"))?;
+    fs::write(out.join("summary.json"), format!("{summary_text}\n"))
+        .map_err(|err| format!("write {}: {err}", out.join("summary.json").display()))?;
+
+    let mut jsonl = String::new();
+    for row in &summary.rows {
+        let line =
+            serde_json::to_string(row).map_err(|err| format!("serialize metrics jsonl: {err}"))?;
+        jsonl.push_str(&line);
+        jsonl.push('\n');
+    }
+    fs::write(out.join("metrics.jsonl"), jsonl)
+        .map_err(|err| format!("write {}: {err}", out.join("metrics.jsonl").display()))
+}
+
+fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRow<'a> {
+    BenchMetricRow {
+        schema_version: 1,
+        benchmark: "memory-sstable-five-layer-prep",
+        scenario: &scenario.name,
+        scenario_category: scenario.category,
+        required_scenario: scenario.required,
+        path: row.path,
+        access_path: row.access_path,
+        records: scenario.records.len(),
+        queries: row.queries,
+        build_ms: row.build_time.map(duration_ms),
+        bytes: row.bytes,
+        latency_us_per_query: duration_us_per_query_value(row.total_latency, row.queries),
+        semantic_evals_per_query: avg_usize(row.semantic_evals, row.queries),
+        filter_candidates_per_query: row
+            .filter_candidates
+            .map(|value| avg_usize(value, row.queries)),
+        symbol_candidates_per_query: row
+            .symbol_candidates
+            .map(|value| avg_usize(value, row.queries)),
+        vector_candidates_per_query: row
+            .vector_candidates
+            .map(|value| avg_usize(value, row.queries)),
+        correct: row.correct,
+        fork_ms: row.fork_time.map(duration_ms),
+        fork_bytes: row.fork_bytes,
+    }
 }
 
 fn run_mvp(
@@ -223,6 +381,7 @@ fn run_mvp(
     let mut semantic_evals = 0;
     let mut filter_candidates = 0;
     let mut symbol_candidates = 0;
+    let mut vector_candidates = 0;
     let mut correct = 0;
 
     for bench_query in queries {
@@ -234,6 +393,7 @@ fn run_mvp(
             if let Some(trace) = segment.trace {
                 filter_candidates += trace.candidates_after_filters;
                 symbol_candidates += trace.candidates_after_symbols;
+                vector_candidates += trace.vector_candidates;
             }
         }
         if result
@@ -247,7 +407,8 @@ fn run_mvp(
 
     Ok(PathMetrics {
         path: "memory-sstable",
-        access_path: "metadata filters + symbol postings + semantic rerank",
+        access_path:
+            "metadata filters + symbol postings + flat vector candidates + semantic rerank",
         build_time: Some(build_time),
         bytes: Some(bytes),
         fork_time: Some(fork_time),
@@ -256,6 +417,7 @@ fn run_mvp(
         semantic_evals,
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
+        vector_candidates: Some(vector_candidates),
         correct,
         queries: queries.len(),
     })
@@ -299,6 +461,7 @@ fn run_naive_jsonl(
         semantic_evals,
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
+        vector_candidates: None,
         correct,
         queries: queries.len(),
     })
@@ -340,6 +503,7 @@ fn run_in_memory_flat(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMe
         semantic_evals,
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
+        vector_candidates: None,
         correct,
         queries: queries.len(),
     }
@@ -377,6 +541,7 @@ fn run_vector_only(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMetri
         semantic_evals,
         filter_candidates: None,
         symbol_candidates: None,
+        vector_candidates: None,
         correct,
         queries: queries.len(),
     }
@@ -493,6 +658,9 @@ fn tiny_scenario() -> Result<Scenario, String> {
     let query = read_query(Path::new("examples/query_prefix8.json"))?;
     Ok(Scenario {
         name: "tiny-prefix8".to_string(),
+        category: "required/tiny-prefix8",
+        description: "tiny example-backed prefix8 planner fallback regression case",
+        required: true,
         records,
         queries: vec![BenchQuery {
             query,
@@ -501,8 +669,193 @@ fn tiny_scenario() -> Result<Scenario, String> {
     })
 }
 
+fn required_scenarios() -> Result<Vec<Scenario>, String> {
+    Ok(vec![
+        tiny_scenario()?,
+        prepared_scenario(
+            "metadata-selective",
+            "required/metadata-selective",
+            "metadata filters should prune most records before semantic rerank",
+            200_001,
+            vec![
+                prepared_record(10, 200_001, 41, 1_700_100_010, 1, 0.97, [0.9, 0.1, 0.0, 0.0], &["metadata", "selective", "target"]),
+                prepared_record(10, 200_002, 42, 1_700_100_011, 1, 0.99, [0.9, 0.1, 0.0, 0.0], &["metadata", "selective", "wrong-scope"]),
+                prepared_record(11, 200_003, 41, 1_700_200_000, 1, 0.98, [0.9, 0.1, 0.0, 0.0], &["metadata", "selective", "wrong-time"]),
+                prepared_record(11, 200_004, 41, 1_700_100_012, 1, 0.55, [0.9, 0.1, 0.0, 0.0], &["metadata", "selective", "low-confidence"]),
+                prepared_record(12, 200_005, 7, 1_700_100_013, 2, 0.80, [0.0, 0.9, 0.0, 0.0], &["metadata", "distractor"]),
+            ],
+            RecallQuery {
+                embedding: Some(vec![0.9, 0.1, 0.0, 0.0]),
+                symbols: vec!["metadata".to_string(), "selective".to_string(), "target".to_string()],
+                scope_id: Some(41),
+                time_start: Some(1_700_100_000),
+                time_end: Some(1_700_100_099),
+                min_confidence: Some(0.90),
+                limit: 3,
+                candidate_budget: Some(16),
+            },
+        ),
+        prepared_scenario(
+            "symbol-selective",
+            "required/symbol-selective",
+            "symbol postings should isolate the target among near-identical vectors",
+            210_001,
+            vec![
+                prepared_record(20, 210_001, 5, 1_700_210_001, 1, 0.96, [0.2, 0.8, 0.1, 0.0], &["symbol", "rare-route", "target"]),
+                prepared_record(20, 210_002, 5, 1_700_210_002, 1, 0.99, [0.2, 0.8, 0.1, 0.0], &["symbol", "common-route"]),
+                prepared_record(21, 210_003, 5, 1_700_210_003, 1, 0.98, [0.2, 0.8, 0.1, 0.0], &["symbol", "other-route"]),
+                prepared_record(21, 210_004, 6, 1_700_210_004, 1, 0.95, [0.1, 0.7, 0.2, 0.0], &["symbol", "rare-route", "other-scope"]),
+            ],
+            RecallQuery {
+                embedding: Some(vec![0.2, 0.8, 0.1, 0.0]),
+                symbols: vec!["rare-route".to_string(), "target".to_string()],
+                scope_id: Some(5),
+                time_start: None,
+                time_end: None,
+                min_confidence: Some(0.90),
+                limit: 3,
+                candidate_budget: Some(8),
+            },
+        ),
+        prepared_scenario(
+            "broad-semantic",
+            "required/broad-semantic",
+            "broad semantic query with no metadata or symbol filters",
+            220_001,
+            vec![
+                prepared_record(30, 220_001, 1, 1_700_220_001, 1, 0.92, [0.6, 0.6, 0.0, 0.0], &["semantic", "target"]),
+                prepared_record(30, 220_002, 2, 1_700_220_002, 1, 0.95, [0.2, 0.9, 0.0, 0.0], &["semantic", "near"]),
+                prepared_record(31, 220_003, 3, 1_700_220_003, 1, 0.95, [-0.5, 0.1, 0.0, 0.0], &["semantic", "far"]),
+                prepared_record(31, 220_004, 4, 1_700_220_004, 1, 0.95, [0.0, -0.7, 0.0, 0.0], &["semantic", "far"]),
+            ],
+            RecallQuery {
+                embedding: Some(vec![0.6, 0.6, 0.0, 0.0]),
+                symbols: Vec::new(),
+                scope_id: None,
+                time_start: None,
+                time_end: None,
+                min_confidence: None,
+                limit: 3,
+                candidate_budget: Some(32),
+            },
+        ),
+        prepared_scenario(
+            "branch-fork",
+            "required/branch-fork",
+            "branch/fork fixture reserves stable records for manifest fork measurements",
+            230_001,
+            vec![
+                prepared_record(40, 230_001, 12, 1_700_230_001, 1, 0.98, [0.0, 0.4, 0.8, 0.0], &["branch", "fork", "child-ready"]),
+                prepared_record(40, 230_002, 12, 1_700_230_002, 1, 0.93, [0.0, 0.3, 0.7, 0.0], &["branch", "main"]),
+                prepared_record(41, 230_003, 13, 1_700_230_003, 2, 0.91, [0.1, 0.0, 0.5, 0.2], &["branch", "sibling"]),
+            ],
+            RecallQuery {
+                embedding: Some(vec![0.0, 0.4, 0.8, 0.0]),
+                symbols: vec!["branch".to_string(), "fork".to_string()],
+                scope_id: Some(12),
+                time_start: None,
+                time_end: None,
+                min_confidence: Some(0.90),
+                limit: 3,
+                candidate_budget: Some(8),
+            },
+        ),
+        prepared_scenario(
+            "adversarial",
+            "required/adversarial",
+            "adversarial fixture with duplicate-like vectors and misleading high confidence distractors",
+            240_001,
+            vec![
+                prepared_record(50, 240_001, 3, 1_700_240_001, 1, 0.96, [0.7, -0.1, 0.2, 0.0], &["adversarial", "target", "exact-symbol"]),
+                prepared_record(50, 240_002, 3, 1_700_240_002, 1, 0.99, [0.7, -0.1, 0.2, 0.0], &["adversarial", "decoy"]),
+                prepared_record(51, 240_003, 3, 1_700_240_003, 1, 0.99, [0.7, -0.1, 0.2, 0.0], &["adversarial", "exact-symbol", "wrong-token"]),
+                prepared_record(51, 240_004, 4, 1_700_240_004, 1, 1.00, [0.7, -0.1, 0.2, 0.0], &["target", "exact-symbol"]),
+            ],
+            RecallQuery {
+                embedding: Some(vec![0.7, -0.1, 0.2, 0.0]),
+                symbols: vec!["adversarial".to_string(), "target".to_string(), "exact-symbol".to_string()],
+                scope_id: Some(3),
+                time_start: None,
+                time_end: None,
+                min_confidence: Some(0.90),
+                limit: 3,
+                candidate_budget: Some(8),
+            },
+        ),
+        prepared_scenario(
+            "fallback",
+            "required/fallback",
+            "fallback fixture exercises recall without an embedding vector",
+            250_001,
+            vec![
+                prepared_record(60, 250_001, 9, 1_700_250_001, 1, 0.98, [0.1, 0.1, 0.1, 0.9], &["fallback", "metadata-only", "target"]),
+                prepared_record(60, 250_002, 9, 1_700_250_002, 1, 0.90, [0.8, 0.1, 0.1, 0.0], &["fallback", "metadata-only"]),
+                prepared_record(61, 250_003, 10, 1_700_250_003, 1, 0.99, [0.1, 0.1, 0.1, 0.9], &["fallback", "target"]),
+            ],
+            RecallQuery {
+                embedding: None,
+                symbols: vec!["fallback".to_string(), "metadata-only".to_string(), "target".to_string()],
+                scope_id: Some(9),
+                time_start: None,
+                time_end: None,
+                min_confidence: Some(0.95),
+                limit: 3,
+                candidate_budget: Some(8),
+            },
+        ),
+    ])
+}
+
+fn prepared_scenario(
+    name: &str,
+    category: &'static str,
+    description: &'static str,
+    expected_record_id: u64,
+    records: Vec<BenchRecord>,
+    query: RecallQuery,
+) -> Scenario {
+    Scenario {
+        name: name.to_string(),
+        category,
+        description,
+        required: true,
+        records,
+        queries: vec![BenchQuery {
+            query,
+            expected_record_id,
+        }],
+    }
+}
+
+fn prepared_record(
+    segment_id: u64,
+    record_id: u64,
+    scope_id: u32,
+    timestamp: i64,
+    source_id: u16,
+    confidence: f32,
+    embedding: [f32; 4],
+    symbols: &[&str],
+) -> BenchRecord {
+    BenchRecord {
+        segment_id,
+        record: MemoryRecordInput {
+            record_id,
+            scope_id,
+            timestamp,
+            source_id,
+            confidence,
+            text: format!("prepared memory benchmark record {record_id}"),
+            embedding: embedding.to_vec(),
+            symbols: symbols.iter().map(|symbol| (*symbol).to_string()).collect(),
+        },
+    }
+}
+
 fn synthetic_scenario(
     name: &str,
+    category: &'static str,
+    description: &'static str,
     record_count: usize,
     segment_count: usize,
     query_count: usize,
@@ -553,6 +906,9 @@ fn synthetic_scenario(
 
     Scenario {
         name: name.to_string(),
+        category,
+        description,
+        required: false,
         records,
         queries,
     }
@@ -732,8 +1088,19 @@ fn parse_path(args: &[String], name: &str, default: &str) -> PathBuf {
 }
 
 fn duration_us_per_query(duration: Duration, queries: usize) -> String {
-    let per_query = duration.as_secs_f64() * 1_000_000.0 / queries.max(1) as f64;
-    format!("{per_query:.1}")
+    format!("{:.1}", duration_us_per_query_value(duration, queries))
+}
+
+fn duration_us_per_query_value(duration: Duration, queries: usize) -> f64 {
+    duration.as_secs_f64() * 1_000_000.0 / queries.max(1) as f64
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn avg_usize(value: usize, queries: usize) -> f64 {
+    value as f64 / queries.max(1) as f64
 }
 
 fn fmt_duration_ms(duration: Option<Duration>) -> String {
@@ -752,6 +1119,23 @@ fn fmt_avg(value: Option<usize>, queries: usize) -> String {
     value
         .map(|value| (value / queries.max(1)).to_string())
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn scenario_segment_count(scenario: &Scenario) -> usize {
+    scenario
+        .records
+        .iter()
+        .map(|record| record.segment_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+fn scenario_embedding_dim(scenario: &Scenario) -> usize {
+    scenario
+        .records
+        .first()
+        .map(|record| record.record.embedding.len())
+        .unwrap_or(0)
 }
 
 fn default_limit() -> usize {
