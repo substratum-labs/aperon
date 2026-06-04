@@ -2,10 +2,12 @@ use crate::distance::l2_squared_unchecked;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SEGMENT_MAGIC: &[u8; 4] = b"APMS";
 const SEGMENT_VERSION: u32 = 0;
+const MANIFEST_MAGIC: &[u8; 4] = b"APMF";
+const MANIFEST_VERSION: u32 = 0;
 const CHECKSUM_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const CHECKSUM_PRIME: u64 = 0x100000001b3;
 
@@ -46,6 +48,20 @@ pub struct MemoryManifest {
     pub segment_ids: Vec<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryManifestSegment {
+    pub segment_id: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryManifestFile {
+    pub manifest_id: u64,
+    pub parent_manifest_id: Option<u64>,
+    pub branch_id: u64,
+    pub segments: Vec<MemoryManifestSegment>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RecallQuery {
     pub embedding: Option<Vec<f32>>,
@@ -84,6 +100,38 @@ pub struct RecallTrace {
 pub struct RecallResult {
     pub hits: Vec<MemoryHit>,
     pub trace: RecallTrace,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemorySpaceSegmentTrace {
+    pub segment_id: u64,
+    pub pruned: bool,
+    pub prune_reason: Option<&'static str>,
+    pub trace: Option<RecallTrace>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemorySpaceRecallTrace {
+    pub manifest_id: u64,
+    pub branch_id: u64,
+    pub segments_considered: usize,
+    pub segments_scanned: usize,
+    pub segments_pruned: usize,
+    pub semantic_evals: usize,
+    pub returned: usize,
+    pub segment_traces: Vec<MemorySpaceSegmentTrace>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemorySpaceRecallResult {
+    pub hits: Vec<MemoryHit>,
+    pub trace: MemorySpaceRecallTrace,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemorySpace {
+    pub manifest: MemoryManifestFile,
+    segments: Vec<LoadedMemorySegment>,
 }
 
 impl MemorySegment {
@@ -526,6 +574,260 @@ impl MemorySegment {
     }
 }
 
+impl MemoryManifestFile {
+    pub fn new(
+        parent_manifest_id: Option<u64>,
+        branch_id: u64,
+        segments: Vec<MemoryManifestSegment>,
+    ) -> Self {
+        let manifest_id = stable_manifest_id(parent_manifest_id, branch_id, &segments);
+        Self {
+            manifest_id,
+            parent_manifest_id,
+            branch_id,
+            segments,
+        }
+    }
+
+    pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let segment_count = checked_u32(self.segments.len(), "manifest segment count")?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MANIFEST_MAGIC);
+        write_u32(&mut bytes, MANIFEST_VERSION);
+        write_u64(&mut bytes, self.manifest_id);
+        match self.parent_manifest_id {
+            Some(parent_manifest_id) => {
+                bytes.push(1);
+                write_u64(&mut bytes, parent_manifest_id);
+            }
+            None => {
+                bytes.push(0);
+                write_u64(&mut bytes, 0);
+            }
+        }
+        write_u64(&mut bytes, self.branch_id);
+        write_u32(&mut bytes, segment_count);
+        for segment in &self.segments {
+            write_u64(&mut bytes, segment.segment_id);
+            let path = segment
+                .path
+                .to_str()
+                .ok_or_else(|| invalid_data("manifest segment path must be valid utf-8"))?;
+            write_u32(
+                &mut bytes,
+                checked_u32(path.len(), "manifest segment path length")?,
+            );
+            bytes.extend_from_slice(path.as_bytes());
+        }
+        let checksum = checksum64(&bytes);
+        write_u64(&mut bytes, checksum);
+        fs::write(path, bytes)
+    }
+
+    pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        if bytes.len() < 45 {
+            return Err(invalid_data("manifest file is too short"));
+        }
+        let (payload, footer) = bytes.split_at(bytes.len() - 8);
+        let expected_checksum = read_footer_checksum(footer)?;
+        let actual_checksum = checksum64(payload);
+        if expected_checksum != actual_checksum {
+            return Err(invalid_data("manifest checksum mismatch"));
+        }
+
+        let mut reader = ManifestReader::new(payload);
+        reader.expect_magic()?;
+        let version = reader.read_u32()?;
+        if version != MANIFEST_VERSION {
+            return Err(invalid_data(format!(
+                "unsupported memory manifest version: {}",
+                version
+            )));
+        }
+        let manifest_id = reader.read_u64()?;
+        let parent_flag = reader.read_u8()?;
+        let parent_value = reader.read_u64()?;
+        let parent_manifest_id = match parent_flag {
+            0 => None,
+            1 => Some(parent_value),
+            _ => return Err(invalid_data("manifest parent flag must be 0 or 1")),
+        };
+        let branch_id = reader.read_u64()?;
+        let segment_count = reader.read_u32()? as usize;
+        reader.check_remaining(segment_count, 12)?;
+        let mut segments = Vec::with_capacity(segment_count);
+        let mut ordered_ids = BTreeSet::new();
+        for _ in 0..segment_count {
+            let segment_id = reader.read_u64()?;
+            if !ordered_ids.insert(segment_id) {
+                return Err(invalid_data("manifest segment ids must be unique"));
+            }
+            let path_len = reader.read_u32()? as usize;
+            let path = std::str::from_utf8(reader.read_bytes(path_len)?)
+                .map_err(|_| invalid_data("manifest segment path is not valid utf-8"))?;
+            segments.push(MemoryManifestSegment {
+                segment_id,
+                path: PathBuf::from(path),
+            });
+        }
+        reader.expect_end()?;
+
+        Ok(Self {
+            manifest_id,
+            parent_manifest_id,
+            branch_id,
+            segments,
+        })
+    }
+}
+
+impl MemorySpace {
+    pub fn open(manifest_path: impl AsRef<Path>) -> io::Result<Self> {
+        let manifest_path = manifest_path.as_ref();
+        let manifest = MemoryManifestFile::read(manifest_path)?;
+        let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for entry in &manifest.segments {
+            let segment_path = if entry.path.is_absolute() {
+                entry.path.clone()
+            } else {
+                base_dir.join(&entry.path)
+            };
+            let segment = MemorySegment::read(&segment_path)?;
+            if segment.segment_id != entry.segment_id {
+                return Err(invalid_data(format!(
+                    "manifest segment id {} does not match loaded segment id {}",
+                    entry.segment_id, segment.segment_id
+                )));
+            }
+            segments.push(LoadedMemorySegment {
+                stats: SegmentStats::from_segment(&segment),
+                segment,
+            });
+        }
+        Ok(Self { manifest, segments })
+    }
+
+    pub fn recall(&self, query: &RecallQuery) -> Result<MemorySpaceRecallResult, String> {
+        let limit = query.limit.max(1);
+        let mut merged = Vec::new();
+        let mut segment_traces = Vec::with_capacity(self.segments.len());
+        let mut segments_scanned = 0;
+        let mut segments_pruned = 0;
+        let mut semantic_evals = 0;
+
+        for loaded in &self.segments {
+            if let Some(reason) = loaded.stats.prune_reason(query) {
+                segments_pruned += 1;
+                segment_traces.push(MemorySpaceSegmentTrace {
+                    segment_id: loaded.segment.segment_id,
+                    pruned: true,
+                    prune_reason: Some(reason),
+                    trace: None,
+                });
+                continue;
+            }
+
+            segments_scanned += 1;
+            let result = loaded.segment.recall(query)?;
+            semantic_evals += result.trace.semantic_evals;
+            for hit in result.hits {
+                merged.push((loaded.segment.segment_id, hit));
+            }
+            segment_traces.push(MemorySpaceSegmentTrace {
+                segment_id: loaded.segment.segment_id,
+                pruned: false,
+                prune_reason: None,
+                trace: Some(result.trace),
+            });
+        }
+
+        merged.sort_unstable_by(|a, b| {
+            b.1.score
+                .total_cmp(&a.1.score)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.record_id.cmp(&b.1.record_id))
+        });
+        let hits = merged
+            .into_iter()
+            .take(limit)
+            .map(|(_, hit)| hit)
+            .collect::<Vec<_>>();
+
+        Ok(MemorySpaceRecallResult {
+            trace: MemorySpaceRecallTrace {
+                manifest_id: self.manifest.manifest_id,
+                branch_id: self.manifest.branch_id,
+                segments_considered: self.segments.len(),
+                segments_scanned,
+                segments_pruned,
+                semantic_evals,
+                returned: hits.len(),
+                segment_traces,
+            },
+            hits,
+        })
+    }
+
+    pub fn fork(&self, branch_id: u64, out_manifest_path: impl AsRef<Path>) -> io::Result<()> {
+        let child = MemoryManifestFile::new(
+            Some(self.manifest.manifest_id),
+            branch_id,
+            self.manifest.segments.clone(),
+        );
+        child.write(out_manifest_path)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LoadedMemorySegment {
+    segment: MemorySegment,
+    stats: SegmentStats,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SegmentStats {
+    scope_min: Option<u32>,
+    scope_max: Option<u32>,
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+}
+
+impl SegmentStats {
+    fn from_segment(segment: &MemorySegment) -> Self {
+        Self {
+            scope_min: segment.scope_ids.iter().min().copied(),
+            scope_max: segment.scope_ids.iter().max().copied(),
+            time_min: segment.timestamps.iter().min().copied(),
+            time_max: segment.timestamps.iter().max().copied(),
+        }
+    }
+
+    fn prune_reason(&self, query: &RecallQuery) -> Option<&'static str> {
+        if let Some(scope_id) = query.scope_id {
+            if self
+                .scope_min
+                .zip(self.scope_max)
+                .is_some_and(|(min, max)| scope_id < min || scope_id > max)
+            {
+                return Some("scope_range");
+            }
+        }
+        if let Some(start) = query.time_start {
+            if self.time_max.is_some_and(|max| max < start) {
+                return Some("time_range");
+            }
+        }
+        if let Some(end) = query.time_end {
+            if self.time_min.is_some_and(|min| min > end) {
+                return Some("time_range");
+            }
+        }
+        None
+    }
+}
+
 fn normalize_symbol(symbol: &str) -> String {
     symbol.trim().to_ascii_lowercase()
 }
@@ -549,6 +851,32 @@ fn checksum64(bytes: &[u8]) -> u64 {
         checksum = checksum.wrapping_mul(CHECKSUM_PRIME);
     }
     checksum
+}
+
+fn stable_manifest_id(
+    parent_manifest_id: Option<u64>,
+    branch_id: u64,
+    segments: &[MemoryManifestSegment],
+) -> u64 {
+    let mut bytes = Vec::new();
+    match parent_manifest_id {
+        Some(parent_manifest_id) => {
+            bytes.push(1);
+            write_u64(&mut bytes, parent_manifest_id);
+        }
+        None => {
+            bytes.push(0);
+            write_u64(&mut bytes, 0);
+        }
+    }
+    write_u64(&mut bytes, branch_id);
+    write_u64(&mut bytes, segments.len() as u64);
+    for segment in segments {
+        write_u64(&mut bytes, segment.segment_id);
+        bytes.extend_from_slice(segment.path.as_os_str().to_string_lossy().as_bytes());
+        bytes.push(0);
+    }
+    checksum64(&bytes)
 }
 
 fn write_u16(bytes: &mut Vec<u8>, value: u16) {
@@ -605,8 +933,13 @@ impl<'a> SegmentReader<'a> {
 
     fn check_remaining(&self, count: usize, size_of_element: usize) -> io::Result<()> {
         let remaining = self.bytes.len().saturating_sub(self.offset);
-        if count.checked_mul(size_of_element).map_or(true, |needed| needed > remaining) {
-            return Err(invalid_data("unexpected end of memory segment or size mismatch"));
+        if count
+            .checked_mul(size_of_element)
+            .map_or(true, |needed| needed > remaining)
+        {
+            return Err(invalid_data(
+                "unexpected end of memory segment or size mismatch",
+            ));
         }
         Ok(())
     }
@@ -695,6 +1028,72 @@ impl<'a> SegmentReader<'a> {
     }
 }
 
+struct ManifestReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ManifestReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn expect_magic(&mut self) -> io::Result<()> {
+        let magic = self.read_bytes(MANIFEST_MAGIC.len())?;
+        if magic != MANIFEST_MAGIC {
+            return Err(invalid_data("unsupported memory manifest magic"));
+        }
+        Ok(())
+    }
+
+    fn expect_end(&self) -> io::Result<()> {
+        if self.offset != self.bytes.len() {
+            return Err(invalid_data("trailing bytes in memory manifest"));
+        }
+        Ok(())
+    }
+
+    fn check_remaining(&self, count: usize, size_of_element: usize) -> io::Result<()> {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        if count
+            .checked_mul(size_of_element)
+            .map_or(true, |needed| needed > remaining)
+        {
+            return Err(invalid_data(
+                "unexpected end of memory manifest or size mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_data("manifest offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid_data("unexpected end of memory manifest"));
+        }
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let bytes: [u8; 4] = self.read_bytes(4)?.try_into().unwrap();
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        let bytes: [u8; 8] = self.read_bytes(8)?.try_into().unwrap();
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +1170,191 @@ mod tests {
         };
         assert_eq!(branch.parent_manifest_id, Some(1));
         assert_eq!(branch.segment_ids, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn manifest_file_round_trip_preserves_ordered_segments() {
+        let manifest = MemoryManifestFile::new(
+            None,
+            42,
+            vec![
+                MemoryManifestSegment {
+                    segment_id: 10,
+                    path: PathBuf::from("segment-10.apms"),
+                },
+                MemoryManifestSegment {
+                    segment_id: 11,
+                    path: PathBuf::from("segment-11.apms"),
+                },
+            ],
+        );
+        let path = temp_manifest_path("round-trip");
+        manifest.write(&path).unwrap();
+
+        let loaded = MemoryManifestFile::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.segments[0].segment_id, 10);
+        assert_eq!(loaded.segments[1].segment_id, 11);
+    }
+
+    #[test]
+    fn memory_space_recalls_across_segments_with_deterministic_trace() {
+        let segment_a = MemorySegment::build(
+            10,
+            3,
+            vec![record(
+                1,
+                10,
+                100,
+                "manifest recall found base note",
+                [1.0, 0.0, 0.0],
+                &["T-177", "manifest"],
+            )],
+        )
+        .unwrap();
+        let segment_b = MemorySegment::build(
+            11,
+            3,
+            vec![record(
+                4,
+                10,
+                130,
+                "manifest recall found branch note",
+                [0.9, 0.0, 0.0],
+                &["T-177", "branch"],
+            )],
+        )
+        .unwrap();
+        let segment_a_path = temp_segment_path("space-a");
+        let segment_b_path = temp_segment_path("space-b");
+        let manifest_path = temp_manifest_path("space");
+        segment_a.write(&segment_a_path).unwrap();
+        segment_b.write(&segment_b_path).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![
+                MemoryManifestSegment {
+                    segment_id: 10,
+                    path: segment_a_path.clone(),
+                },
+                MemoryManifestSegment {
+                    segment_id: 11,
+                    path: segment_b_path.clone(),
+                },
+            ],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let space = MemorySpace::open(&manifest_path).unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            symbols: vec!["t-177".to_string()],
+            scope_id: Some(10),
+            limit: 10,
+            ..RecallQuery::default()
+        };
+        let first = space.recall(&query).unwrap();
+        let second = space.recall(&query).unwrap();
+
+        fs::remove_file(&segment_a_path).unwrap();
+        fs::remove_file(&segment_b_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .hits
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(first.trace.segments_considered, 2);
+        assert_eq!(first.trace.segments_scanned, 2);
+        assert_eq!(first.trace.segments_pruned, 0);
+        assert_eq!(first.trace.semantic_evals, 2);
+        assert_eq!(first.trace.returned, 2);
+        assert_eq!(first.trace.segment_traces.len(), 2);
+        assert_eq!(first.trace.segment_traces[0].segment_id, 10);
+        assert_eq!(first.trace.segment_traces[1].segment_id, 11);
+    }
+
+    #[test]
+    fn memory_space_prunes_segments_by_scope_and_time_stats() {
+        let segment = sample_segment();
+        let segment_path = temp_segment_path("prune");
+        let manifest_path = temp_manifest_path("prune");
+        segment.write(&segment_path).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: segment_path.clone(),
+            }],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let space = MemorySpace::open(&manifest_path).unwrap();
+        let result = space
+            .recall(&RecallQuery {
+                scope_id: Some(99),
+                time_start: Some(1000),
+                limit: 5,
+                ..RecallQuery::default()
+            })
+            .unwrap();
+
+        fs::remove_file(&segment_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        assert!(result.hits.is_empty());
+        assert_eq!(result.trace.segments_considered, 1);
+        assert_eq!(result.trace.segments_scanned, 0);
+        assert_eq!(result.trace.segments_pruned, 1);
+        assert_eq!(
+            result.trace.segment_traces[0].prune_reason,
+            Some("scope_range")
+        );
+    }
+
+    #[test]
+    fn memory_space_fork_writes_child_manifest_without_mutating_parent() {
+        let segment = sample_segment();
+        let segment_path = temp_segment_path("fork-segment");
+        let parent_path = temp_manifest_path("fork-parent");
+        let child_path = temp_manifest_path("fork-child");
+        segment.write(&segment_path).unwrap();
+        let parent = MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: segment_path.clone(),
+            }],
+        );
+        parent.write(&parent_path).unwrap();
+        let parent_before = fs::read(&parent_path).unwrap();
+
+        let space = MemorySpace::open(&parent_path).unwrap();
+        space.fork(43, &child_path).unwrap();
+        let parent_after = fs::read(&parent_path).unwrap();
+        let child = MemoryManifestFile::read(&child_path).unwrap();
+
+        fs::remove_file(&segment_path).unwrap();
+        fs::remove_file(&parent_path).unwrap();
+        fs::remove_file(&child_path).unwrap();
+
+        assert_eq!(parent_before, parent_after);
+        assert_eq!(child.parent_manifest_id, Some(parent.manifest_id));
+        assert_eq!(child.branch_id, 43);
+        assert_ne!(child.manifest_id, parent.manifest_id);
+        assert_eq!(child.segments, parent.segments);
     }
 
     #[test]
@@ -897,6 +1481,19 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!(
             "aperon-memory-segment-{}-{}-{}.apms",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn temp_manifest_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aperon-memory-manifest-{}-{}-{}.apmf",
             name,
             std::process::id(),
             nanos

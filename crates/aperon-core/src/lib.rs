@@ -17,8 +17,9 @@ pub use grain::{Grain, GrainId, ScoredVector};
 pub use index::{AperonIndex, IndexStats};
 pub use layout::{BlockSoaLayout, VectorId, DEFAULT_BLOCK_SIZE};
 pub use memory_sstable::{
-    MemoryHit, MemoryManifest, MemoryRecordInput, MemorySegment, RecallQuery, RecallResult,
-    RecallTrace,
+    MemoryHit, MemoryManifest, MemoryManifestFile, MemoryManifestSegment, MemoryRecordInput,
+    MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
+    MemorySpaceSegmentTrace, RecallQuery, RecallResult, RecallTrace,
 };
 pub use pivot_prefix::{
     coverage, exact_topk, sample_centroids, DensePivotSketch, PivotPrefixConfig, PivotPrefixRouter,
