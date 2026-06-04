@@ -1,4 +1,5 @@
 use crate::distance::l2_squared_unchecked;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -6,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 const SEGMENT_MAGIC: &[u8; 4] = b"APMS";
 const SEGMENT_VERSION: u32 = 0;
-const MANIFEST_MAGIC: &[u8; 4] = b"APMF";
-const MANIFEST_VERSION: u32 = 0;
+const MANIFEST_SCHEMA_VERSION: u32 = 0;
 const CHECKSUM_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const CHECKSUM_PRIME: u64 = 0x100000001b3;
 
@@ -48,14 +48,15 @@ pub struct MemoryManifest {
     pub segment_ids: Vec<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MemoryManifestSegment {
     pub segment_id: u64,
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MemoryManifestFile {
+    pub version: u32,
     pub manifest_id: u64,
     pub parent_manifest_id: Option<u64>,
     pub branch_id: u64,
@@ -131,7 +132,7 @@ pub struct MemorySpaceRecallResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemorySpace {
     pub manifest: MemoryManifestFile,
-    segments: Vec<LoadedMemorySegment>,
+    pub segments: Vec<LoadedMemorySegment>,
 }
 
 impl MemorySegment {
@@ -280,7 +281,7 @@ impl MemorySegment {
 
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        if bytes.len() < 52 {
+        if bytes.len() < 56 {
             return Err(invalid_data("segment file is too short"));
         }
         let (payload, footer) = bytes.split_at(bytes.len() - 8);
@@ -318,7 +319,6 @@ impl MemorySegment {
         let text_bytes = reader.read_bytes(text_bytes_len)?.to_vec();
         let embeddings = reader.read_f32_vec(embedding_count)?;
 
-        reader.check_remaining(symbol_count, 8)?;
         let mut symbol_terms = Vec::with_capacity(symbol_count);
         for _ in 0..symbol_count {
             let len = reader.read_u32()? as usize;
@@ -380,13 +380,16 @@ impl MemorySegment {
 
         if !query.symbols.is_empty() {
             access_paths.push("symbol_postings");
-            let mut allowed = BTreeSet::<u32>::new();
-            for symbol in &query.symbols {
-                if let Some(ids) = self.symbol_postings(symbol) {
-                    allowed.extend(ids.iter().copied());
-                }
+            let postings = query
+                .symbols
+                .iter()
+                .map(|symbol| self.symbol_postings(symbol))
+                .collect::<Option<Vec<_>>>();
+            if let Some(postings) = postings {
+                candidates.retain(|id| postings.iter().all(|ids| ids.binary_search(id).is_ok()));
+            } else {
+                candidates.clear();
             }
-            candidates.retain(|id| allowed.contains(id));
         }
         let candidates_after_symbols = candidates.len();
 
@@ -501,9 +504,17 @@ impl MemorySegment {
 
     fn score(&self, local_id: usize, semantic_distance: Option<f32>, symbol_matches: usize) -> f32 {
         let semantic = semantic_distance.map_or(0.0, |dist| -dist);
-        let symbol = symbol_matches as f32 * 2.0;
+        let symbol = symbol_matches as f32 * 2.0 + self.record_symbol_count(local_id) as f32 * 0.01;
         let confidence = self.confidences[local_id];
         semantic + symbol + confidence
+    }
+
+    fn record_symbol_count(&self, local_id: usize) -> usize {
+        let local_id = local_id as u32;
+        self.symbol_record_ids
+            .iter()
+            .filter(|&&record_id| record_id == local_id)
+            .count()
     }
 
     fn validate_layout(&self) -> Result<(), String> {
@@ -582,6 +593,7 @@ impl MemoryManifestFile {
     ) -> Self {
         let manifest_id = stable_manifest_id(parent_manifest_id, branch_id, &segments);
         Self {
+            version: MANIFEST_SCHEMA_VERSION,
             manifest_id,
             parent_manifest_id,
             branch_id,
@@ -590,95 +602,48 @@ impl MemoryManifestFile {
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let segment_count = checked_u32(self.segments.len(), "manifest segment count")?;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MANIFEST_MAGIC);
-        write_u32(&mut bytes, MANIFEST_VERSION);
-        write_u64(&mut bytes, self.manifest_id);
-        match self.parent_manifest_id {
-            Some(parent_manifest_id) => {
-                bytes.push(1);
-                write_u64(&mut bytes, parent_manifest_id);
-            }
-            None => {
-                bytes.push(0);
-                write_u64(&mut bytes, 0);
-            }
-        }
-        write_u64(&mut bytes, self.branch_id);
-        write_u32(&mut bytes, segment_count);
-        for segment in &self.segments {
-            write_u64(&mut bytes, segment.segment_id);
-            let path = segment
-                .path
-                .to_str()
-                .ok_or_else(|| invalid_data("manifest segment path must be valid utf-8"))?;
-            write_u32(
-                &mut bytes,
-                checked_u32(path.len(), "manifest segment path length")?,
-            );
-            bytes.extend_from_slice(path.as_bytes());
-        }
-        let checksum = checksum64(&bytes);
-        write_u64(&mut bytes, checksum);
+        self.validate().map_err(invalid_data)?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|err| invalid_data(format!("serialize manifest json: {err}")))?;
         fs::write(path, bytes)
     }
 
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        if bytes.len() < 45 {
-            return Err(invalid_data("manifest file is too short"));
-        }
-        let (payload, footer) = bytes.split_at(bytes.len() - 8);
-        let expected_checksum = read_footer_checksum(footer)?;
-        let actual_checksum = checksum64(payload);
-        if expected_checksum != actual_checksum {
-            return Err(invalid_data("manifest checksum mismatch"));
-        }
+        let manifest = serde_json::from_slice::<Self>(&bytes)
+            .map_err(|err| invalid_data(format!("parse manifest json: {err}")))?;
+        manifest.validate().map_err(invalid_data)?;
+        Ok(manifest)
+    }
 
-        let mut reader = ManifestReader::new(payload);
-        reader.expect_magic()?;
-        let version = reader.read_u32()?;
-        if version != MANIFEST_VERSION {
-            return Err(invalid_data(format!(
+    fn validate(&self) -> Result<(), String> {
+        if self.version != MANIFEST_SCHEMA_VERSION {
+            return Err(format!(
                 "unsupported memory manifest version: {}",
-                version
-            )));
+                self.version
+            ));
         }
-        let manifest_id = reader.read_u64()?;
-        let parent_flag = reader.read_u8()?;
-        let parent_value = reader.read_u64()?;
-        let parent_manifest_id = match parent_flag {
-            0 => None,
-            1 => Some(parent_value),
-            _ => return Err(invalid_data("manifest parent flag must be 0 or 1")),
-        };
-        let branch_id = reader.read_u64()?;
-        let segment_count = reader.read_u32()? as usize;
-        reader.check_remaining(segment_count, 12)?;
-        let mut segments = Vec::with_capacity(segment_count);
-        let mut ordered_ids = BTreeSet::new();
-        for _ in 0..segment_count {
-            let segment_id = reader.read_u64()?;
-            if !ordered_ids.insert(segment_id) {
-                return Err(invalid_data("manifest segment ids must be unique"));
+        let expected_manifest_id =
+            stable_manifest_id(self.parent_manifest_id, self.branch_id, &self.segments);
+        if self.manifest_id != expected_manifest_id {
+            return Err(format!(
+                "manifest id mismatch: expected {}, got {}",
+                expected_manifest_id, self.manifest_id
+            ));
+        }
+        let mut segment_ids = BTreeSet::new();
+        for segment in &self.segments {
+            if !segment_ids.insert(segment.segment_id) {
+                return Err("manifest segment ids must be unique".to_string());
             }
-            let path_len = reader.read_u32()? as usize;
-            let path = std::str::from_utf8(reader.read_bytes(path_len)?)
-                .map_err(|_| invalid_data("manifest segment path is not valid utf-8"))?;
-            segments.push(MemoryManifestSegment {
-                segment_id,
-                path: PathBuf::from(path),
-            });
+            if segment.path.as_os_str().is_empty() {
+                return Err("manifest segment path must not be empty".to_string());
+            }
+            if segment.path.to_str().is_none() {
+                return Err("manifest segment path must be valid utf-8".to_string());
+            }
         }
-        reader.expect_end()?;
-
-        Ok(Self {
-            manifest_id,
-            parent_manifest_id,
-            branch_id,
-            segments,
-        })
+        Ok(())
     }
 }
 
@@ -770,7 +735,8 @@ impl MemorySpace {
         })
     }
 
-    pub fn fork(&self, branch_id: u64, out_manifest_path: impl AsRef<Path>) -> io::Result<()> {
+    pub fn fork(&self, branch_id_str: &str, out_manifest_path: impl AsRef<Path>) -> io::Result<()> {
+        let branch_id = stable_memory_branch_id(branch_id_str);
         let child = MemoryManifestFile::new(
             Some(self.manifest.manifest_id),
             branch_id,
@@ -781,8 +747,8 @@ impl MemorySpace {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct LoadedMemorySegment {
-    segment: MemorySegment,
+pub struct LoadedMemorySegment {
+    pub segment: MemorySegment,
     stats: SegmentStats,
 }
 
@@ -859,6 +825,7 @@ fn stable_manifest_id(
     segments: &[MemoryManifestSegment],
 ) -> u64 {
     let mut bytes = Vec::new();
+    write_u32(&mut bytes, MANIFEST_SCHEMA_VERSION);
     match parent_manifest_id {
         Some(parent_manifest_id) => {
             bytes.push(1);
@@ -873,10 +840,18 @@ fn stable_manifest_id(
     write_u64(&mut bytes, segments.len() as u64);
     for segment in segments {
         write_u64(&mut bytes, segment.segment_id);
-        bytes.extend_from_slice(segment.path.as_os_str().to_string_lossy().as_bytes());
+        bytes.extend_from_slice(&stable_path_bytes(&segment.path));
         bytes.push(0);
     }
     checksum64(&bytes)
+}
+
+pub fn stable_memory_branch_id(branch_id_str: &str) -> u64 {
+    checksum64(branch_id_str.as_bytes())
+}
+
+fn stable_path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().replace('\\', "/").into_bytes()
 }
 
 fn write_u16(bytes: &mut Vec<u8>, value: u16) {
@@ -1028,72 +1003,6 @@ impl<'a> SegmentReader<'a> {
     }
 }
 
-struct ManifestReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ManifestReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn expect_magic(&mut self) -> io::Result<()> {
-        let magic = self.read_bytes(MANIFEST_MAGIC.len())?;
-        if magic != MANIFEST_MAGIC {
-            return Err(invalid_data("unsupported memory manifest magic"));
-        }
-        Ok(())
-    }
-
-    fn expect_end(&self) -> io::Result<()> {
-        if self.offset != self.bytes.len() {
-            return Err(invalid_data("trailing bytes in memory manifest"));
-        }
-        Ok(())
-    }
-
-    fn check_remaining(&self, count: usize, size_of_element: usize) -> io::Result<()> {
-        let remaining = self.bytes.len().saturating_sub(self.offset);
-        if count
-            .checked_mul(size_of_element)
-            .map_or(true, |needed| needed > remaining)
-        {
-            return Err(invalid_data(
-                "unexpected end of memory manifest or size mismatch",
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| invalid_data("manifest offset overflow"))?;
-        if end > self.bytes.len() {
-            return Err(invalid_data("unexpected end of memory manifest"));
-        }
-        let slice = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(slice)
-    }
-
-    fn read_u8(&mut self) -> io::Result<u8> {
-        Ok(self.read_bytes(1)?[0])
-    }
-
-    fn read_u32(&mut self) -> io::Result<u32> {
-        let bytes: [u8; 4] = self.read_bytes(4)?.try_into().unwrap();
-        Ok(u32::from_le_bytes(bytes))
-    }
-
-    fn read_u64(&mut self) -> io::Result<u64> {
-        let bytes: [u8; 8] = self.read_bytes(8)?.try_into().unwrap();
-        Ok(u64::from_le_bytes(bytes))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,6 +1082,100 @@ mod tests {
     }
 
     #[test]
+    fn symbol_filter_requires_all_query_symbols() {
+        let segment = MemorySegment::build(
+            7,
+            3,
+            vec![
+                record(
+                    1,
+                    10,
+                    100,
+                    "prefix8 failed at K10000",
+                    [1.0, 0.0, 0.0],
+                    &["prefix8", "planner-fallback"],
+                ),
+                record(
+                    2,
+                    10,
+                    110,
+                    "prefix8 alone is insufficient",
+                    [1.0, 0.0, 0.0],
+                    &["prefix8"],
+                ),
+                record(
+                    3,
+                    10,
+                    120,
+                    "fallback alone is insufficient",
+                    [1.0, 0.0, 0.0],
+                    &["planner-fallback"],
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result = segment
+            .recall(&RecallQuery {
+                symbols: vec!["prefix8".to_string(), "planner-fallback".to_string()],
+                scope_id: Some(10),
+                limit: 10,
+                ..RecallQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].record_id, 1);
+        assert_eq!(result.trace.candidates_after_symbols, 1);
+    }
+
+    #[test]
+    fn symbol_score_uses_record_symbol_richness_after_intersection() {
+        let segment = MemorySegment::build(
+            7,
+            3,
+            vec![
+                record(
+                    1,
+                    10,
+                    100,
+                    "required symbols only",
+                    [1.0, 0.0, 0.0],
+                    &["prefix8", "planner-fallback"],
+                ),
+                record(
+                    2,
+                    10,
+                    100,
+                    "required symbols plus context",
+                    [1.0, 0.0, 0.0],
+                    &["prefix8", "planner-fallback", "k10000"],
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result = segment
+            .recall(&RecallQuery {
+                symbols: vec!["prefix8".to_string(), "planner-fallback".to_string()],
+                scope_id: Some(10),
+                limit: 10,
+                ..RecallQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(result.hits[0].score > result.hits[1].score);
+    }
+
+    #[test]
     fn manifest_file_round_trip_preserves_ordered_segments() {
         let manifest = MemoryManifestFile::new(
             None,
@@ -1190,13 +1193,39 @@ mod tests {
         );
         let path = temp_manifest_path("round-trip");
         manifest.write(&path).unwrap();
+        let manifest_bytes = fs::read(&path).unwrap();
 
         let loaded = MemoryManifestFile::read(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
         assert_eq!(loaded, manifest);
+        assert!(manifest_bytes.starts_with(b"{\n"));
+        assert!(String::from_utf8(manifest_bytes)
+            .unwrap()
+            .contains("\"version\": 0"));
         assert_eq!(loaded.segments[0].segment_id, 10);
         assert_eq!(loaded.segments[1].segment_id, 11);
+    }
+
+    #[test]
+    fn manifest_file_rejects_unsupported_version() {
+        let mut manifest = MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: 10,
+                path: PathBuf::from("segment-10.apms"),
+            }],
+        );
+        manifest.version = 999;
+        let path = temp_manifest_path("bad-version");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = MemoryManifestFile::read(&path).unwrap_err();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("version"));
     }
 
     #[test]
@@ -1342,7 +1371,7 @@ mod tests {
         let parent_before = fs::read(&parent_path).unwrap();
 
         let space = MemorySpace::open(&parent_path).unwrap();
-        space.fork(43, &child_path).unwrap();
+        space.fork("prefix12-exp", &child_path).unwrap();
         let parent_after = fs::read(&parent_path).unwrap();
         let child = MemoryManifestFile::read(&child_path).unwrap();
 
@@ -1352,7 +1381,7 @@ mod tests {
 
         assert_eq!(parent_before, parent_after);
         assert_eq!(child.parent_manifest_id, Some(parent.manifest_id));
-        assert_eq!(child.branch_id, 43);
+        assert_eq!(child.branch_id, stable_memory_branch_id("prefix12-exp"));
         assert_ne!(child.manifest_id, parent.manifest_id);
         assert_eq!(child.segments, parent.segments);
     }
@@ -1388,6 +1417,43 @@ mod tests {
             loaded.recall(&query).unwrap(),
             segment.recall(&query).unwrap()
         );
+    }
+
+    #[test]
+    fn segment_file_round_trip_accepts_short_symbol_terms() {
+        let segment = MemorySegment::build(
+            7,
+            3,
+            vec![record(
+                1,
+                10,
+                100,
+                "one byte symbol",
+                [1.0, 0.0, 0.0],
+                &["x"],
+            )],
+        )
+        .unwrap();
+        let path = temp_segment_path("short-symbol");
+        segment.write(&path).unwrap();
+
+        let loaded = MemorySegment::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.symbol_terms, vec!["x"]);
+        assert_eq!(loaded, segment);
+    }
+
+    #[test]
+    fn segment_file_rejects_header_sized_file_without_footer_payload() {
+        let path = temp_segment_path("too-short");
+        fs::write(&path, vec![0; 55]).unwrap();
+
+        let error = MemorySegment::read(&path).unwrap_err();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("too short"));
     }
 
     #[test]

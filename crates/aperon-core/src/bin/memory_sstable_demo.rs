@@ -1,6 +1,6 @@
 use aperon_core::{
-    MemoryManifestFile, MemoryManifestSegment, MemoryRecordInput, MemorySegment, MemorySpace,
-    RecallQuery,
+    stable_memory_branch_id, MemoryManifestFile, MemoryManifestSegment, MemoryRecordInput,
+    MemorySegment, MemorySpace, RecallQuery,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-const MAIN_BRANCH_ID: u64 = 1;
+const MAIN_BRANCH_NAME: &str = "main";
 
 #[derive(Debug, Deserialize)]
 struct JsonMemoryRecord {
@@ -129,7 +129,11 @@ fn build(input: &Path, out: &Path) -> Result<(), String> {
         );
     }
 
-    let manifest = MemoryManifestFile::new(None, MAIN_BRANCH_ID, manifest_segments);
+    let manifest = MemoryManifestFile::new(
+        None,
+        stable_memory_branch_id(MAIN_BRANCH_NAME),
+        manifest_segments,
+    );
     let manifest_path = out.join("main.apmf");
     manifest
         .write(&manifest_path)
@@ -197,10 +201,9 @@ fn fork(manifest: &Path, branch: &str, out: &Path) -> Result<(), String> {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
-    let branch_id = stable_id(branch.as_bytes());
     let space = MemorySpace::open(manifest).map_err(|err| format!("open manifest: {err}"))?;
     space
-        .fork(branch_id, out)
+        .fork(branch, out)
         .map_err(|err| format!("write fork manifest: {err}"))?;
     let child =
         MemoryManifestFile::read(out).map_err(|err| format!("read fork manifest: {err}"))?;
@@ -259,15 +262,6 @@ fn required_value(args: &[String], name: &str) -> Result<String, String> {
 
 fn default_limit() -> usize {
     10
-}
-
-fn stable_id(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn print_usage(bin: &str) {

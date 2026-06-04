@@ -200,6 +200,33 @@ print(idx.candidates(vectors[0], nprobe=4, candidate_k=50)[:5])
 print(idx.search_tiered(vectors[0], top_k=5, nprobe=4, candidate_k=50))
 ```
 
+## Memory SSTable Baseline Comparison
+
+The Memory SSTable MVP has a reproducible local comparison harness covering the
+SSTable path, naive JSONL scan, in-memory flat scan, and vector-only flat scan.
+It always runs the tiny `examples/aperon_memory.jsonl` / `examples/query_prefix8.json`
+case and deterministic synthetic scenarios:
+
+```bash
+cargo run -p aperon-core --bin memory_sstable_bench -- \
+  --records 100000 \
+  --segments 100 \
+  --queries 100
+```
+
+For a faster smoke run:
+
+```bash
+cargo run -p aperon-core --bin memory_sstable_bench -- \
+  --records 1000 \
+  --segments 10 \
+  --queries 10
+```
+
+The compact table reports build time, manifest plus segment bytes, per-query
+latency, semantic evals, metadata and symbol candidates, top-k correctness, fork
+time, and child manifest bytes.
+
 ## CLI Reference
 
 ```text
