@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 
-**A vector and semantic memory engine for AI agents.** Treats agent memory like database engines treat LSM-based SSTables — with immutable segment columns, versioned manifests, multi-path query planning, and secondary index sidecars. Any LLM agent framework runs on top and inherits sub-10% HNSW memory footprints.
+**Aperon is a transformative, high-risk, leading-edge vector and semantic memory engine that compresses agent-native memory spaces to sub-10% of standard HNSW footprints with zero pointer-chasing CPU cache misses.** Rather than incrementally optimizing established vector databases, it introduces an entirely unproven, non-evolutionary indexing paradigm: an embedded Memory SSTable engine powered by topological manifold-adaptive quantization (MAQ) and pointerless tangent-lattice atlas (HTLA) routing to achieve sub-5ns distance evaluation latency.
 
 ---
 
