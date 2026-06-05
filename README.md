@@ -1,15 +1,45 @@
 # Aperon
 
-Aperon is a compact Rust vector search engine with Python bindings. It stores
-vectors in manifold-local grains, scans compressed Block-SoA payloads, and can
-run either as a self-contained compressed index or as a small hot filter in
-front of raw/cold-vector reranking.
+[![CI](https://github.com/substratum-labs/aperon/actions/workflows/ci.yml/badge.svg)](https://github.com/substratum-labs/aperon/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-MIT_or_Apache_2.0-blue.svg)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 
-The workspace contains:
+**A vector and semantic memory engine for AI agents.** Treats agent memory like database engines treat LSM-based SSTables — with immutable segment columns, versioned manifests, multi-path query planning, and secondary index sidecars. Any LLM agent framework runs on top and inherits sub-10% HNSW memory footprints.
 
-- `aperon-core`: index, routing, quantization, binary formats, and search.
-- `aperon-cli`: `aperon build`, `aperon query`, and `aperon eval`.
+Aperon is the core semantic storage and vector index layer in the [Substratum Labs](https://substratumlabs.ai) ecosystem: kernel ([Castor](https://github.com/substratum-labs/castor)) + memory index (this repo) + inference engine ([Mnemos](https://github.com/substratum-labs/mnemos)) + sandbox orchestrator ([Roche](https://github.com/substratum-labs/roche)).
+
+---
+
+## Workspace Structure
+
+- `aperon-core`: Core vector indexes, quantized scanning kernels, memory SSTable primitives, and planners.
+- `aperon-cli`: Command-line interface (`aperon build`, `aperon query`, `aperon eval`) for index compilation and evaluation.
 - `aperon-py`: PyO3 bindings published as the `aperon` Python package.
+
+---
+
+## 💡 LSM-DB vs. Memory SSTable Analogy
+
+| Traditional Database Concept | Aperon Memory SSTable Analog | Role in Agent Memory |
+| :--- | :--- | :--- |
+| **SSTable Segment (`.sst`)** | `MemorySegment` (`.apms`) | Immutable columnar chunk of tokenized symbols, confidence filters, and dense embeddings. |
+| **Manifest File (`manifest.log`)** | `MemoryManifestFile` (`.apmf`) | The source of truth recording active segment paths, sizes, and vector index bindings. |
+| **Active Memory Space** | `MemorySpace` | Resolves queries globally across active segments and handles relative path resolution. |
+| **Secondary Vector Index** | `.apmv` Sidecar | Segment-local acceleration file (like HTLA or Pivot-Prefix) bound by fingerprint. |
+| **Query Optimizer** | `MemoryQueryPlanner` | A 5-layer deterministic router that decides query paths (Direct Rerank, Flat Scan, etc.) based on filters and budget. |
+
+---
+
+## ⚡ Key Algorithmic Primitives
+
+Aperon achieves sub-10% HNSW memory footprints by utilizing advanced compression:
+* **Manifold-Adaptive Quantization (MAQ)**: Dynamically scales local projection dimensions and bitwidths per grain based on singular value decay.
+* **VLBRD Quantization**: 1-bit and 2-bit residual vector quantization, lowering RAM usage to $\le 1/10$ of standard HNSW indexes.
+* **Pivot-Prefix Routing**: Performs fast candidate generation using metadata-intersection posting lists and inverted-file routing centroids.
+* **Tangent-space HTLA Atlas**: Employs Hierarchical Tangent Lattice Atlas structures to perform fast routing on complex manifolds.
+
+---
 
 ## Requirements
 
@@ -17,7 +47,9 @@ The workspace contains:
 - Python 3.9+.
 - `maturin` for local Python development installs.
 
-## Quickstart From Clone
+---
+
+## 🚀 Quickstart From Clone
 
 ```bash
 git clone https://github.com/substrate-lab/aperon.git
@@ -77,6 +109,8 @@ queries,top_k,recall@3
 4,3,1
 ```
 
+---
+
 ## Python API
 
 ```python
@@ -96,12 +130,13 @@ print(idx.search(queries[0], top_k=5, nprobe=4))
 print(idx.stats())
 ```
 
+---
+
 ## Mode A: Self-Contained Compressed Search
 
-Mode A stores the compressed index and reconstructs/reranks from its own
-payload. It does not require raw vectors at query time.
+Mode A stores the compressed index and reconstructs/reranks from its own payload. It does not require raw vectors at query time.
 
-CLI:
+### CLI
 
 ```bash
 cargo run -p aperon-cli -- build \
@@ -123,7 +158,7 @@ cargo run -p aperon-cli -- eval \
   --nprobe 4
 ```
 
-Python:
+### Python
 
 ```python
 import numpy as np
@@ -148,13 +183,13 @@ loaded = aperon.AperonIndex.load("tmp/mode-a.hntm")
 print(loaded.search(vectors[0], top_k=5, nprobe=4))
 ```
 
+---
+
 ## Mode B: Hot Filter With Raw-Vector Rerank
 
-Mode B uses a smaller resident index to generate candidates, then reranks those
-candidates against attached raw vectors. In production, the raw vectors can live
-in a colder tier; the current API attaches them in memory.
+Mode B uses a smaller resident index to generate candidates, then reranks those candidates against attached raw vectors. In production, the raw vectors can live in a colder tier; the current API attaches them in memory.
 
-CLI:
+### CLI
 
 ```bash
 cargo run -p aperon-cli -- build \
@@ -176,7 +211,7 @@ cargo run -p aperon-cli -- eval \
   --candidate-k 12
 ```
 
-Python:
+### Python
 
 ```python
 import numpy as np
@@ -200,14 +235,11 @@ print(idx.candidates(vectors[0], nprobe=4, candidate_k=50)[:5])
 print(idx.search_tiered(vectors[0], top_k=5, nprobe=4, candidate_k=50))
 ```
 
+---
+
 ## Memory SSTable Baseline Comparison
 
-The Memory SSTable MVP has a reproducible local comparison harness covering the
-SSTable flat generator, SSTable array-like generator, SSTable pivot-prefix
-generator, optional SSTable HTLA/tangent generator, naive JSONL scan, in-memory
-flat scan, and vector-only flat scan. It always runs the tiny
-`examples/aperon_memory.jsonl` / `examples/query_prefix8.json` case and
-deterministic synthetic scenarios:
+The Memory SSTable MVP has a reproducible local comparison harness covering the SSTable flat generator, SSTable array-like generator, SSTable pivot-prefix generator, optional SSTable HTLA/tangent generator, naive JSONL scan, in-memory flat scan, and vector-only flat scan. It always runs the tiny `examples/aperon_memory.jsonl` / `examples/query_prefix8.json` case and deterministic synthetic scenarios:
 
 ```bash
 cargo run -p aperon-core --bin memory_sstable_bench -- \
@@ -225,38 +257,16 @@ cargo run -p aperon-core --bin memory_sstable_bench -- \
   --queries 10
 ```
 
-The compact table reports build time, manifest plus segment bytes, vector index
-bytes, per-query latency, semantic evals, metadata and symbol candidates, vector
-candidates, candidate recall, rerank reduction versus upstream candidates,
-working-set bytes, fallback rate, top-k correctness, fork time, and child
-manifest bytes. The machine-readable rows also split segment bytes from manifest
-bytes and include explicit top-k recall. Path rows include flat Memory SSTable
-recall, array-like, pivot-prefix, HTLA tangent, and the deterministic multi-path
-planner.
+The compact table reports build time, manifest plus segment bytes, vector index bytes, per-query latency, semantic evals, metadata and symbol candidates, vector candidates, candidate recall, rerank reduction versus upstream candidates, working-set bytes, fallback rate, top-k correctness, fork time, and child manifest bytes. The machine-readable rows also split segment bytes from manifest bytes and include explicit top-k recall. Path rows include flat Memory SSTable recall, array-like, pivot-prefix, HTLA tangent, and the deterministic multi-path planner.
 
 Each scenario also writes machine-readable outputs under its scenario directory:
 
 - `summary.json`: schema version, scenario metadata, artifact paths, and all path rows.
 - `metrics.jsonl`: one stable row per path for append/merge benchmark tooling.
 
-The row schema is reserved for the T-186 five-layer benchmark handoff:
-`schema_version`, `benchmark`, `scenario`, `scenario_category`,
-`required_scenario`, `path`, `access_path`, `records`, `queries`, `build_ms`,
-`bytes`, `segment_bytes`, `manifest_bytes`, `vector_index_bytes`,
-`working_set_bytes_per_query`, `latency_us_per_query`,
-`semantic_evals_per_query`, `filter_candidates_per_query`,
-`symbol_candidates_per_query`, `vector_candidates_per_query`,
-`candidate_recall`, `semantic_eval_reduction_vs_upstream`,
-`semantic_eval_reduction_vs_flat`, `fallback_rate`, `correct`, `top_k_recall`,
-`fork_ms`, and `fork_bytes`.
+Required deterministic scenarios currently include `tiny-prefix8`, `metadata-selective`, `symbol-selective`, `broad-semantic`, `branch-fork`, `adversarial`, and `fallback`. The `fallback` scenario drives a low-budget `planner` route miss and records the resulting fallback rate. These fixtures do not change the default Memory SSTable recall path. The harness also runs `synthetic-broad-semantic` to compare vector generators on broad semantic queries without metadata or symbol filters.
 
-Required deterministic scenarios currently include `tiny-prefix8`,
-`metadata-selective`, `symbol-selective`, `broad-semantic`, `branch-fork`,
-`adversarial`, and `fallback`. The `fallback` scenario drives a low-budget
-`planner` route miss and records the resulting fallback rate. These fixtures do
-not change the default Memory SSTable recall path. The harness also runs
-`synthetic-broad-semantic` to compare vector generators on broad semantic
-queries without metadata or symbol filters.
+---
 
 ## Memory SSTable Rust API Usage
 
@@ -293,6 +303,22 @@ fn main() -> Result<(), String> {
 }
 ```
 
+---
+
+## 🌐 Sister Projects
+
+Aperon is part of an agent-centric operating system stack:
+
+| Project | Role |
+| :--- | :--- |
+| **[Castor](https://github.com/substratum-labs/castor)** | Agent OS Kernel — manages agent processes, journals, HITL gating, and resource budgets. |
+| **[castor-server](https://github.com/substratum-labs/castor-server)** | SSE Platform — multi-tenant deployment engine with Anthropic and OpenAI SDK adapters. |
+| **[Mnemos](https://github.com/substratum-labs/mnemos)** | Inference Engine — GPU KV cache allocation and low-latency LLM execution. |
+| **[Roche](https://github.com/substratum-labs/roche)** | Sandbox Orchestrator — capability-scoped Firecracker / Docker secure micro-vm execution. |
+| **[Pollux](https://github.com/substratum-labs/pollux)** | Real-time Kernel — sister to Castor for soft/hard real-time interactive agents. |
+
+---
+
 ## CLI Reference
 
 ```text
@@ -311,6 +337,8 @@ u32 dimension
 row_count * dimension float32 values
 ```
 
+---
+
 ## Development Checks
 
 ```bash
@@ -320,5 +348,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p aperon-py --features extension-module
 ```
 
-For benchmark methodology and current siftsmall results, see
-`benchmarks/README.md`.
+For benchmark methodology and current siftsmall results, see `benchmarks/README.md`.
+
+---
+
+## License
+
+Dual-licensed under MIT and Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) for details.
