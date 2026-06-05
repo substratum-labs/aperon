@@ -229,7 +229,10 @@ The compact table reports build time, manifest plus segment bytes, vector index
 bytes, per-query latency, semantic evals, metadata and symbol candidates, vector
 candidates, candidate recall, rerank reduction versus upstream candidates,
 working-set bytes, fallback rate, top-k correctness, fork time, and child
-manifest bytes.
+manifest bytes. The machine-readable rows also split segment bytes from manifest
+bytes and include explicit top-k recall. Path rows include flat Memory SSTable
+recall, array-like, pivot-prefix, HTLA tangent, and the deterministic multi-path
+planner.
 
 Each scenario also writes machine-readable outputs under its scenario directory:
 
@@ -239,17 +242,19 @@ Each scenario also writes machine-readable outputs under its scenario directory:
 The row schema is reserved for the T-186 five-layer benchmark handoff:
 `schema_version`, `benchmark`, `scenario`, `scenario_category`,
 `required_scenario`, `path`, `access_path`, `records`, `queries`, `build_ms`,
-`bytes`, `vector_index_bytes`, `working_set_bytes_per_query`, `latency_us_per_query`,
+`bytes`, `segment_bytes`, `manifest_bytes`, `vector_index_bytes`,
+`working_set_bytes_per_query`, `latency_us_per_query`,
 `semantic_evals_per_query`, `filter_candidates_per_query`,
 `symbol_candidates_per_query`, `vector_candidates_per_query`,
 `candidate_recall`, `semantic_eval_reduction_vs_upstream`,
-`semantic_eval_reduction_vs_flat`, `fallback_rate`, `correct`, `fork_ms`, and
-`fork_bytes`.
+`semantic_eval_reduction_vs_flat`, `fallback_rate`, `correct`, `top_k_recall`,
+`fork_ms`, and `fork_bytes`.
 
 Required deterministic scenarios currently include `tiny-prefix8`,
 `metadata-selective`, `symbol-selective`, `broad-semantic`, `branch-fork`,
-`adversarial`, and `fallback`. These are preparation fixtures only; they do not
-change the default Memory SSTable recall path. The harness also runs
+`adversarial`, and `fallback`. The `fallback` scenario drives a low-budget
+planner route miss and records the resulting fallback rate. These fixtures do
+not change the default Memory SSTable recall path. The harness also runs
 `synthetic-broad-semantic` to compare vector generators on broad semantic
 queries without metadata or symbol filters.
 

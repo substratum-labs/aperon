@@ -99,8 +99,19 @@ pub struct RecallTrace {
     pub vector_generator: &'static str,
     pub vector_candidates: usize,
     pub vector_route: Option<MemoryVectorRouteTrace>,
+    pub planner: Option<MemoryQueryPlannerTrace>,
     pub semantic_evals: usize,
     pub returned: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryQueryPlannerTrace {
+    pub selected_path: &'static str,
+    pub candidate_budget: usize,
+    pub expanded_candidate_budget: Option<usize>,
+    pub fallback_reason: Option<&'static str>,
+    pub candidates_after_symbols: usize,
+    pub final_candidates: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +175,10 @@ pub trait MemoryVectorCandidateGenerator {
     ) -> Result<Vec<u32>, String>;
 
     fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        None
+    }
+
+    fn planner_trace(&self) -> Option<MemoryQueryPlannerTrace> {
         None
     }
 }
@@ -530,6 +545,237 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryQueryPlannerConfig {
+    pub direct_candidate_threshold: usize,
+    pub vector_candidate_budget: usize,
+    pub fallback_budget_multiplier: usize,
+    pub pivot_min_candidates: usize,
+    pub htla_enabled: bool,
+    pub htla_min_candidates: usize,
+}
+
+impl Default for MemoryQueryPlannerConfig {
+    fn default() -> Self {
+        Self {
+            direct_candidate_threshold: 16,
+            vector_candidate_budget: 32,
+            fallback_budget_multiplier: 2,
+            pivot_min_candidates: 32,
+            htla_enabled: false,
+            htla_min_candidates: 128,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryQueryPlanner {
+    config: MemoryQueryPlannerConfig,
+    array_like: ArrayLikeMemoryVectorCandidateGenerator,
+    pivot_prefix: Option<PivotPrefixMemoryVectorCandidateGenerator>,
+    htla: Option<HtlaMemoryVectorCandidateGenerator>,
+    last_route: RefCell<Option<MemoryVectorRouteTrace>>,
+    last_trace: RefCell<Option<MemoryQueryPlannerTrace>>,
+}
+
+impl MemoryQueryPlanner {
+    pub fn build(
+        segment: &MemorySegment,
+        config: MemoryQueryPlannerConfig,
+    ) -> Result<Self, String> {
+        let pivot_prefix = if segment.is_empty() {
+            None
+        } else {
+            Some(PivotPrefixMemoryVectorCandidateGenerator::build_default(
+                segment,
+            )?)
+        };
+        let htla = if config.htla_enabled && !segment.is_empty() {
+            Some(HtlaMemoryVectorCandidateGenerator::build_default(segment)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            array_like: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
+            pivot_prefix,
+            htla,
+            last_route: RefCell::new(None),
+            last_trace: RefCell::new(None),
+        })
+    }
+
+    pub fn build_default(segment: &MemorySegment) -> Result<Self, String> {
+        Self::build(segment, MemoryQueryPlannerConfig::default())
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.array_like.index().vector_index_bytes()
+            + self
+                .pivot_prefix
+                .as_ref()
+                .map(PivotPrefixMemoryVectorCandidateGenerator::resident_bytes)
+                .unwrap_or(0)
+            + self
+                .htla
+                .as_ref()
+                .map(HtlaMemoryVectorCandidateGenerator::resident_bytes)
+                .unwrap_or(0)
+    }
+
+    fn planned_budget(&self, query: &RecallQuery, candidates_after_symbols: usize) -> usize {
+        let budget = match query.candidate_budget {
+            Some(budget) => budget.max(1),
+            None => self.config.vector_candidate_budget.max(query.limit.max(1)),
+        };
+        budget.min(candidates_after_symbols.max(1))
+    }
+
+    fn expanded_budget(&self, budget: usize, candidates_after_symbols: usize) -> usize {
+        budget
+            .saturating_mul(self.config.fallback_budget_multiplier.max(1))
+            .max(budget + usize::from(budget < candidates_after_symbols))
+            .min(candidates_after_symbols)
+    }
+
+    fn query_with_budget(query: &RecallQuery, budget: usize) -> RecallQuery {
+        let mut planned_query = query.clone();
+        planned_query.candidate_budget = Some(budget);
+        planned_query
+    }
+
+    fn record_trace(
+        &self,
+        selected_path: &'static str,
+        candidate_budget: usize,
+        expanded_candidate_budget: Option<usize>,
+        fallback_reason: Option<&'static str>,
+        candidates_after_symbols: usize,
+        final_candidates: usize,
+    ) {
+        self.last_trace.replace(Some(MemoryQueryPlannerTrace {
+            selected_path,
+            candidate_budget,
+            expanded_candidate_budget,
+            fallback_reason,
+            candidates_after_symbols,
+            final_candidates,
+        }));
+    }
+}
+
+impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
+    fn name(&self) -> &'static str {
+        "query_planner"
+    }
+
+    fn candidates(
+        &self,
+        segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        self.last_route.replace(None);
+        self.last_trace.replace(None);
+
+        let candidates_len = candidates_after_symbols.len();
+        let budget = self.planned_budget(query, candidates_len);
+        if candidates_len == 0 {
+            self.record_trace("direct_rerank", budget, None, None, 0, 0);
+            return Ok(Vec::new());
+        }
+
+        if query.embedding.is_none() {
+            let mut candidates = candidates_after_symbols.to_vec();
+            candidates.truncate(budget);
+            self.record_trace(
+                "direct_rerank",
+                budget,
+                None,
+                Some("missing_embedding"),
+                candidates_len,
+                candidates.len(),
+            );
+            return Ok(candidates);
+        }
+
+        if candidates_len <= self.config.direct_candidate_threshold {
+            self.record_trace(
+                "direct_rerank",
+                budget,
+                None,
+                None,
+                candidates_len,
+                candidates_len,
+            );
+            return Ok(candidates_after_symbols.to_vec());
+        }
+
+        let planned_query = Self::query_with_budget(query, budget);
+        let (selected_path, generator): (&'static str, &dyn MemoryVectorCandidateGenerator) =
+            if self.config.htla_enabled
+                && candidates_len >= self.config.htla_min_candidates
+                && self.htla.is_some()
+            {
+                ("htla_tangent", self.htla.as_ref().unwrap())
+            } else if candidates_len >= self.config.pivot_min_candidates
+                && self.pivot_prefix.is_some()
+            {
+                ("pivot_prefix", self.pivot_prefix.as_ref().unwrap())
+            } else {
+                ("array_like", &self.array_like)
+            };
+
+        let mut candidates =
+            generator.candidates(segment, &planned_query, candidates_after_symbols)?;
+        let route = generator.route_trace();
+        let fallback_reason = if route.as_ref().is_some_and(|trace| trace.fallback_used) {
+            Some("route_fallback")
+        } else if candidates.is_empty() {
+            Some("empty_vector_candidates")
+        } else {
+            None
+        };
+
+        if let Some(reason) = fallback_reason {
+            let expanded_budget = self.expanded_budget(budget, candidates_len);
+            let expanded_query = Self::query_with_budget(query, expanded_budget);
+            candidates =
+                self.array_like
+                    .candidates(segment, &expanded_query, candidates_after_symbols)?;
+            self.last_route.replace(route);
+            self.record_trace(
+                selected_path,
+                budget,
+                Some(expanded_budget),
+                Some(reason),
+                candidates_len,
+                candidates.len(),
+            );
+            return Ok(candidates);
+        }
+
+        self.last_route.replace(route);
+        self.record_trace(
+            selected_path,
+            budget,
+            None,
+            None,
+            candidates_len,
+            candidates.len(),
+        );
+        Ok(candidates)
+    }
+
+    fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        self.last_route.borrow().clone()
+    }
+
+    fn planner_trace(&self) -> Option<MemoryQueryPlannerTrace> {
+        self.last_trace.borrow().clone()
+    }
+}
+
 impl MemorySegment {
     pub fn build(
         segment_id: u64,
@@ -802,6 +1048,7 @@ impl MemorySegment {
         self.validate_vector_candidates(&candidates, candidates_after_symbols_slice)?;
         let vector_candidates = candidates.len();
         let vector_route = vector_candidate_generator.route_trace();
+        let planner = vector_candidate_generator.planner_trace();
 
         let mut scored = Vec::with_capacity(candidates.len());
         if query.embedding.is_some() {
@@ -848,6 +1095,7 @@ impl MemorySegment {
                 vector_generator: vector_candidate_generator.name(),
                 vector_candidates,
                 vector_route,
+                planner,
                 semantic_evals: scored.len(),
                 returned: hits.len(),
             },
@@ -2215,6 +2463,152 @@ mod tests {
     }
 
     #[test]
+    fn query_planner_uses_direct_rerank_for_metadata_selective_query() {
+        let segment = sample_segment();
+        let planner = MemoryQueryPlanner::build_default(&segment).unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let plan = result.trace.planner.as_ref().unwrap();
+
+        assert_eq!(result.trace.vector_generator, "query_planner");
+        assert_eq!(plan.selected_path, "direct_rerank");
+        assert_eq!(plan.candidates_after_symbols, 2);
+        assert_eq!(plan.final_candidates, 2);
+        assert_eq!(plan.candidate_budget, 1);
+        assert_eq!(plan.fallback_reason, None);
+        assert_eq!(result.trace.semantic_evals, 2);
+    }
+
+    #[test]
+    fn query_planner_uses_direct_rerank_for_symbol_selective_query() {
+        let segment = sample_segment();
+        let planner = MemoryQueryPlanner::build_default(&segment).unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![0.0, 1.0, 0.0]),
+            symbols: vec!["uint16".to_string()],
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let plan = result.trace.planner.as_ref().unwrap();
+
+        assert_eq!(plan.selected_path, "direct_rerank");
+        assert_eq!(plan.candidates_after_symbols, 1);
+        assert_eq!(plan.final_candidates, 1);
+        assert_eq!(result.hits[0].record_id, 2);
+    }
+
+    #[test]
+    fn query_planner_uses_pivot_prefix_for_broad_semantic_query() {
+        let segment = broad_planner_segment();
+        let planner = MemoryQueryPlanner::build(
+            &segment,
+            MemoryQueryPlannerConfig {
+                direct_candidate_threshold: 4,
+                vector_candidate_budget: 8,
+                fallback_budget_multiplier: 2,
+                pivot_min_candidates: 8,
+                htla_enabled: false,
+                htla_min_candidates: 128,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![30.1, 0.0, 0.0]),
+            limit: 4,
+            candidate_budget: Some(8),
+            ..RecallQuery::default()
+        };
+
+        let first = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let second = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let plan = first.trace.planner.as_ref().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(plan.selected_path, "pivot_prefix");
+        assert_eq!(plan.candidate_budget, 8);
+        assert_eq!(plan.final_candidates, first.trace.vector_candidates);
+        assert!(first.trace.vector_route.is_some());
+        assert!(first.trace.semantic_evals <= 8);
+        assert!(first.hits.iter().any(|hit| hit.record_id == 30));
+    }
+
+    #[test]
+    fn query_planner_expands_budget_after_route_fallback() {
+        let segment = adversarial_planner_segment();
+        let planner = MemoryQueryPlanner::build(
+            &segment,
+            MemoryQueryPlannerConfig {
+                direct_candidate_threshold: 0,
+                vector_candidate_budget: 1,
+                fallback_budget_multiplier: 2,
+                pivot_min_candidates: 1,
+                htla_enabled: false,
+                htla_min_candidates: 128,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![0.0, 0.0, 0.0]),
+            symbols: vec!["needle".to_string()],
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let plan = result.trace.planner.as_ref().unwrap();
+
+        assert_eq!(plan.selected_path, "pivot_prefix");
+        assert_eq!(plan.fallback_reason, Some("route_fallback"));
+        assert_eq!(plan.expanded_candidate_budget, Some(1));
+        assert_eq!(plan.final_candidates, 1);
+        assert!(result.trace.vector_route.as_ref().unwrap().fallback_used);
+        assert_eq!(result.hits[0].record_id, 127);
+    }
+
+    #[test]
+    fn query_planner_falls_back_deterministically_without_embedding() {
+        let segment = sample_segment();
+        let planner = MemoryQueryPlanner::build_default(&segment).unwrap();
+        let query = RecallQuery {
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &planner)
+            .unwrap();
+        let plan = result.trace.planner.as_ref().unwrap();
+
+        assert_eq!(plan.selected_path, "direct_rerank");
+        assert_eq!(plan.fallback_reason, Some("missing_embedding"));
+        assert_eq!(plan.final_candidates, 1);
+        assert_eq!(result.trace.semantic_evals, 1);
+    }
+
+    #[test]
     fn recall_rejects_out_of_range_vector_candidates() {
         let segment = sample_segment();
         let error = segment
@@ -2381,6 +2775,51 @@ mod tests {
                         "htla synthetic chart record",
                         vec![i as f32, (i % 8) as f32, 0.0, 1.0],
                         &["htla"],
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn broad_planner_segment() -> MemorySegment {
+        MemorySegment::build(
+            71,
+            3,
+            (0..48)
+                .map(|i| {
+                    record(
+                        i as u64,
+                        1,
+                        1_700_010_000 + i as i64,
+                        "broad planner synthetic record",
+                        [i as f32, 0.0, 0.0],
+                        &["broad"],
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn adversarial_planner_segment() -> MemorySegment {
+        MemorySegment::build(
+            72,
+            3,
+            (0..128)
+                .map(|i| {
+                    let symbols = if i == 127 {
+                        vec!["needle"]
+                    } else {
+                        vec!["haystack"]
+                    };
+                    record(
+                        i as u64,
+                        1,
+                        1_700_020_000 + i as i64,
+                        "adversarial planner synthetic record",
+                        [i as f32, 0.0, 0.0],
+                        &symbols,
                     )
                 })
                 .collect(),

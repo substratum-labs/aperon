@@ -20,7 +20,8 @@ pub use memory_sstable::{
     stable_memory_branch_id, ArrayLikeMemoryVectorCandidateGenerator, ArrayLikeMemoryVectorIndex,
     FlatMemoryVectorCandidateGenerator, HtlaMemoryVectorCandidateGenerator, HtlaMemoryVectorConfig,
     LoadedMemorySegment, MemoryHit, MemoryManifest, MemoryManifestFile, MemoryManifestSegment,
-    MemoryRecordInput, MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
+    MemoryQueryPlanner, MemoryQueryPlannerConfig, MemoryQueryPlannerTrace, MemoryRecordInput,
+    MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
     MemorySpaceSegmentTrace, MemoryVectorCandidateGenerator, MemoryVectorRouteTrace,
     PivotPrefixMemoryVectorCandidateGenerator, RecallQuery, RecallResult, RecallTrace,
 };

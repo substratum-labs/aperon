@@ -1,9 +1,10 @@
 use aperon_core::{
     distance::l2_squared_unchecked, stable_memory_branch_id,
     ArrayLikeMemoryVectorCandidateGenerator, HtlaMemoryVectorCandidateGenerator, MemoryHit,
-    MemoryManifestFile, MemoryManifestSegment, MemoryRecordInput, MemorySegment, MemorySpace,
-    MemorySpaceRecallResult, MemorySpaceRecallTrace, MemorySpaceSegmentTrace,
-    MemoryVectorCandidateGenerator, PivotPrefixMemoryVectorCandidateGenerator, RecallQuery,
+    MemoryManifestFile, MemoryManifestSegment, MemoryQueryPlanner, MemoryQueryPlannerConfig,
+    MemoryRecordInput, MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
+    MemorySpaceSegmentTrace, MemoryVectorCandidateGenerator,
+    PivotPrefixMemoryVectorCandidateGenerator, RecallQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -79,6 +80,8 @@ struct PathMetrics {
     access_path: &'static str,
     build_time: Option<Duration>,
     bytes: Option<u64>,
+    segment_bytes: Option<u64>,
+    manifest_bytes: Option<u64>,
     vector_index_bytes: Option<usize>,
     working_set_bytes: Option<usize>,
     fork_time: Option<Duration>,
@@ -138,6 +141,8 @@ struct BenchMetricRow<'a> {
     queries: usize,
     build_ms: Option<f64>,
     bytes: Option<u64>,
+    segment_bytes: Option<u64>,
+    manifest_bytes: Option<u64>,
     vector_index_bytes: Option<u64>,
     working_set_bytes_per_query: Option<f64>,
     latency_us_per_query: f64,
@@ -150,6 +155,7 @@ struct BenchMetricRow<'a> {
     semantic_eval_reduction_vs_flat: Option<f64>,
     fallback_rate: Option<f64>,
     correct: usize,
+    top_k_recall: f64,
     fork_ms: Option<f64>,
     fork_bytes: Option<u64>,
 }
@@ -228,7 +234,8 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
     let jsonl_path = out.join("records.jsonl");
     write_jsonl(&scenario.records, &jsonl_path)?;
 
-    let (manifest_path, mvp_build_time, mvp_bytes) = build_mvp(&scenario.records, out)?;
+    let (manifest_path, mvp_build_time, mvp_bytes, segment_bytes, manifest_bytes) =
+        build_mvp(&scenario.records, out)?;
     let space = MemorySpace::open(&manifest_path).map_err(|err| format!("open manifest: {err}"))?;
 
     let fork_path = out.join("child.apmf");
@@ -248,6 +255,8 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         &scenario.queries,
         mvp_build_time,
         mvp_bytes,
+        segment_bytes,
+        manifest_bytes,
         fork_time,
         fork_bytes,
     )?);
@@ -256,6 +265,8 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         &scenario.queries,
         mvp_build_time,
         mvp_bytes,
+        segment_bytes,
+        manifest_bytes,
         fork_time,
         fork_bytes,
     )?);
@@ -264,6 +275,8 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         &scenario.queries,
         mvp_build_time,
         mvp_bytes,
+        segment_bytes,
+        manifest_bytes,
         fork_time,
         fork_bytes,
     )?);
@@ -272,6 +285,19 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         &scenario.queries,
         mvp_build_time,
         mvp_bytes,
+        segment_bytes,
+        manifest_bytes,
+        fork_time,
+        fork_bytes,
+    )?);
+    rows.push(run_memory_sstable_planner(
+        &space,
+        scenario,
+        &scenario.queries,
+        mvp_build_time,
+        mvp_bytes,
+        segment_bytes,
+        manifest_bytes,
         fork_time,
         fork_bytes,
     )?);
@@ -365,7 +391,7 @@ fn write_machine_readable_summary(
         .collect::<Vec<_>>();
     let summary = BenchSummary {
         schema_version: 1,
-        benchmark: "memory-sstable-five-layer-prep",
+        benchmark: "memory-sstable-five-layer",
         scenario: BenchScenarioInfo {
             name: &scenario.name,
             category: scenario.category,
@@ -404,7 +430,7 @@ fn write_machine_readable_summary(
 fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRow<'a> {
     BenchMetricRow {
         schema_version: 1,
-        benchmark: "memory-sstable-five-layer-prep",
+        benchmark: "memory-sstable-five-layer",
         scenario: &scenario.name,
         scenario_category: scenario.category,
         required_scenario: scenario.required,
@@ -414,6 +440,8 @@ fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRo
         queries: row.queries,
         build_ms: row.build_time.map(duration_ms),
         bytes: row.bytes,
+        segment_bytes: row.segment_bytes,
+        manifest_bytes: row.manifest_bytes,
         vector_index_bytes: row.vector_index_bytes.map(|value| value as u64),
         working_set_bytes_per_query: row
             .working_set_bytes
@@ -438,6 +466,7 @@ fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRo
             .fallback_count
             .map(|value| avg_usize(value, row.queries)),
         correct: row.correct,
+        top_k_recall: avg_usize(row.correct, row.queries),
         fork_ms: row.fork_time.map(duration_ms),
         fork_bytes: row.fork_bytes,
     }
@@ -448,6 +477,8 @@ fn run_memory_sstable_flat(
     queries: &[BenchQuery],
     build_time: Duration,
     bytes: u64,
+    segment_bytes: u64,
+    manifest_bytes: u64,
     fork_time: Duration,
     fork_bytes: u64,
 ) -> Result<PathMetrics, String> {
@@ -485,6 +516,8 @@ fn run_memory_sstable_flat(
             "metadata filters + symbol postings + flat vector candidates + semantic rerank",
         build_time: Some(build_time),
         bytes: Some(bytes),
+        segment_bytes: Some(segment_bytes),
+        manifest_bytes: Some(manifest_bytes),
         vector_index_bytes: None,
         working_set_bytes: None,
         fork_time: Some(fork_time),
@@ -511,6 +544,8 @@ fn run_memory_sstable_array_like(
     queries: &[BenchQuery],
     mvp_build_time: Duration,
     bytes: u64,
+    segment_bytes: u64,
+    manifest_bytes: u64,
     fork_time: Duration,
     fork_bytes: u64,
 ) -> Result<PathMetrics, String> {
@@ -538,6 +573,8 @@ fn run_memory_sstable_array_like(
             "metadata filters + symbol postings + array-like vector candidates + semantic rerank",
         build_time: Some(mvp_build_time + generator_build_time),
         bytes: Some(bytes),
+        segment_bytes: Some(segment_bytes),
+        manifest_bytes: Some(manifest_bytes),
         vector_index_bytes: Some(vector_index_bytes),
         working_set_bytes: Some(result.working_set_bytes),
         fork_time: Some(fork_time),
@@ -564,6 +601,8 @@ fn run_memory_sstable_pivot_prefix(
     queries: &[BenchQuery],
     mvp_build_time: Duration,
     bytes: u64,
+    segment_bytes: u64,
+    manifest_bytes: u64,
     fork_time: Duration,
     fork_bytes: u64,
 ) -> Result<PathMetrics, String> {
@@ -590,6 +629,8 @@ fn run_memory_sstable_pivot_prefix(
         access_path: "metadata filters + symbol postings + pivot-prefix postings + semantic rerank",
         build_time: Some(mvp_build_time + generator_build_time),
         bytes: Some(bytes),
+        segment_bytes: Some(segment_bytes),
+        manifest_bytes: Some(manifest_bytes),
         vector_index_bytes: Some(vector_index_bytes),
         working_set_bytes: Some(result.working_set_bytes),
         fork_time: Some(fork_time),
@@ -616,6 +657,8 @@ fn run_memory_sstable_htla(
     queries: &[BenchQuery],
     mvp_build_time: Duration,
     bytes: u64,
+    segment_bytes: u64,
+    manifest_bytes: u64,
     fork_time: Duration,
     fork_bytes: u64,
 ) -> Result<PathMetrics, String> {
@@ -642,6 +685,8 @@ fn run_memory_sstable_htla(
             "metadata filters + symbol postings + htla tangent candidates + semantic rerank",
         build_time: Some(mvp_build_time + generator_build_time),
         bytes: Some(bytes),
+        segment_bytes: Some(segment_bytes),
+        manifest_bytes: Some(manifest_bytes),
         vector_index_bytes: Some(vector_index_bytes),
         working_set_bytes: Some(result.working_set_bytes),
         fork_time: Some(fork_time),
@@ -661,6 +706,79 @@ fn run_memory_sstable_htla(
         correct: result.correct,
         queries: queries.len(),
     })
+}
+
+fn run_memory_sstable_planner(
+    space: &MemorySpace,
+    scenario: &Scenario,
+    queries: &[BenchQuery],
+    mvp_build_time: Duration,
+    bytes: u64,
+    segment_bytes: u64,
+    manifest_bytes: u64,
+    fork_time: Duration,
+    fork_bytes: u64,
+) -> Result<PathMetrics, String> {
+    let build_start = Instant::now();
+    let config = planner_config_for_scenario(scenario);
+    let planners = space
+        .segments
+        .iter()
+        .map(|loaded| MemoryQueryPlanner::build(&loaded.segment, config.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let planner_build_time = build_start.elapsed();
+    let vector_index_bytes = planners
+        .iter()
+        .map(MemoryQueryPlanner::resident_bytes)
+        .sum::<usize>();
+    let generator_refs = planners
+        .iter()
+        .map(|planner| planner as &dyn MemoryVectorCandidateGenerator)
+        .collect::<Vec<_>>();
+    let result = run_memory_sstable_generators(space, queries, &generator_refs)?;
+
+    Ok(PathMetrics {
+        path: "memory-sstable-planner",
+        access_path:
+            "metadata filters + symbol postings + deterministic planner candidates + semantic rerank",
+        build_time: Some(mvp_build_time + planner_build_time),
+        bytes: Some(bytes),
+        segment_bytes: Some(segment_bytes),
+        manifest_bytes: Some(manifest_bytes),
+        vector_index_bytes: Some(vector_index_bytes),
+        working_set_bytes: Some(result.working_set_bytes),
+        fork_time: Some(fork_time),
+        fork_bytes: Some(fork_bytes),
+        total_latency: result.total_latency,
+        semantic_evals: result.semantic_evals,
+        filter_candidates: Some(result.filter_candidates),
+        symbol_candidates: Some(result.symbol_candidates),
+        vector_candidates: Some(result.vector_candidates),
+        candidate_recall: Some(result.correct),
+        semantic_eval_reduction_vs_upstream: semantic_eval_reduction(
+            result.semantic_evals,
+            result.symbol_candidates,
+        ),
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: Some(result.fallback_count),
+        correct: result.correct,
+        queries: queries.len(),
+    })
+}
+
+fn planner_config_for_scenario(scenario: &Scenario) -> MemoryQueryPlannerConfig {
+    if scenario.name == "fallback" {
+        MemoryQueryPlannerConfig {
+            direct_candidate_threshold: 0,
+            vector_candidate_budget: 1,
+            fallback_budget_multiplier: 2,
+            pivot_min_candidates: 1,
+            htla_enabled: false,
+            htla_min_candidates: 128,
+        }
+    } else {
+        MemoryQueryPlannerConfig::default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -698,6 +816,11 @@ fn run_memory_sstable_generators(
                 if let Some(route) = trace.vector_route.as_ref() {
                     stats.working_set_bytes += route.working_set_bytes;
                     stats.fallback_count += usize::from(route.fallback_used);
+                }
+                if trace.vector_route.is_none() {
+                    if let Some(plan) = trace.planner.as_ref() {
+                        stats.fallback_count += usize::from(plan.fallback_reason.is_some());
+                    }
                 }
             }
         }
@@ -799,6 +922,8 @@ fn run_naive_jsonl(
         access_path: "full JSONL parse per query + metadata/symbol scan",
         build_time: None,
         bytes,
+        segment_bytes: None,
+        manifest_bytes: None,
         vector_index_bytes: None,
         working_set_bytes: None,
         fork_time: None,
@@ -847,6 +972,8 @@ fn run_in_memory_flat(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMe
         access_path: "one-time Vec load + metadata/symbol scan",
         build_time: Some(build_time),
         bytes: None,
+        segment_bytes: None,
+        manifest_bytes: None,
         vector_index_bytes: None,
         working_set_bytes: None,
         fork_time: None,
@@ -891,6 +1018,8 @@ fn run_vector_only(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMetri
         access_path: "flat embedding distance; ignores memory metadata/symbols",
         build_time: Some(build_time),
         bytes: None,
+        segment_bytes: None,
+        manifest_bytes: None,
         vector_index_bytes: None,
         working_set_bytes: None,
         fork_time: None,
@@ -993,7 +1122,10 @@ fn scan_records(
     (scored, stats)
 }
 
-fn build_mvp(records: &[BenchRecord], out: &Path) -> Result<(PathBuf, Duration, u64), String> {
+fn build_mvp(
+    records: &[BenchRecord],
+    out: &Path,
+) -> Result<(PathBuf, Duration, u64, u64, u64), String> {
     let build_dir = out.join("mvp");
     fs::create_dir_all(&build_dir)
         .map_err(|err| format!("create {}: {err}", build_dir.display()))?;
@@ -1017,12 +1149,15 @@ fn build_mvp(records: &[BenchRecord], out: &Path) -> Result<(PathBuf, Duration, 
     let dim = dim.ok_or_else(|| "scenario has no records".to_string())?;
 
     let mut manifest_segments = Vec::new();
+    let mut segment_bytes = 0;
     for (segment_id, segment_records) in by_segment {
         let segment = MemorySegment::build(segment_id, dim, segment_records)?;
         let file_name = format!("segment-{segment_id}.apms");
+        let segment_path = build_dir.join(&file_name);
         segment
-            .write(build_dir.join(&file_name))
+            .write(&segment_path)
             .map_err(|err| format!("write segment {segment_id}: {err}"))?;
+        segment_bytes += file_len(&segment_path)?;
         manifest_segments.push(MemoryManifestSegment {
             segment_id,
             path: PathBuf::from(file_name),
@@ -1038,8 +1173,15 @@ fn build_mvp(records: &[BenchRecord], out: &Path) -> Result<(PathBuf, Duration, 
         .write(&manifest_path)
         .map_err(|err| format!("write manifest: {err}"))?;
     let build_time = start.elapsed();
+    let manifest_bytes = file_len(&manifest_path)?;
     let bytes = dir_bytes(&build_dir)?;
-    Ok((manifest_path, build_time, bytes))
+    Ok((
+        manifest_path,
+        build_time,
+        bytes,
+        segment_bytes,
+        manifest_bytes,
+    ))
 }
 
 fn tiny_scenario() -> Result<Scenario, String> {
@@ -1171,28 +1313,55 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(8),
             },
         ),
-        prepared_scenario(
-            "fallback",
-            "required/fallback",
-            "fallback fixture exercises recall without an embedding vector",
-            250_001,
-            vec![
-                prepared_record(60, 250_001, 9, 1_700_250_001, 1, 0.98, [0.1, 0.1, 0.1, 0.9], &["fallback", "metadata-only", "target"]),
-                prepared_record(60, 250_002, 9, 1_700_250_002, 1, 0.90, [0.8, 0.1, 0.1, 0.0], &["fallback", "metadata-only"]),
-                prepared_record(61, 250_003, 10, 1_700_250_003, 1, 0.99, [0.1, 0.1, 0.1, 0.9], &["fallback", "target"]),
-            ],
-            RecallQuery {
-                embedding: None,
-                symbols: vec!["fallback".to_string(), "metadata-only".to_string(), "target".to_string()],
+        route_fallback_scenario(),
+    ])
+}
+
+fn route_fallback_scenario() -> Scenario {
+    let mut records = Vec::with_capacity(128);
+    for i in 0..128 {
+        let is_target = i == 127;
+        let symbols = if is_target {
+            vec!["fallback-target"]
+        } else {
+            vec!["fallback-decoy"]
+        };
+        records.push(BenchRecord {
+            segment_id: 60,
+            record: MemoryRecordInput {
+                record_id: 250_000 + i as u64,
+                scope_id: 9,
+                timestamp: 1_700_250_000 + i as i64,
+                source_id: 1,
+                confidence: if is_target { 0.99 } else { 0.90 },
+                text: format!("route fallback benchmark record {i}"),
+                embedding: vec![i as f32, 0.0, 0.0, 0.0],
+                symbols: symbols.into_iter().map(str::to_string).collect(),
+            },
+        });
+    }
+
+    Scenario {
+        name: "fallback".to_string(),
+        category: "required/fallback",
+        description:
+            "planner fallback when the vector route misses the only symbol-valid candidate",
+        required: true,
+        records,
+        queries: vec![BenchQuery {
+            query: RecallQuery {
+                embedding: Some(vec![0.0, 0.0, 0.0, 0.0]),
+                symbols: vec!["fallback-target".to_string()],
                 scope_id: Some(9),
                 time_start: None,
                 time_end: None,
                 min_confidence: Some(0.95),
                 limit: 3,
-                candidate_budget: Some(8),
+                candidate_budget: Some(1),
             },
-        ),
-    ])
+            expected_record_id: 250_127,
+        }],
+    }
 }
 
 fn prepared_scenario(
