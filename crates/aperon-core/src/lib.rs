@@ -23,7 +23,8 @@ pub use memory_sstable::{
     MemoryQueryPlanner, MemoryQueryPlannerConfig, MemoryQueryPlannerTrace, MemoryRecordInput,
     MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
     MemorySpaceSegmentTrace, MemoryVectorCandidateGenerator, MemoryVectorRouteTrace,
-    PivotPrefixMemoryVectorCandidateGenerator, RecallQuery, RecallResult, RecallTrace,
+    MemoryVectorSidecarFile, MemoryVectorSidecarRef, PivotPrefixMemoryVectorCandidateGenerator,
+    RecallQuery, RecallResult, RecallTrace,
 };
 pub use pivot_prefix::{
     coverage, exact_topk, sample_centroids, DensePivotSketch, PivotPrefixConfig, PivotPrefixRouter,

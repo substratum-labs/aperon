@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use aperon_core::pivot_prefix::{
     coverage, exact_topk, sample_centroids, DensePivotSketch, PivotPrefixConfig, PivotPrefixRouter,
     PrefixScoreMode, RouteMetrics, DEFAULT_FINAL_NPROBE,

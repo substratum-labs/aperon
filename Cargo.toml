@@ -5,7 +5,8 @@ members = ["crates/aperon-core", "crates/aperon-cli", "crates/aperon-py"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+description = "A compact agent-native Memory SSTable vector index and search engine with multi-path planning"
 repository = "https://github.com/substratum-labs/aperon"
 homepage = "https://github.com/substratum-labs/aperon"
 keywords = ["ann", "vector-search", "database", "simd"]

@@ -120,6 +120,7 @@ fn build(input: &Path, out: &Path) -> Result<(), String> {
         manifest_segments.push(MemoryManifestSegment {
             segment_id,
             path: PathBuf::from(file_name),
+            vector_sidecar: None,
         });
         println!(
             "wrote segment id={} records={} path={}",

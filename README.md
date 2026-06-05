@@ -253,10 +253,45 @@ The row schema is reserved for the T-186 five-layer benchmark handoff:
 Required deterministic scenarios currently include `tiny-prefix8`,
 `metadata-selective`, `symbol-selective`, `broad-semantic`, `branch-fork`,
 `adversarial`, and `fallback`. The `fallback` scenario drives a low-budget
-planner route miss and records the resulting fallback rate. These fixtures do
+`planner` route miss and records the resulting fallback rate. These fixtures do
 not change the default Memory SSTable recall path. The harness also runs
 `synthetic-broad-semantic` to compare vector generators on broad semantic
 queries without metadata or symbol filters.
+
+## Memory SSTable Rust API Usage
+
+Aperon's Memory SSTable engine allows embedded agents to load segments from versioned manifests, write new snapshots, fork branches, and execute multi-path planned recall.
+
+### Rust Example
+
+```rust
+use aperon_core::{MemorySpace, MemoryQueryPlanner, RecallQuery};
+use std::path::Path;
+
+fn main() -> Result<(), String> {
+    // 1. Open an existing memory space snapshot from manifest
+    let space = MemorySpace::open(Path::new("target/memory-demo/main.apmf"))
+        .map_err(|e| e.to_string())?;
+
+    // 2. Define a query with symbol matching and semantic vector retrieval
+    let query = RecallQuery {
+        embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
+        symbols: vec!["prefix8".to_string()],
+        limit: 5,
+        ..Default::default()
+    };
+
+    // 3. Plan and execute using the 5-layer query planner
+    let planner = MemoryQueryPlanner::new(Default::default());
+    let result = planner.recall(&space, &query)?;
+
+    println!("Scanned {} segments", result.trace.segments_scanned);
+    for hit in result.hits {
+        println!("Record ID: {}, Score: {}", hit.record_id, hit.score);
+    }
+    Ok(())
+}
+```
 
 ## CLI Reference
 

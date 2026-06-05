@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 const SEGMENT_MAGIC: &[u8; 4] = b"APMS";
 const SEGMENT_VERSION: u32 = 0;
+const VECTOR_SIDECAR_MAGIC: &[u8; 4] = b"APMV";
+const VECTOR_SIDECAR_VERSION: u32 = 0;
 const MANIFEST_SCHEMA_VERSION: u32 = 0;
 const CHECKSUM_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const CHECKSUM_PRIME: u64 = 0x100000001b3;
@@ -26,6 +28,8 @@ pub struct MemoryRecordInput {
     pub symbols: Vec<String>,
 }
 
+/// An immutable, columnar SSTable segment representing a collection of memory records.
+/// Contains pre-tokenized symbol indices, metadata filters, and dense embeddings for vector queries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemorySegment {
     pub dim: usize,
@@ -55,6 +59,40 @@ pub struct MemoryManifest {
 pub struct MemoryManifestSegment {
     pub segment_id: u64,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_sidecar: Option<MemoryVectorSidecarRef>,
+}
+
+/// Reference to an external `.apmv` vector sidecar file associated with a segment.
+/// Stores expected indexing parameters, checksums, and validation fingerprints to ensure version consistency.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MemoryVectorSidecarRef {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sidecar_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generator_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generator_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_checksum: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_fingerprint: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryVectorSidecarFile {
+    pub version: u32,
+    pub segment_id: u64,
+    pub segment_version: u32,
+    pub record_count: u32,
+    pub dim: u32,
+    pub segment_fingerprint: u64,
+    pub generator_name: String,
+    pub generator_version: u32,
+    pub checksum: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -66,6 +104,8 @@ pub struct MemoryManifestFile {
     pub segments: Vec<MemoryManifestSegment>,
 }
 
+/// A query structure specifying conditions for filtering and searching memory records.
+/// Supports metadata-matching filters, confidence thresholds, and semantic routing parameters.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RecallQuery {
     pub embedding: Option<Vec<f32>>,
@@ -158,6 +198,8 @@ pub struct MemorySpaceRecallResult {
     pub trace: MemorySpaceRecallTrace,
 }
 
+/// An open memory snapshot that manages a set of loaded `MemorySegment`s and resolves
+/// global queries across them. Handles relative path resolution and sidecar validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemorySpace {
     pub manifest: MemoryManifestFile,
@@ -568,6 +610,8 @@ impl Default for MemoryQueryPlannerConfig {
     }
 }
 
+/// A 5-layer query planner that routes queries through direct scans, flat scans,
+/// array-like indexes, pivot-prefix indexes, or HTLA lanes based on available metadata and budget.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryQueryPlanner {
     config: MemoryQueryPlannerConfig,
@@ -713,17 +757,17 @@ impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
 
         let planned_query = Self::query_with_budget(query, budget);
         let (selected_path, generator): (&'static str, &dyn MemoryVectorCandidateGenerator) =
-            if self.config.htla_enabled
-                && candidates_len >= self.config.htla_min_candidates
-                && self.htla.is_some()
-            {
-                ("htla_tangent", self.htla.as_ref().unwrap())
-            } else if candidates_len >= self.config.pivot_min_candidates
-                && self.pivot_prefix.is_some()
-            {
-                ("pivot_prefix", self.pivot_prefix.as_ref().unwrap())
-            } else {
-                ("array_like", &self.array_like)
+            match (&self.htla, &self.pivot_prefix) {
+                (Some(ref htla), _)
+                    if self.config.htla_enabled
+                        && candidates_len >= self.config.htla_min_candidates =>
+                {
+                    ("htla_tangent", htla)
+                }
+                (_, Some(ref pivot)) if candidates_len >= self.config.pivot_min_candidates => {
+                    ("pivot_prefix", pivot)
+                }
+                _ => ("array_like", &self.array_like),
             };
 
         let mut candidates =
@@ -1322,6 +1366,216 @@ impl MemoryManifestFile {
             if segment.path.to_str().is_none() {
                 return Err("manifest segment path must be valid utf-8".to_string());
             }
+            if let Some(sidecar) = &segment.vector_sidecar {
+                if sidecar.path.as_os_str().is_empty() {
+                    return Err("manifest vector sidecar path must not be empty".to_string());
+                }
+                if sidecar.path.to_str().is_none() {
+                    return Err("manifest vector sidecar path must be valid utf-8".to_string());
+                }
+                if sidecar
+                    .expected_generator_name
+                    .as_deref()
+                    .is_some_and(str::is_empty)
+                {
+                    return Err(
+                        "manifest vector sidecar expected generator name must not be empty"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MemoryVectorSidecarFile {
+    pub fn for_segment_file(
+        segment_path: impl AsRef<Path>,
+        segment: &MemorySegment,
+        generator_name: impl Into<String>,
+        generator_version: u32,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            version: VECTOR_SIDECAR_VERSION,
+            segment_id: segment.segment_id,
+            segment_version: SEGMENT_VERSION,
+            record_count: checked_u32(segment.len(), "record count")?,
+            dim: checked_u32(segment.dim, "dimension")?,
+            segment_fingerprint: segment_file_fingerprint(segment_path)?,
+            generator_name: generator_name.into(),
+            generator_version,
+            checksum: 0,
+        })
+    }
+
+    pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.validate_layout().map_err(invalid_data)?;
+        let generator_name = self.generator_name.as_bytes();
+        let generator_name_len = checked_u32(generator_name.len(), "generator name length")?;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(VECTOR_SIDECAR_MAGIC);
+        write_u32(&mut bytes, self.version);
+        write_u64(&mut bytes, self.segment_id);
+        write_u32(&mut bytes, self.segment_version);
+        write_u32(&mut bytes, self.record_count);
+        write_u32(&mut bytes, self.dim);
+        write_u64(&mut bytes, self.segment_fingerprint);
+        write_u32(&mut bytes, self.generator_version);
+        write_u32(&mut bytes, generator_name_len);
+        bytes.extend_from_slice(generator_name);
+
+        let checksum = checksum64(&bytes);
+        write_u64(&mut bytes, checksum);
+        fs::write(path, bytes)
+    }
+
+    pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        if bytes.len() < 52 {
+            return Err(invalid_data("vector sidecar file is too short"));
+        }
+        let (payload, footer) = bytes.split_at(bytes.len() - 8);
+        let expected_checksum = read_footer_checksum(footer)?;
+        let actual_checksum = checksum64(payload);
+        if expected_checksum != actual_checksum {
+            return Err(invalid_data("vector sidecar checksum mismatch"));
+        }
+
+        let mut reader = SegmentReader::new(payload);
+        let magic = reader.read_bytes(VECTOR_SIDECAR_MAGIC.len())?;
+        if magic != VECTOR_SIDECAR_MAGIC {
+            return Err(invalid_data("unsupported memory vector sidecar magic"));
+        }
+        let version = reader.read_u32()?;
+        if version != VECTOR_SIDECAR_VERSION {
+            return Err(invalid_data(format!(
+                "unsupported memory vector sidecar version: {}",
+                version
+            )));
+        }
+        let segment_id = reader.read_u64()?;
+        let segment_version = reader.read_u32()?;
+        let record_count = reader.read_u32()?;
+        let dim = reader.read_u32()?;
+        let segment_fingerprint = reader.read_u64()?;
+        let generator_version = reader.read_u32()?;
+        let generator_name_len = reader.read_u32()? as usize;
+        let generator_name = std::str::from_utf8(reader.read_bytes(generator_name_len)?)
+            .map_err(|_| invalid_data("vector sidecar generator name is not valid utf-8"))?
+            .to_string();
+        reader.expect_end()?;
+
+        let sidecar = Self {
+            version,
+            segment_id,
+            segment_version,
+            record_count,
+            dim,
+            segment_fingerprint,
+            generator_name,
+            generator_version,
+            checksum: actual_checksum,
+        };
+        sidecar.validate_layout().map_err(invalid_data)?;
+        Ok(sidecar)
+    }
+
+    fn validate_layout(&self) -> Result<(), String> {
+        if self.version != VECTOR_SIDECAR_VERSION {
+            return Err(format!(
+                "unsupported memory vector sidecar version: {}",
+                self.version
+            ));
+        }
+        if self.segment_version != SEGMENT_VERSION {
+            return Err(format!(
+                "memory vector sidecar segment version mismatch: expected {}, got {}",
+                SEGMENT_VERSION, self.segment_version
+            ));
+        }
+        if self.dim == 0 {
+            return Err("memory vector sidecar dimension must be greater than zero".to_string());
+        }
+        if self.generator_name.is_empty() {
+            return Err("memory vector sidecar generator name must not be empty".to_string());
+        }
+        if self.generator_name.as_bytes().contains(&0) {
+            return Err("memory vector sidecar generator name must not contain NUL".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_binding(
+        &self,
+        segment: &MemorySegment,
+        segment_fingerprint: u64,
+        reference: &MemoryVectorSidecarRef,
+    ) -> Result<(), String> {
+        if self.segment_id != segment.segment_id {
+            return Err(format!(
+                "memory vector sidecar segment id mismatch: expected {}, got {}",
+                segment.segment_id, self.segment_id
+            ));
+        }
+        if self.segment_version != SEGMENT_VERSION {
+            return Err(format!(
+                "memory vector sidecar segment version mismatch: expected {}, got {}",
+                SEGMENT_VERSION, self.segment_version
+            ));
+        }
+        if self.record_count as usize != segment.len() {
+            return Err(format!(
+                "memory vector sidecar record count mismatch: expected {}, got {}",
+                segment.len(),
+                self.record_count
+            ));
+        }
+        if self.dim as usize != segment.dim {
+            return Err(format!(
+                "memory vector sidecar dimension mismatch: expected {}, got {}",
+                segment.dim, self.dim
+            ));
+        }
+        if self.segment_fingerprint != segment_fingerprint {
+            return Err("memory vector sidecar segment fingerprint mismatch".to_string());
+        }
+        if let Some(expected) = reference.expected_sidecar_version {
+            if self.version != expected {
+                return Err(format!(
+                    "memory vector sidecar version mismatch: expected {}, got {}",
+                    expected, self.version
+                ));
+            }
+        }
+        if let Some(expected) = reference.expected_generator_name.as_deref() {
+            if self.generator_name != expected {
+                return Err(format!(
+                    "memory vector sidecar generator mismatch: expected {}, got {}",
+                    expected, self.generator_name
+                ));
+            }
+        }
+        if let Some(expected) = reference.expected_generator_version {
+            if self.generator_version != expected {
+                return Err(format!(
+                    "memory vector sidecar generator version mismatch: expected {}, got {}",
+                    expected, self.generator_version
+                ));
+            }
+        }
+        if let Some(expected) = reference.sidecar_checksum {
+            if self.checksum != expected {
+                return Err("memory vector sidecar checksum reference mismatch".to_string());
+            }
+        }
+        if let Some(expected) = reference.segment_fingerprint {
+            if self.segment_fingerprint != expected {
+                return Err(
+                    "memory vector sidecar segment fingerprint reference mismatch".to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -1346,12 +1600,41 @@ impl MemorySpace {
                     entry.segment_id, segment.segment_id
                 )));
             }
+            if let Some(sidecar_ref) = &entry.vector_sidecar {
+                let sidecar_path = if sidecar_ref.path.is_absolute() {
+                    sidecar_ref.path.clone()
+                } else {
+                    base_dir.join(&sidecar_ref.path)
+                };
+                let validate_result = Self::validate_vector_sidecar_ref(
+                    &segment_path,
+                    &segment,
+                    &sidecar_path,
+                    sidecar_ref,
+                );
+                if sidecar_ref.required {
+                    validate_result?;
+                }
+            }
             segments.push(LoadedMemorySegment {
                 stats: SegmentStats::from_segment(&segment),
                 segment,
             });
         }
         Ok(Self { manifest, segments })
+    }
+
+    fn validate_vector_sidecar_ref(
+        segment_path: &Path,
+        segment: &MemorySegment,
+        sidecar_path: &Path,
+        sidecar_ref: &MemoryVectorSidecarRef,
+    ) -> io::Result<()> {
+        let segment_fingerprint = segment_file_fingerprint(segment_path)?;
+        let sidecar = MemoryVectorSidecarFile::read(sidecar_path)?;
+        sidecar
+            .validate_binding(segment, segment_fingerprint, sidecar_ref)
+            .map_err(invalid_data)
     }
 
     pub fn recall(&self, query: &RecallQuery) -> Result<MemorySpaceRecallResult, String> {
@@ -1509,8 +1792,8 @@ fn default_memory_htla_config(segment: &MemorySegment) -> HtlaMemoryVectorConfig
         levels: if record_count >= 8 { 3 } else { 2 },
         chart_dim: segment.dim.clamp(1, 4),
         beam: 4,
-        candidate_pool: record_count.min(64).max(1),
-        final_nprobe: record_count.min(16).max(1),
+        candidate_pool: record_count.clamp(1, 64),
+        final_nprobe: record_count.clamp(1, 16),
         fallback_on_route_risk: true,
     }
 }
@@ -1602,6 +1885,14 @@ fn read_footer_checksum(bytes: &[u8]) -> io::Result<u64> {
     Ok(u64::from_le_bytes(array))
 }
 
+fn segment_file_fingerprint(path: impl AsRef<Path>) -> io::Result<u64> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 8 {
+        return Err(invalid_data("segment file is too short"));
+    }
+    read_footer_checksum(&bytes[bytes.len() - 8..])
+}
+
 struct SegmentReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1631,7 +1922,7 @@ impl<'a> SegmentReader<'a> {
         let remaining = self.bytes.len().saturating_sub(self.offset);
         if count
             .checked_mul(size_of_element)
-            .map_or(true, |needed| needed > remaining)
+            .is_none_or(|needed| needed > remaining)
         {
             return Err(invalid_data(
                 "unexpected end of memory segment or size mismatch",
@@ -1905,10 +2196,12 @@ mod tests {
                 MemoryManifestSegment {
                     segment_id: 10,
                     path: PathBuf::from("segment-10.apms"),
+                    vector_sidecar: None,
                 },
                 MemoryManifestSegment {
                     segment_id: 11,
                     path: PathBuf::from("segment-11.apms"),
+                    vector_sidecar: None,
                 },
             ],
         );
@@ -1936,6 +2229,7 @@ mod tests {
             vec![MemoryManifestSegment {
                 segment_id: 10,
                 path: PathBuf::from("segment-10.apms"),
+                vector_sidecar: None,
             }],
         );
         manifest.version = 999;
@@ -1947,6 +2241,196 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("version"));
+    }
+
+    #[test]
+    fn manifest_file_round_trip_preserves_mixed_vector_sidecar_refs() {
+        let without_sidecars = MemoryManifestFile::new(
+            None,
+            42,
+            vec![
+                MemoryManifestSegment {
+                    segment_id: 10,
+                    path: PathBuf::from("segment-10.apms"),
+                    vector_sidecar: None,
+                },
+                MemoryManifestSegment {
+                    segment_id: 11,
+                    path: PathBuf::from("segment-11.apms"),
+                    vector_sidecar: None,
+                },
+            ],
+        );
+        let with_sidecar = MemoryManifestFile::new(
+            None,
+            42,
+            vec![
+                MemoryManifestSegment {
+                    segment_id: 10,
+                    path: PathBuf::from("segment-10.apms"),
+                    vector_sidecar: Some(sample_sidecar_ref("segment-10.apmv", false)),
+                },
+                MemoryManifestSegment {
+                    segment_id: 11,
+                    path: PathBuf::from("segment-11.apms"),
+                    vector_sidecar: None,
+                },
+            ],
+        );
+        let path = temp_manifest_path("sidecar-round-trip");
+        with_sidecar.write(&path).unwrap();
+
+        let loaded = MemoryManifestFile::read(&path).unwrap();
+        let manifest_bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, with_sidecar);
+        assert_eq!(with_sidecar.manifest_id, without_sidecars.manifest_id);
+        assert!(String::from_utf8(manifest_bytes)
+            .unwrap()
+            .contains("\"vector_sidecar\""));
+        assert!(loaded.segments[0].vector_sidecar.is_some());
+        assert!(loaded.segments[1].vector_sidecar.is_none());
+    }
+
+    #[test]
+    fn memory_space_opens_with_optional_missing_vector_sidecar() {
+        let segment = sample_segment();
+        let segment_path = temp_segment_path("optional-sidecar-segment");
+        let manifest_path = temp_manifest_path("optional-sidecar-manifest");
+        segment.write(&segment_path).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: segment_path.clone(),
+                vector_sidecar: Some(sample_sidecar_ref("missing.apmv", false)),
+            }],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let space = MemorySpace::open(&manifest_path).unwrap();
+
+        fs::remove_file(&segment_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        assert_eq!(space.segments.len(), 1);
+        assert_eq!(space.segments[0].segment.segment_id, segment.segment_id);
+    }
+
+    #[test]
+    fn memory_space_rejects_required_missing_vector_sidecar() {
+        let segment = sample_segment();
+        let segment_path = temp_segment_path("required-sidecar-segment");
+        let manifest_path = temp_manifest_path("required-sidecar-manifest");
+        segment.write(&segment_path).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: segment_path.clone(),
+                vector_sidecar: Some(sample_sidecar_ref("missing.apmv", true)),
+            }],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let error = MemorySpace::open(&manifest_path).unwrap_err();
+
+        fs::remove_file(&segment_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn memory_space_rejects_required_unsupported_vector_sidecar_version() {
+        let segment = sample_segment();
+        let segment_path = temp_segment_path("bad-sidecar-version-segment");
+        let sidecar_path = temp_sidecar_path("bad-version");
+        let manifest_path = temp_manifest_path("bad-sidecar-version-manifest");
+        segment.write(&segment_path).unwrap();
+        MemoryVectorSidecarFile::for_segment_file(&segment_path, &segment, "array_like", 0)
+            .unwrap()
+            .write(&sidecar_path)
+            .unwrap();
+        let mut sidecar_bytes = fs::read(&sidecar_path).unwrap();
+        sidecar_bytes[4..8].copy_from_slice(&999u32.to_le_bytes());
+        rewrite_checksum(&mut sidecar_bytes);
+        fs::write(&sidecar_path, sidecar_bytes).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: segment_path.clone(),
+                vector_sidecar: Some(MemoryVectorSidecarRef {
+                    path: sidecar_path.clone(),
+                    required: true,
+                    expected_sidecar_version: Some(VECTOR_SIDECAR_VERSION),
+                    expected_generator_name: Some("array_like".to_string()),
+                    expected_generator_version: Some(0),
+                    sidecar_checksum: None,
+                    segment_fingerprint: None,
+                }),
+            }],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let error = MemorySpace::open(&manifest_path).unwrap_err();
+
+        fs::remove_file(&segment_path).unwrap();
+        fs::remove_file(&sidecar_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("version"));
+    }
+
+    #[test]
+    fn memory_space_resolves_vector_sidecar_relative_to_manifest_dir() {
+        let segment = sample_segment();
+        let base_dir = temp_space_dir("relative-sidecar");
+        fs::create_dir_all(&base_dir).unwrap();
+        let segment_path = base_dir.join("segment.apms");
+        let sidecar_path = base_dir.join("segment.apmv");
+        let manifest_path = base_dir.join("main.apmf");
+        segment.write(&segment_path).unwrap();
+        let sidecar =
+            MemoryVectorSidecarFile::for_segment_file(&segment_path, &segment, "pivot_prefix", 3)
+                .unwrap();
+        sidecar.write(&sidecar_path).unwrap();
+        let sidecar = MemoryVectorSidecarFile::read(&sidecar_path).unwrap();
+        MemoryManifestFile::new(
+            None,
+            42,
+            vec![MemoryManifestSegment {
+                segment_id: segment.segment_id,
+                path: PathBuf::from("segment.apms"),
+                vector_sidecar: Some(MemoryVectorSidecarRef {
+                    path: PathBuf::from("segment.apmv"),
+                    required: true,
+                    expected_sidecar_version: Some(VECTOR_SIDECAR_VERSION),
+                    expected_generator_name: Some("pivot_prefix".to_string()),
+                    expected_generator_version: Some(3),
+                    sidecar_checksum: Some(sidecar.checksum),
+                    segment_fingerprint: Some(sidecar.segment_fingerprint),
+                }),
+            }],
+        )
+        .write(&manifest_path)
+        .unwrap();
+
+        let space = MemorySpace::open(&manifest_path).unwrap();
+
+        fs::remove_dir_all(&base_dir).unwrap();
+
+        assert_eq!(space.segments.len(), 1);
+        assert_eq!(space.segments[0].segment.segment_id, segment.segment_id);
     }
 
     #[test]
@@ -1989,10 +2473,12 @@ mod tests {
                 MemoryManifestSegment {
                     segment_id: 10,
                     path: segment_a_path.clone(),
+                    vector_sidecar: None,
                 },
                 MemoryManifestSegment {
                     segment_id: 11,
                     path: segment_b_path.clone(),
+                    vector_sidecar: None,
                 },
             ],
         )
@@ -2045,6 +2531,7 @@ mod tests {
             vec![MemoryManifestSegment {
                 segment_id: segment.segment_id,
                 path: segment_path.clone(),
+                vector_sidecar: None,
             }],
         )
         .write(&manifest_path)
@@ -2086,6 +2573,7 @@ mod tests {
             vec![MemoryManifestSegment {
                 segment_id: segment.segment_id,
                 path: segment_path.clone(),
+                vector_sidecar: None,
             }],
         );
         parent.write(&parent_path).unwrap();
@@ -2851,6 +3339,44 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn temp_sidecar_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aperon-memory-sidecar-{}-{}-{}.apmv",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn temp_space_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aperon-memory-space-{}-{}-{}",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn sample_sidecar_ref(path: impl Into<PathBuf>, required: bool) -> MemoryVectorSidecarRef {
+        MemoryVectorSidecarRef {
+            path: path.into(),
+            required,
+            expected_sidecar_version: Some(VECTOR_SIDECAR_VERSION),
+            expected_generator_name: Some("array_like".to_string()),
+            expected_generator_version: Some(0),
+            sidecar_checksum: None,
+            segment_fingerprint: None,
+        }
     }
 
     fn rewrite_checksum(bytes: &mut [u8]) {

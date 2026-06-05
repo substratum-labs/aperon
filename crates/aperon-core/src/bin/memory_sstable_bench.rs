@@ -1,3 +1,9 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::vec_init_then_push,
+    clippy::manual_clamp
+)]
+
 use aperon_core::{
     distance::l2_squared_unchecked, stable_memory_branch_id,
     ArrayLikeMemoryVectorCandidateGenerator, HtlaMemoryVectorCandidateGenerator, MemoryHit,
@@ -1161,6 +1167,7 @@ fn build_mvp(
         manifest_segments.push(MemoryManifestSegment {
             segment_id,
             path: PathBuf::from(file_name),
+            vector_sidecar: None,
         });
     }
     let manifest = MemoryManifestFile::new(

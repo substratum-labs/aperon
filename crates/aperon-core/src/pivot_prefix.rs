@@ -761,7 +761,7 @@ fn validate_matrix(values: &[f32], dim: usize) -> Result<(), String> {
     if dim == 0 {
         return Err("dim must be greater than zero".to_string());
     }
-    if values.is_empty() || values.len() % dim != 0 {
+    if values.is_empty() || !values.len().is_multiple_of(dim) {
         return Err("matrix payload must be non-empty and divisible by dim".to_string());
     }
     Ok(())
