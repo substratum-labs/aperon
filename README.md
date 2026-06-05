@@ -203,9 +203,11 @@ print(idx.search_tiered(vectors[0], top_k=5, nprobe=4, candidate_k=50))
 ## Memory SSTable Baseline Comparison
 
 The Memory SSTable MVP has a reproducible local comparison harness covering the
-SSTable path, naive JSONL scan, in-memory flat scan, and vector-only flat scan.
-It always runs the tiny `examples/aperon_memory.jsonl` / `examples/query_prefix8.json`
-case and deterministic synthetic scenarios:
+SSTable flat generator, SSTable array-like generator, SSTable pivot-prefix
+generator, optional SSTable HTLA/tangent generator, naive JSONL scan, in-memory
+flat scan, and vector-only flat scan. It always runs the tiny
+`examples/aperon_memory.jsonl` / `examples/query_prefix8.json` case and
+deterministic synthetic scenarios:
 
 ```bash
 cargo run -p aperon-core --bin memory_sstable_bench -- \
@@ -223,9 +225,11 @@ cargo run -p aperon-core --bin memory_sstable_bench -- \
   --queries 10
 ```
 
-The compact table reports build time, manifest plus segment bytes, per-query
-latency, semantic evals, metadata and symbol candidates, top-k correctness, fork
-time, and child manifest bytes.
+The compact table reports build time, manifest plus segment bytes, vector index
+bytes, per-query latency, semantic evals, metadata and symbol candidates, vector
+candidates, candidate recall, rerank reduction versus upstream candidates,
+working-set bytes, fallback rate, top-k correctness, fork time, and child
+manifest bytes.
 
 Each scenario also writes machine-readable outputs under its scenario directory:
 
@@ -235,14 +239,19 @@ Each scenario also writes machine-readable outputs under its scenario directory:
 The row schema is reserved for the T-186 five-layer benchmark handoff:
 `schema_version`, `benchmark`, `scenario`, `scenario_category`,
 `required_scenario`, `path`, `access_path`, `records`, `queries`, `build_ms`,
-`bytes`, `latency_us_per_query`, `semantic_evals_per_query`,
-`filter_candidates_per_query`, `symbol_candidates_per_query`,
-`vector_candidates_per_query`, `correct`, `fork_ms`, and `fork_bytes`.
+`bytes`, `vector_index_bytes`, `working_set_bytes_per_query`, `latency_us_per_query`,
+`semantic_evals_per_query`, `filter_candidates_per_query`,
+`symbol_candidates_per_query`, `vector_candidates_per_query`,
+`candidate_recall`, `semantic_eval_reduction_vs_upstream`,
+`semantic_eval_reduction_vs_flat`, `fallback_rate`, `correct`, `fork_ms`, and
+`fork_bytes`.
 
 Required deterministic scenarios currently include `tiny-prefix8`,
 `metadata-selective`, `symbol-selective`, `broad-semantic`, `branch-fork`,
 `adversarial`, and `fallback`. These are preparation fixtures only; they do not
-change the Memory SSTable recall path.
+change the default Memory SSTable recall path. The harness also runs
+`synthetic-broad-semantic` to compare vector generators on broad semantic
+queries without metadata or symbol filters.
 
 ## CLI Reference
 

@@ -1,5 +1,8 @@
 use crate::distance::l2_squared_unchecked;
+use crate::pivot_prefix::{PivotPrefixConfig, PivotPrefixRouter, PrefixScoreMode, RouteMetrics};
+use crate::routing::HtlaRouter;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -95,8 +98,21 @@ pub struct RecallTrace {
     pub candidates_after_symbols: usize,
     pub vector_generator: &'static str,
     pub vector_candidates: usize,
+    pub vector_route: Option<MemoryVectorRouteTrace>,
     pub semantic_evals: usize,
     pub returned: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryVectorRouteTrace {
+    pub vector_index_bytes: usize,
+    pub route_candidates: usize,
+    pub posting_entries_touched: usize,
+    pub duplicate_block_rate: f32,
+    pub selected_blocks: usize,
+    pub centroid_evals: usize,
+    pub working_set_bytes: usize,
+    pub fallback_used: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,6 +162,10 @@ pub trait MemoryVectorCandidateGenerator {
         query: &RecallQuery,
         candidates_after_symbols: &[u32],
     ) -> Result<Vec<u32>, String>;
+
+    fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,6 +187,346 @@ impl MemoryVectorCandidateGenerator for FlatMemoryVectorCandidateGenerator {
             candidates.truncate(budget);
         }
         Ok(candidates)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayLikeMemoryVectorIndex {
+    dim: usize,
+    segment_id: u64,
+    local_ids: Vec<u32>,
+    embeddings: Vec<f32>,
+}
+
+impl ArrayLikeMemoryVectorIndex {
+    pub fn build(segment: &MemorySegment) -> Self {
+        Self {
+            dim: segment.dim,
+            segment_id: segment.segment_id,
+            local_ids: (0..segment.len()).map(|local_id| local_id as u32).collect(),
+            embeddings: segment.embeddings.clone(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.local_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.local_ids.is_empty()
+    }
+
+    pub fn vector_index_bytes(&self) -> usize {
+        self.local_ids.len() * std::mem::size_of::<u32>()
+            + self.embeddings.len() * std::mem::size_of::<f32>()
+    }
+
+    pub fn segment_id(&self) -> u64 {
+        self.segment_id
+    }
+
+    fn embedding_row(&self, local_id: u32) -> &[f32] {
+        let local_id = local_id as usize;
+        &self.embeddings[local_id * self.dim..(local_id + 1) * self.dim]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayLikeMemoryVectorCandidateGenerator {
+    index: ArrayLikeMemoryVectorIndex,
+}
+
+impl ArrayLikeMemoryVectorCandidateGenerator {
+    pub fn build(segment: &MemorySegment) -> Self {
+        Self {
+            index: ArrayLikeMemoryVectorIndex::build(segment),
+        }
+    }
+
+    pub fn index(&self) -> &ArrayLikeMemoryVectorIndex {
+        &self.index
+    }
+}
+
+impl MemoryVectorCandidateGenerator for ArrayLikeMemoryVectorCandidateGenerator {
+    fn name(&self) -> &'static str {
+        "array_like"
+    }
+
+    fn candidates(
+        &self,
+        segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        if self.index.segment_id != segment.segment_id {
+            return Err(format!(
+                "array-like vector index segment id mismatch: expected {}, got {}",
+                segment.segment_id, self.index.segment_id
+            ));
+        }
+        if self.index.dim != segment.dim || self.index.len() != segment.len() {
+            return Err("array-like vector index layout mismatch".to_string());
+        }
+
+        let Some(query_embedding) = query.embedding.as_deref() else {
+            return FlatMemoryVectorCandidateGenerator.candidates(
+                segment,
+                query,
+                candidates_after_symbols,
+            );
+        };
+        let Some(budget) = query.candidate_budget else {
+            return Ok(candidates_after_symbols.to_vec());
+        };
+        if budget >= candidates_after_symbols.len() {
+            return Ok(candidates_after_symbols.to_vec());
+        }
+
+        let mut scored = candidates_after_symbols
+            .iter()
+            .map(|&local_id| {
+                let distance =
+                    l2_squared_unchecked(query_embedding, self.index.embedding_row(local_id));
+                (local_id, distance)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(budget);
+        scored.sort_unstable_by_key(|&(local_id, _)| local_id);
+        Ok(scored
+            .into_iter()
+            .map(|(local_id, _)| local_id)
+            .collect::<Vec<_>>())
+    }
+
+    fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        Some(MemoryVectorRouteTrace {
+            vector_index_bytes: self.index.vector_index_bytes(),
+            route_candidates: self.index.len(),
+            posting_entries_touched: 0,
+            duplicate_block_rate: 0.0,
+            selected_blocks: 0,
+            centroid_evals: self.index.len(),
+            working_set_bytes: self.index.vector_index_bytes(),
+            fallback_used: false,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PivotPrefixMemoryVectorCandidateGenerator {
+    segment_id: u64,
+    router: PivotPrefixRouter,
+    last_trace: RefCell<Option<MemoryVectorRouteTrace>>,
+}
+
+impl PivotPrefixMemoryVectorCandidateGenerator {
+    pub fn build(segment: &MemorySegment, config: PivotPrefixConfig) -> Result<Self, String> {
+        let router = PivotPrefixRouter::build(&segment.embeddings, segment.dim, config)?;
+        Ok(Self {
+            segment_id: segment.segment_id,
+            router,
+            last_trace: RefCell::new(None),
+        })
+    }
+
+    pub fn build_default(segment: &MemorySegment) -> Result<Self, String> {
+        Self::build(segment, default_memory_pivot_prefix_config(segment))
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.router.resident_bytes()
+    }
+}
+
+impl MemoryVectorCandidateGenerator for PivotPrefixMemoryVectorCandidateGenerator {
+    fn name(&self) -> &'static str {
+        "pivot_prefix"
+    }
+
+    fn candidates(
+        &self,
+        segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        self.last_trace.replace(None);
+        if self.segment_id != segment.segment_id {
+            return Err(format!(
+                "pivot-prefix vector index segment id mismatch: expected {}, got {}",
+                segment.segment_id, self.segment_id
+            ));
+        }
+
+        let Some(query_embedding) = query.embedding.as_deref() else {
+            return FlatMemoryVectorCandidateGenerator.candidates(
+                segment,
+                query,
+                candidates_after_symbols,
+            );
+        };
+
+        let mut scratch = self.router.scratch();
+        let metrics = self.router.route(query_embedding, &mut scratch);
+        self.last_trace.replace(Some(memory_vector_route_trace(
+            self.resident_bytes(),
+            metrics,
+        )));
+
+        let mut seen = BTreeSet::new();
+        let mut routed = scratch
+            .pool_candidates
+            .iter()
+            .copied()
+            .filter(|local_id| {
+                candidates_after_symbols.binary_search(local_id).is_ok() && seen.insert(*local_id)
+            })
+            .collect::<Vec<_>>();
+        if let Some(budget) = query.candidate_budget {
+            routed.truncate(budget);
+        }
+        routed.sort_unstable();
+
+        if routed.is_empty() && !candidates_after_symbols.is_empty() {
+            if let Some(trace) = self.last_trace.borrow_mut().as_mut() {
+                trace.fallback_used = true;
+            }
+            let mut fallback = candidates_after_symbols.to_vec();
+            if let Some(budget) = query.candidate_budget {
+                fallback.truncate(budget);
+            }
+            return Ok(fallback);
+        }
+        Ok(routed)
+    }
+
+    fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        self.last_trace.borrow().clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtlaMemoryVectorConfig {
+    pub levels: usize,
+    pub chart_dim: usize,
+    pub beam: usize,
+    pub candidate_pool: usize,
+    pub final_nprobe: usize,
+    pub fallback_on_route_risk: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HtlaMemoryVectorCandidateGenerator {
+    segment_id: u64,
+    router: HtlaRouter,
+    config: HtlaMemoryVectorConfig,
+    fallback: ArrayLikeMemoryVectorCandidateGenerator,
+    last_trace: RefCell<Option<MemoryVectorRouteTrace>>,
+}
+
+impl HtlaMemoryVectorCandidateGenerator {
+    pub fn build(segment: &MemorySegment, config: HtlaMemoryVectorConfig) -> Result<Self, String> {
+        let centroids = segment
+            .embeddings
+            .chunks_exact(segment.dim)
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+        let router = HtlaRouter::new(segment.dim, &centroids, config.levels, config.chart_dim)?;
+        Ok(Self {
+            segment_id: segment.segment_id,
+            router,
+            config,
+            fallback: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
+            last_trace: RefCell::new(None),
+        })
+    }
+
+    pub fn build_default(segment: &MemorySegment) -> Result<Self, String> {
+        Self::build(segment, default_memory_htla_config(segment))
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.router.resident_bytes()
+    }
+}
+
+impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
+    fn name(&self) -> &'static str {
+        "htla_tangent"
+    }
+
+    fn candidates(
+        &self,
+        segment: &MemorySegment,
+        query: &RecallQuery,
+        candidates_after_symbols: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        self.last_trace.replace(None);
+        if self.segment_id != segment.segment_id {
+            return Err(format!(
+                "htla vector index segment id mismatch: expected {}, got {}",
+                segment.segment_id, self.segment_id
+            ));
+        }
+
+        let Some(query_embedding) = query.embedding.as_deref() else {
+            return FlatMemoryVectorCandidateGenerator.candidates(
+                segment,
+                query,
+                candidates_after_symbols,
+            );
+        };
+
+        let budget = query
+            .candidate_budget
+            .unwrap_or(self.config.candidate_pool)
+            .min(self.config.candidate_pool)
+            .max(1);
+        let route = self.router.route(
+            query_embedding,
+            self.config.beam,
+            budget,
+            self.config.final_nprobe.min(segment.len()).max(1),
+        );
+        self.last_trace.replace(Some(MemoryVectorRouteTrace {
+            vector_index_bytes: self.resident_bytes(),
+            route_candidates: route.candidates.len(),
+            posting_entries_touched: 0,
+            duplicate_block_rate: 0.0,
+            selected_blocks: route.final_nprobe.len(),
+            centroid_evals: route.candidates.len(),
+            working_set_bytes: route.working_set_bytes,
+            fallback_used: route.fallback,
+        }));
+
+        let mut seen = BTreeSet::new();
+        let mut routed = route
+            .candidates
+            .iter()
+            .map(|&local_id| local_id as u32)
+            .filter(|local_id| {
+                candidates_after_symbols.binary_search(local_id).is_ok() && seen.insert(*local_id)
+            })
+            .collect::<Vec<_>>();
+        routed.truncate(budget);
+        routed.sort_unstable();
+
+        if (self.config.fallback_on_route_risk && route.fallback)
+            || (routed.is_empty() && !candidates_after_symbols.is_empty())
+        {
+            if let Some(trace) = self.last_trace.borrow_mut().as_mut() {
+                trace.fallback_used = true;
+            }
+            return self
+                .fallback
+                .candidates(segment, query, candidates_after_symbols);
+        }
+        Ok(routed)
+    }
+
+    fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
+        self.last_trace.borrow().clone()
     }
 }
 
@@ -392,7 +752,7 @@ impl MemorySegment {
     pub fn recall_with_vector_candidate_generator(
         &self,
         query: &RecallQuery,
-        vector_candidate_generator: &impl MemoryVectorCandidateGenerator,
+        vector_candidate_generator: &(impl MemoryVectorCandidateGenerator + ?Sized),
     ) -> Result<RecallResult, String> {
         if let Some(embedding) = &query.embedding {
             if embedding.len() != self.dim {
@@ -441,6 +801,7 @@ impl MemorySegment {
             vector_candidate_generator.candidates(self, query, candidates_after_symbols_slice)?;
         self.validate_vector_candidates(&candidates, candidates_after_symbols_slice)?;
         let vector_candidates = candidates.len();
+        let vector_route = vector_candidate_generator.route_trace();
 
         let mut scored = Vec::with_capacity(candidates.len());
         if query.embedding.is_some() {
@@ -486,6 +847,7 @@ impl MemorySegment {
                 candidates_after_symbols,
                 vector_generator: vector_candidate_generator.name(),
                 vector_candidates,
+                vector_route,
                 semantic_evals: scored.len(),
                 returned: hits.len(),
             },
@@ -878,6 +1240,47 @@ fn checked_u64(value: usize, name: &str) -> io::Result<u64> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn default_memory_pivot_prefix_config(segment: &MemorySegment) -> PivotPrefixConfig {
+    let record_count = segment.len().max(1);
+    PivotPrefixConfig {
+        block_size: record_count.clamp(1, 64),
+        pivot_count: record_count.clamp(1, 16),
+        prefix_len: 1,
+        top_blocks: 1,
+        candidate_pool: record_count,
+        mode: PrefixScoreMode::Weighted,
+        cluster_iters: 2,
+    }
+}
+
+fn default_memory_htla_config(segment: &MemorySegment) -> HtlaMemoryVectorConfig {
+    let record_count = segment.len().max(1);
+    HtlaMemoryVectorConfig {
+        levels: if record_count >= 8 { 3 } else { 2 },
+        chart_dim: segment.dim.clamp(1, 4),
+        beam: 4,
+        candidate_pool: record_count.min(64).max(1),
+        final_nprobe: record_count.min(16).max(1),
+        fallback_on_route_risk: true,
+    }
+}
+
+fn memory_vector_route_trace(
+    vector_index_bytes: usize,
+    metrics: RouteMetrics,
+) -> MemoryVectorRouteTrace {
+    MemoryVectorRouteTrace {
+        vector_index_bytes,
+        route_candidates: metrics.candidate_count,
+        posting_entries_touched: metrics.posting_entries_touched,
+        duplicate_block_rate: metrics.duplicate_block_rate,
+        selected_blocks: metrics.selected_blocks,
+        centroid_evals: metrics.centroid_evals,
+        working_set_bytes: metrics.working_set_bytes,
+        fallback_used: metrics.fallback,
+    }
 }
 
 fn checksum64(bytes: &[u8]) -> u64 {
@@ -1542,6 +1945,276 @@ mod tests {
     }
 
     #[test]
+    fn array_like_vector_candidate_generator_bounds_semantic_rerank() {
+        let segment = sample_segment();
+        let generator = ArrayLikeMemoryVectorCandidateGenerator::build(&segment);
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+
+        assert_eq!(generator.index().segment_id(), segment.segment_id);
+        assert_eq!(generator.index().len(), segment.len());
+        assert_eq!(
+            generator.index().vector_index_bytes(),
+            segment.len() * std::mem::size_of::<u32>()
+                + segment.embeddings.len() * std::mem::size_of::<f32>()
+        );
+        assert_eq!(result.trace.vector_generator, "array_like");
+        assert_eq!(result.trace.candidates_after_filters, 2);
+        assert_eq!(result.trace.candidates_after_symbols, 2);
+        assert_eq!(result.trace.vector_candidates, 1);
+        assert_eq!(result.trace.semantic_evals, 1);
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn array_like_vector_candidate_generator_is_deterministic() {
+        let segment = sample_segment();
+        let generator = ArrayLikeMemoryVectorCandidateGenerator::build(&segment);
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            limit: 3,
+            candidate_budget: Some(2),
+            ..RecallQuery::default()
+        };
+
+        let first = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+        let second = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.trace.vector_candidates, 2);
+        assert_eq!(first.trace.semantic_evals, 2);
+    }
+
+    #[test]
+    fn array_like_vector_candidate_generator_falls_back_without_embedding() {
+        let segment = sample_segment();
+        let generator = ArrayLikeMemoryVectorCandidateGenerator::build(&segment);
+        let query = RecallQuery {
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let array_like = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+        let flat = segment
+            .recall_with_vector_candidate_generator(&query, &FlatMemoryVectorCandidateGenerator)
+            .unwrap();
+
+        assert_eq!(array_like.hits, flat.hits);
+        assert_eq!(array_like.trace.vector_generator, "array_like");
+        assert_eq!(array_like.trace.vector_candidates, 1);
+        assert_eq!(array_like.trace.semantic_evals, 1);
+    }
+
+    #[test]
+    fn array_like_vector_candidate_generator_rejects_wrong_segment() {
+        let segment = sample_segment();
+        let other = MemorySegment::build(
+            8,
+            3,
+            vec![record(
+                9,
+                10,
+                100,
+                "different segment",
+                [1.0, 0.0, 0.0],
+                &["prefix8"],
+            )],
+        )
+        .unwrap();
+        let generator = ArrayLikeMemoryVectorCandidateGenerator::build(&other);
+
+        let error = segment
+            .recall_with_vector_candidate_generator(
+                &RecallQuery {
+                    embedding: Some(vec![1.0, 0.0, 0.0]),
+                    limit: 3,
+                    candidate_budget: Some(1),
+                    ..RecallQuery::default()
+                },
+                &generator,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("segment id mismatch"));
+    }
+
+    #[test]
+    fn pivot_prefix_vector_candidate_generator_routes_before_rerank() {
+        let segment = sample_segment();
+        let generator = PivotPrefixMemoryVectorCandidateGenerator::build(
+            &segment,
+            PivotPrefixConfig {
+                block_size: 1,
+                pivot_count: 2,
+                prefix_len: 1,
+                top_blocks: 1,
+                candidate_pool: 2,
+                mode: PrefixScoreMode::Weighted,
+                cluster_iters: 2,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.1, 0.0]),
+            scope_id: Some(10),
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+        let route = result.trace.vector_route.as_ref().unwrap();
+
+        assert_eq!(result.trace.vector_generator, "pivot_prefix");
+        assert_eq!(result.trace.candidates_after_filters, 2);
+        assert_eq!(result.trace.vector_candidates, 1);
+        assert_eq!(result.trace.semantic_evals, 1);
+        assert_eq!(result.hits[0].record_id, 1);
+        assert!(route.vector_index_bytes > 0);
+        assert!(route.posting_entries_touched > 0);
+        assert!(route.route_candidates <= 2);
+        assert!(route.working_set_bytes > 0);
+    }
+
+    #[test]
+    fn pivot_prefix_vector_candidate_generator_falls_back_after_empty_intersection() {
+        let segment = sample_segment();
+        let generator = PivotPrefixMemoryVectorCandidateGenerator::build(
+            &segment,
+            PivotPrefixConfig {
+                block_size: 1,
+                pivot_count: 2,
+                prefix_len: 1,
+                top_blocks: 1,
+                candidate_pool: 2,
+                mode: PrefixScoreMode::Weighted,
+                cluster_iters: 2,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            symbols: vec!["uint16".to_string()],
+            limit: 3,
+            candidate_budget: Some(1),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+
+        assert_eq!(result.trace.candidates_after_symbols, 1);
+        assert_eq!(result.trace.vector_candidates, 1);
+        assert_eq!(result.trace.semantic_evals, 1);
+        assert_eq!(result.hits[0].record_id, 2);
+        assert!(result.trace.vector_route.unwrap().fallback_used);
+    }
+
+    #[test]
+    fn htla_vector_candidate_generator_routes_deterministically() {
+        let segment = htla_sample_segment();
+        let generator = HtlaMemoryVectorCandidateGenerator::build(
+            &segment,
+            HtlaMemoryVectorConfig {
+                levels: 3,
+                chart_dim: 2,
+                beam: 4,
+                candidate_pool: 8,
+                final_nprobe: 4,
+                fallback_on_route_risk: false,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![10.1, 2.0, 0.0, 1.0]),
+            limit: 4,
+            candidate_budget: Some(8),
+            ..RecallQuery::default()
+        };
+
+        let first = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+        let second = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+        let route = first.trace.vector_route.as_ref().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.trace.vector_generator, "htla_tangent");
+        assert!(first.trace.vector_candidates <= 8);
+        assert!(route.vector_index_bytes > 0);
+        assert!(route.working_set_bytes > 0);
+        assert!(route.route_candidates <= 8);
+        assert!(first
+            .hits
+            .iter()
+            .any(|hit| hit.record_id == 10 || hit.record_id == 11));
+    }
+
+    #[test]
+    fn htla_vector_candidate_generator_falls_back_on_route_risk() {
+        let segment = htla_sample_segment();
+        let generator = HtlaMemoryVectorCandidateGenerator::build(
+            &segment,
+            HtlaMemoryVectorConfig {
+                levels: 3,
+                chart_dim: 2,
+                beam: 1,
+                candidate_pool: 1,
+                final_nprobe: 4,
+                fallback_on_route_risk: true,
+            },
+        )
+        .unwrap();
+        let query = RecallQuery {
+            embedding: Some(vec![10.1, 2.0, 0.0, 1.0]),
+            limit: 4,
+            candidate_budget: Some(4),
+            ..RecallQuery::default()
+        };
+
+        let result = segment
+            .recall_with_vector_candidate_generator(&query, &generator)
+            .unwrap();
+
+        assert_eq!(result.trace.vector_generator, "htla_tangent");
+        assert!(result.trace.vector_route.unwrap().fallback_used);
+        assert_eq!(result.trace.vector_candidates, 4);
+        assert!(result
+            .hits
+            .iter()
+            .any(|hit| hit.record_id == 10 || hit.record_id == 11));
+    }
+
+    #[test]
     fn recall_rejects_out_of_range_vector_candidates() {
         let segment = sample_segment();
         let error = segment
@@ -1555,6 +2228,23 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("out of range"));
+    }
+
+    #[test]
+    fn recall_rejects_vector_candidates_outside_upstream_filters() {
+        let segment = sample_segment();
+        let error = segment
+            .recall_with_vector_candidate_generator(
+                &RecallQuery {
+                    scope_id: Some(10),
+                    limit: 3,
+                    ..RecallQuery::default()
+                },
+                &FixedCandidates(vec![2]),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("upstream filters"));
     }
 
     #[test]
@@ -1678,6 +2368,26 @@ mod tests {
         .unwrap()
     }
 
+    fn htla_sample_segment() -> MemorySegment {
+        MemorySegment::build(
+            70,
+            4,
+            (0..64)
+                .map(|i| {
+                    record_vec(
+                        i as u64,
+                        1,
+                        1_700_000_000 + i as i64,
+                        "htla synthetic chart record",
+                        vec![i as f32, (i % 8) as f32, 0.0, 1.0],
+                        &["htla"],
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
     fn temp_segment_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1743,6 +2453,26 @@ mod tests {
             confidence: 1.0,
             text: text.to_string(),
             embedding: embedding.to_vec(),
+            symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
+        }
+    }
+
+    fn record_vec(
+        record_id: u64,
+        scope_id: u32,
+        timestamp: i64,
+        text: &str,
+        embedding: Vec<f32>,
+        symbols: &[&str],
+    ) -> MemoryRecordInput {
+        MemoryRecordInput {
+            record_id,
+            scope_id,
+            timestamp,
+            source_id: 1,
+            confidence: 1.0,
+            text: text.to_string(),
+            embedding,
             symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
         }
     }

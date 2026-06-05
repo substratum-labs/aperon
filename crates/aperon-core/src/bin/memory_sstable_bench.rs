@@ -1,6 +1,9 @@
 use aperon_core::{
-    distance::l2_squared_unchecked, stable_memory_branch_id, MemoryManifestFile,
-    MemoryManifestSegment, MemoryRecordInput, MemorySegment, MemorySpace, RecallQuery,
+    distance::l2_squared_unchecked, stable_memory_branch_id,
+    ArrayLikeMemoryVectorCandidateGenerator, HtlaMemoryVectorCandidateGenerator, MemoryHit,
+    MemoryManifestFile, MemoryManifestSegment, MemoryRecordInput, MemorySegment, MemorySpace,
+    MemorySpaceRecallResult, MemorySpaceRecallTrace, MemorySpaceSegmentTrace,
+    MemoryVectorCandidateGenerator, PivotPrefixMemoryVectorCandidateGenerator, RecallQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -76,6 +79,8 @@ struct PathMetrics {
     access_path: &'static str,
     build_time: Option<Duration>,
     bytes: Option<u64>,
+    vector_index_bytes: Option<usize>,
+    working_set_bytes: Option<usize>,
     fork_time: Option<Duration>,
     fork_bytes: Option<u64>,
     total_latency: Duration,
@@ -83,6 +88,10 @@ struct PathMetrics {
     filter_candidates: Option<usize>,
     symbol_candidates: Option<usize>,
     vector_candidates: Option<usize>,
+    candidate_recall: Option<usize>,
+    semantic_eval_reduction_vs_upstream: Option<f64>,
+    semantic_eval_reduction_vs_flat: Option<f64>,
+    fallback_count: Option<usize>,
     correct: usize,
     queries: usize,
 }
@@ -129,11 +138,17 @@ struct BenchMetricRow<'a> {
     queries: usize,
     build_ms: Option<f64>,
     bytes: Option<u64>,
+    vector_index_bytes: Option<u64>,
+    working_set_bytes_per_query: Option<f64>,
     latency_us_per_query: f64,
     semantic_evals_per_query: f64,
     filter_candidates_per_query: Option<f64>,
     symbol_candidates_per_query: Option<f64>,
     vector_candidates_per_query: Option<f64>,
+    candidate_recall: Option<f64>,
+    semantic_eval_reduction_vs_upstream: Option<f64>,
+    semantic_eval_reduction_vs_flat: Option<f64>,
+    fallback_rate: Option<f64>,
     correct: usize,
     fork_ms: Option<f64>,
     fork_bytes: Option<u64>,
@@ -168,6 +183,18 @@ fn run() -> Result<(), String> {
         16,
     );
     run_scenario(&small, &args.out.join("synthetic-small"))?;
+
+    let broad = synthetic_broad_semantic_scenario(
+        "synthetic-broad-semantic",
+        "scale-broad-semantic",
+        "broad deterministic semantic routing comparison without metadata or symbol filters",
+        1_000,
+        10,
+        args.queries.min(20).max(10),
+        16,
+        16,
+    );
+    run_scenario(&broad, &args.out.join("synthetic-broad-semantic"))?;
 
     if args.medium || args.records != 100_000 || args.segments != 100 || args.queries != 100 {
         let synthetic = synthetic_scenario(
@@ -216,7 +243,31 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
     let jsonl_bytes = file_len(&jsonl_path)?;
 
     let mut rows = Vec::new();
-    rows.push(run_mvp(
+    rows.push(run_memory_sstable_flat(
+        &space,
+        &scenario.queries,
+        mvp_build_time,
+        mvp_bytes,
+        fork_time,
+        fork_bytes,
+    )?);
+    rows.push(run_memory_sstable_array_like(
+        &space,
+        &scenario.queries,
+        mvp_build_time,
+        mvp_bytes,
+        fork_time,
+        fork_bytes,
+    )?);
+    rows.push(run_memory_sstable_pivot_prefix(
+        &space,
+        &scenario.queries,
+        mvp_build_time,
+        mvp_bytes,
+        fork_time,
+        fork_bytes,
+    )?);
+    rows.push(run_memory_sstable_htla(
         &space,
         &scenario.queries,
         mvp_build_time,
@@ -231,6 +282,7 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
     )?);
     rows.push(run_in_memory_flat(&records, &scenario.queries));
     rows.push(run_vector_only(&records, &scenario.queries));
+    annotate_semantic_eval_reduction(&mut rows);
 
     write_machine_readable_summary(
         scenario,
@@ -250,32 +302,42 @@ fn run_scenario(scenario: &Scenario, out: &Path) -> Result<(), String> {
         out.display()
     );
     println!(
-        "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>11} {:>10}",
+        "{:<24} {:<48} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>10} {:>10} {:>10} {:>11} {:>10}",
         "path",
         "access_path",
         "build_ms",
         "bytes",
+        "vec_idx_b",
+        "workset/q",
         "lat_us/q",
         "sem/q",
         "filter/q",
         "symbol/q",
         "vector/q",
+        "cand_rec",
+        "rerank_red",
+        "fallback",
         "correct",
         "fork_ms",
         "fork_b"
     );
     for row in rows {
         println!(
-            "{:<22} {:<48} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>11} {:>10}",
+            "{:<24} {:<48} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>12} {:>12} {:>10} {:>10} {:>10} {:>10} {:>11} {:>10}",
             row.path,
             row.access_path,
             fmt_duration_ms(row.build_time),
             fmt_bytes(row.bytes),
+            fmt_usize(row.vector_index_bytes),
+            fmt_avg(row.working_set_bytes, row.queries),
             duration_us_per_query(row.total_latency, row.queries),
             row.semantic_evals / row.queries.max(1),
             fmt_avg(row.filter_candidates, row.queries),
             fmt_avg(row.symbol_candidates, row.queries),
             fmt_avg(row.vector_candidates, row.queries),
+            fmt_rate(row.candidate_recall, row.queries),
+            fmt_ratio(row.semantic_eval_reduction_vs_upstream),
+            fmt_rate(row.fallback_count, row.queries),
             format!("{}/{}", row.correct, row.queries),
             fmt_duration_ms(row.fork_time),
             fmt_bytes(row.fork_bytes)
@@ -352,6 +414,10 @@ fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRo
         queries: row.queries,
         build_ms: row.build_time.map(duration_ms),
         bytes: row.bytes,
+        vector_index_bytes: row.vector_index_bytes.map(|value| value as u64),
+        working_set_bytes_per_query: row
+            .working_set_bytes
+            .map(|value| avg_usize(value, row.queries)),
         latency_us_per_query: duration_us_per_query_value(row.total_latency, row.queries),
         semantic_evals_per_query: avg_usize(row.semantic_evals, row.queries),
         filter_candidates_per_query: row
@@ -363,13 +429,21 @@ fn metric_row<'a>(scenario: &'a Scenario, row: &'a PathMetrics) -> BenchMetricRo
         vector_candidates_per_query: row
             .vector_candidates
             .map(|value| avg_usize(value, row.queries)),
+        candidate_recall: row
+            .candidate_recall
+            .map(|value| avg_usize(value, row.queries)),
+        semantic_eval_reduction_vs_upstream: row.semantic_eval_reduction_vs_upstream,
+        semantic_eval_reduction_vs_flat: row.semantic_eval_reduction_vs_flat,
+        fallback_rate: row
+            .fallback_count
+            .map(|value| avg_usize(value, row.queries)),
         correct: row.correct,
         fork_ms: row.fork_time.map(duration_ms),
         fork_bytes: row.fork_bytes,
     }
 }
 
-fn run_mvp(
+fn run_memory_sstable_flat(
     space: &MemorySpace,
     queries: &[BenchQuery],
     build_time: Duration,
@@ -411,6 +485,8 @@ fn run_mvp(
             "metadata filters + symbol postings + flat vector candidates + semantic rerank",
         build_time: Some(build_time),
         bytes: Some(bytes),
+        vector_index_bytes: None,
+        working_set_bytes: None,
         fork_time: Some(fork_time),
         fork_bytes: Some(fork_bytes),
         total_latency,
@@ -418,8 +494,276 @@ fn run_mvp(
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
         vector_candidates: Some(vector_candidates),
+        candidate_recall: Some(correct),
+        semantic_eval_reduction_vs_upstream: semantic_eval_reduction(
+            semantic_evals,
+            symbol_candidates,
+        ),
+        semantic_eval_reduction_vs_flat: Some(0.0),
+        fallback_count: Some(0),
         correct,
         queries: queries.len(),
+    })
+}
+
+fn run_memory_sstable_array_like(
+    space: &MemorySpace,
+    queries: &[BenchQuery],
+    mvp_build_time: Duration,
+    bytes: u64,
+    fork_time: Duration,
+    fork_bytes: u64,
+) -> Result<PathMetrics, String> {
+    let build_start = Instant::now();
+    let generators = space
+        .segments
+        .iter()
+        .map(|loaded| ArrayLikeMemoryVectorCandidateGenerator::build(&loaded.segment))
+        .collect::<Vec<_>>();
+    let generator_build_time = build_start.elapsed();
+    let vector_index_bytes = generators
+        .iter()
+        .map(|generator| generator.index().vector_index_bytes())
+        .sum::<usize>();
+
+    let generator_refs = generators
+        .iter()
+        .map(|generator| generator as &dyn MemoryVectorCandidateGenerator)
+        .collect::<Vec<_>>();
+    let result = run_memory_sstable_generators(space, queries, &generator_refs)?;
+
+    Ok(PathMetrics {
+        path: "memory-sstable-array",
+        access_path:
+            "metadata filters + symbol postings + array-like vector candidates + semantic rerank",
+        build_time: Some(mvp_build_time + generator_build_time),
+        bytes: Some(bytes),
+        vector_index_bytes: Some(vector_index_bytes),
+        working_set_bytes: Some(result.working_set_bytes),
+        fork_time: Some(fork_time),
+        fork_bytes: Some(fork_bytes),
+        total_latency: result.total_latency,
+        semantic_evals: result.semantic_evals,
+        filter_candidates: Some(result.filter_candidates),
+        symbol_candidates: Some(result.symbol_candidates),
+        vector_candidates: Some(result.vector_candidates),
+        candidate_recall: Some(result.correct),
+        semantic_eval_reduction_vs_upstream: semantic_eval_reduction(
+            result.semantic_evals,
+            result.symbol_candidates,
+        ),
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: Some(result.fallback_count),
+        correct: result.correct,
+        queries: queries.len(),
+    })
+}
+
+fn run_memory_sstable_pivot_prefix(
+    space: &MemorySpace,
+    queries: &[BenchQuery],
+    mvp_build_time: Duration,
+    bytes: u64,
+    fork_time: Duration,
+    fork_bytes: u64,
+) -> Result<PathMetrics, String> {
+    let build_start = Instant::now();
+    let generators = space
+        .segments
+        .iter()
+        .map(|loaded| PivotPrefixMemoryVectorCandidateGenerator::build_default(&loaded.segment))
+        .collect::<Result<Vec<_>, _>>()?;
+    let generator_build_time = build_start.elapsed();
+    let vector_index_bytes = generators
+        .iter()
+        .map(PivotPrefixMemoryVectorCandidateGenerator::resident_bytes)
+        .sum::<usize>();
+
+    let generator_refs = generators
+        .iter()
+        .map(|generator| generator as &dyn MemoryVectorCandidateGenerator)
+        .collect::<Vec<_>>();
+    let result = run_memory_sstable_generators(space, queries, &generator_refs)?;
+
+    Ok(PathMetrics {
+        path: "memory-sstable-pivot",
+        access_path: "metadata filters + symbol postings + pivot-prefix postings + semantic rerank",
+        build_time: Some(mvp_build_time + generator_build_time),
+        bytes: Some(bytes),
+        vector_index_bytes: Some(vector_index_bytes),
+        working_set_bytes: Some(result.working_set_bytes),
+        fork_time: Some(fork_time),
+        fork_bytes: Some(fork_bytes),
+        total_latency: result.total_latency,
+        semantic_evals: result.semantic_evals,
+        filter_candidates: Some(result.filter_candidates),
+        symbol_candidates: Some(result.symbol_candidates),
+        vector_candidates: Some(result.vector_candidates),
+        candidate_recall: Some(result.correct),
+        semantic_eval_reduction_vs_upstream: semantic_eval_reduction(
+            result.semantic_evals,
+            result.symbol_candidates,
+        ),
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: Some(result.fallback_count),
+        correct: result.correct,
+        queries: queries.len(),
+    })
+}
+
+fn run_memory_sstable_htla(
+    space: &MemorySpace,
+    queries: &[BenchQuery],
+    mvp_build_time: Duration,
+    bytes: u64,
+    fork_time: Duration,
+    fork_bytes: u64,
+) -> Result<PathMetrics, String> {
+    let build_start = Instant::now();
+    let generators = space
+        .segments
+        .iter()
+        .map(|loaded| HtlaMemoryVectorCandidateGenerator::build_default(&loaded.segment))
+        .collect::<Result<Vec<_>, _>>()?;
+    let generator_build_time = build_start.elapsed();
+    let vector_index_bytes = generators
+        .iter()
+        .map(HtlaMemoryVectorCandidateGenerator::resident_bytes)
+        .sum::<usize>();
+    let generator_refs = generators
+        .iter()
+        .map(|generator| generator as &dyn MemoryVectorCandidateGenerator)
+        .collect::<Vec<_>>();
+    let result = run_memory_sstable_generators(space, queries, &generator_refs)?;
+
+    Ok(PathMetrics {
+        path: "memory-sstable-htla",
+        access_path:
+            "metadata filters + symbol postings + htla tangent candidates + semantic rerank",
+        build_time: Some(mvp_build_time + generator_build_time),
+        bytes: Some(bytes),
+        vector_index_bytes: Some(vector_index_bytes),
+        working_set_bytes: Some(result.working_set_bytes),
+        fork_time: Some(fork_time),
+        fork_bytes: Some(fork_bytes),
+        total_latency: result.total_latency,
+        semantic_evals: result.semantic_evals,
+        filter_candidates: Some(result.filter_candidates),
+        symbol_candidates: Some(result.symbol_candidates),
+        vector_candidates: Some(result.vector_candidates),
+        candidate_recall: Some(result.correct),
+        semantic_eval_reduction_vs_upstream: semantic_eval_reduction(
+            result.semantic_evals,
+            result.symbol_candidates,
+        ),
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: Some(result.fallback_count),
+        correct: result.correct,
+        queries: queries.len(),
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct MemoryGeneratorRun {
+    total_latency: Duration,
+    semantic_evals: usize,
+    filter_candidates: usize,
+    symbol_candidates: usize,
+    vector_candidates: usize,
+    working_set_bytes: usize,
+    fallback_count: usize,
+    correct: usize,
+}
+
+fn run_memory_sstable_generators(
+    space: &MemorySpace,
+    queries: &[BenchQuery],
+    generators: &[&dyn MemoryVectorCandidateGenerator],
+) -> Result<MemoryGeneratorRun, String> {
+    if generators.len() != space.segments.len() {
+        return Err("generator count must match memory segment count".to_string());
+    }
+
+    let mut stats = MemoryGeneratorRun::default();
+    for bench_query in queries {
+        let start = Instant::now();
+        let result = recall_space_with_generators(space, &bench_query.query, generators)?;
+        stats.total_latency += start.elapsed();
+        stats.semantic_evals += result.trace.semantic_evals;
+        for segment in result.trace.segment_traces {
+            if let Some(trace) = segment.trace {
+                stats.filter_candidates += trace.candidates_after_filters;
+                stats.symbol_candidates += trace.candidates_after_symbols;
+                stats.vector_candidates += trace.vector_candidates;
+                if let Some(route) = trace.vector_route.as_ref() {
+                    stats.working_set_bytes += route.working_set_bytes;
+                    stats.fallback_count += usize::from(route.fallback_used);
+                }
+            }
+        }
+        if result
+            .hits
+            .iter()
+            .any(|hit| hit.record_id == bench_query.expected_record_id)
+        {
+            stats.correct += 1;
+        }
+    }
+    Ok(stats)
+}
+
+fn recall_space_with_generators(
+    space: &MemorySpace,
+    query: &RecallQuery,
+    generators: &[&dyn MemoryVectorCandidateGenerator],
+) -> Result<MemorySpaceRecallResult, String> {
+    let limit = query.limit.max(1);
+    let mut merged = Vec::<(u64, MemoryHit)>::new();
+    let mut segment_traces = Vec::with_capacity(space.segments.len());
+    let mut segments_scanned = 0;
+    let mut semantic_evals = 0;
+
+    for (loaded, generator) in space.segments.iter().zip(generators.iter().copied()) {
+        segments_scanned += 1;
+        let result = loaded
+            .segment
+            .recall_with_vector_candidate_generator(query, generator)?;
+        semantic_evals += result.trace.semantic_evals;
+        for hit in result.hits {
+            merged.push((loaded.segment.segment_id, hit));
+        }
+        segment_traces.push(MemorySpaceSegmentTrace {
+            segment_id: loaded.segment.segment_id,
+            pruned: false,
+            prune_reason: None,
+            trace: Some(result.trace),
+        });
+    }
+
+    merged.sort_unstable_by(|a, b| {
+        b.1.score
+            .total_cmp(&a.1.score)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.record_id.cmp(&b.1.record_id))
+    });
+    let hits = merged
+        .into_iter()
+        .take(limit)
+        .map(|(_, hit)| hit)
+        .collect::<Vec<_>>();
+
+    Ok(MemorySpaceRecallResult {
+        trace: MemorySpaceRecallTrace {
+            manifest_id: space.manifest.manifest_id,
+            branch_id: space.manifest.branch_id,
+            segments_considered: space.segments.len(),
+            segments_scanned,
+            segments_pruned: 0,
+            semantic_evals,
+            returned: hits.len(),
+            segment_traces,
+        },
+        hits,
     })
 }
 
@@ -455,6 +799,8 @@ fn run_naive_jsonl(
         access_path: "full JSONL parse per query + metadata/symbol scan",
         build_time: None,
         bytes,
+        vector_index_bytes: None,
+        working_set_bytes: None,
         fork_time: None,
         fork_bytes: None,
         total_latency,
@@ -462,6 +808,10 @@ fn run_naive_jsonl(
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
         vector_candidates: None,
+        candidate_recall: None,
+        semantic_eval_reduction_vs_upstream: None,
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: None,
         correct,
         queries: queries.len(),
     })
@@ -497,6 +847,8 @@ fn run_in_memory_flat(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMe
         access_path: "one-time Vec load + metadata/symbol scan",
         build_time: Some(build_time),
         bytes: None,
+        vector_index_bytes: None,
+        working_set_bytes: None,
         fork_time: None,
         fork_bytes: None,
         total_latency,
@@ -504,6 +856,10 @@ fn run_in_memory_flat(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMe
         filter_candidates: Some(filter_candidates),
         symbol_candidates: Some(symbol_candidates),
         vector_candidates: None,
+        candidate_recall: None,
+        semantic_eval_reduction_vs_upstream: None,
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: None,
         correct,
         queries: queries.len(),
     }
@@ -535,6 +891,8 @@ fn run_vector_only(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMetri
         access_path: "flat embedding distance; ignores memory metadata/symbols",
         build_time: Some(build_time),
         bytes: None,
+        vector_index_bytes: None,
+        working_set_bytes: None,
         fork_time: None,
         fork_bytes: None,
         total_latency,
@@ -542,9 +900,40 @@ fn run_vector_only(records: &[BenchRecord], queries: &[BenchQuery]) -> PathMetri
         filter_candidates: None,
         symbol_candidates: None,
         vector_candidates: None,
+        candidate_recall: None,
+        semantic_eval_reduction_vs_upstream: None,
+        semantic_eval_reduction_vs_flat: None,
+        fallback_count: None,
         correct,
         queries: queries.len(),
     }
+}
+
+fn annotate_semantic_eval_reduction(rows: &mut [PathMetrics]) {
+    let Some(flat_semantic_evals) = rows
+        .iter()
+        .find(|row| row.path == "memory-sstable")
+        .map(|row| row.semantic_evals as f64)
+    else {
+        return;
+    };
+    if flat_semantic_evals <= 0.0 {
+        return;
+    }
+
+    for row in rows {
+        if row.semantic_eval_reduction_vs_flat.is_none() && row.path.starts_with("memory-sstable") {
+            row.semantic_eval_reduction_vs_flat =
+                Some(1.0 - row.semantic_evals as f64 / flat_semantic_evals);
+        }
+    }
+}
+
+fn semantic_eval_reduction(semantic_evals: usize, upstream_candidates: usize) -> Option<f64> {
+    if upstream_candidates == 0 {
+        return None;
+    }
+    Some(1.0 - semantic_evals as f64 / upstream_candidates as f64)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -914,6 +1303,43 @@ fn synthetic_scenario(
     }
 }
 
+fn synthetic_broad_semantic_scenario(
+    name: &str,
+    category: &'static str,
+    description: &'static str,
+    record_count: usize,
+    segment_count: usize,
+    query_count: usize,
+    dim: usize,
+    candidate_budget: usize,
+) -> Scenario {
+    let mut scenario = synthetic_scenario(
+        name,
+        category,
+        description,
+        record_count,
+        segment_count,
+        query_count,
+        dim,
+    );
+    for (qid, query) in scenario.queries.iter_mut().enumerate() {
+        let target = (qid * 9_973 + 17) % record_count.max(1);
+        let record = &scenario.records[target].record;
+        query.query = RecallQuery {
+            embedding: Some(record.embedding.clone()),
+            symbols: Vec::new(),
+            scope_id: None,
+            time_start: None,
+            time_end: None,
+            min_confidence: None,
+            limit: 10,
+            candidate_budget: Some(candidate_budget),
+        };
+        query.expected_record_id = record.record_id;
+    }
+    scenario
+}
+
 fn deterministic_value(id: u64, dim: u64) -> f32 {
     let mut x = id
         .wrapping_mul(0x9e3779b97f4a7c15)
@@ -1115,9 +1541,27 @@ fn fmt_bytes(bytes: Option<u64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+fn fmt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn fmt_avg(value: Option<usize>, queries: usize) -> String {
     value
         .map(|value| (value / queries.max(1)).to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn fmt_rate(value: Option<usize>, queries: usize) -> String {
+    value
+        .map(|value| format!("{:.3}", value as f64 / queries.max(1) as f64))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn fmt_ratio(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "n/a".to_string())
 }
 
