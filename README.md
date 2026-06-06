@@ -51,41 +51,170 @@ Aperon achieves sub-10% HNSW memory footprints by utilizing advanced compression
 
 ---
 
-## 🚀 Quickstart From Clone
+## 🚀 End-to-End Memory SSTable Walkthrough
+
+Aperon is designed as an agent-native **Memory SSTable engine**. Instead of simple in-memory vector indexing, it models memory as log-structured segments, versioned manifests, and multi-path recall queries combining symbol filters with quantized vector routing.
+
+Here is the complete walkthrough of compiling memory records, executing recall, and branching/forking the memory space.
+
+### 1. Setup & Demo CLI Walkthrough
+
+Clone the repository and build the binary:
 
 ```bash
 git clone https://github.com/substrate-lab/aperon.git
 cd aperon
 
+# Build Rust binaries and compile the Python bindings
+cargo build --workspace
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install maturin numpy
-
-cargo build --workspace
+python -m pip install --upgrade pip maturin numpy
 maturin develop --release
 ```
 
-Generate a tiny dataset in Aperon's binary formats:
+Run the end-to-end companion demo binary (`memory_sstable_demo`) to write segments, recall records, and fork branches:
 
 ```bash
-python examples/generate_toy.py --out tmp/aperon-toy
+# A. Build segment files (.apms) and manifest (.apmf) from a JSONL log of memory inputs
+cargo run -p aperon-core --bin memory_sstable_demo -- build \
+  --input examples/aperon_memory.jsonl \
+  --out target/memory-demo
+
+# B. Recall memory records combining timestamp, scope, symbols, and semantic embeddings
+cargo run -p aperon-core --bin memory_sstable_demo -- recall \
+  --manifest target/memory-demo/main.apmf \
+  --query examples/query_prefix8.json
+
+# C. Fork a zero-copy branch manifest inheriting all segment files
+cargo run -p aperon-core --bin memory_sstable_demo -- fork \
+  --manifest target/memory-demo/main.apmf \
+  --branch experimental-branch \
+  --out target/memory-demo/fork.apmf
 ```
 
-Build a multi-grain index:
+### 2. Rust Programmatic API
 
-```bash
-cargo run -p aperon-cli -- build \
-  --vectors tmp/aperon-toy/vectors.hntr \
-  --output tmp/aperon-toy/index.hntm \
-  --grains 4 \
-  --local-dim 4 \
-  --block-size 8
+Here is the exact same build, recall, and fork workflow implemented programmatically in Rust:
+
+```rust
+use std::path::{Path, PathBuf};
+use aperon_core::{
+    MemoryRecordInput, MemorySegment, MemoryManifestFile, MemoryManifestSegment,
+    MemorySpace, RecallQuery, stable_memory_branch_id
+};
+
+fn main() -> Result<(), String> {
+    let out_dir = Path::new("target/readme-demo");
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+
+    // 1. Build and write immutable columnar segment files (.apms) from memory inputs
+    let records = vec![MemoryRecordInput {
+        record_id: 171001,
+        scope_id: 7,
+        timestamp: 171,
+        source_id: 1,
+        confidence: 0.96,
+        text: "T-171 proved the route kernel is fast.".to_string(),
+        embedding: vec![1.0, 0.05, 0.0, 0.0],
+        symbols: vec!["T-171".to_string(), "route-kernel".to_string()],
+    }];
+    let segment = MemorySegment::build(171, 4, records)?;
+    let segment_path = out_dir.join("segment-171.apms");
+    segment.write(&segment_path).map_err(|e| e.to_string())?;
+
+    // 2. Write a versioned manifest file (.apmf) tracking the active segments
+    let manifest = MemoryManifestFile::new(
+        None, // parent_manifest_id
+        stable_memory_branch_id("main"),
+        vec![MemoryManifestSegment {
+            segment_id: 171,
+            path: PathBuf::from("segment-171.apms"),
+            vector_sidecar: None,
+        }],
+    );
+    let manifest_path = out_dir.join("main.apmf");
+    manifest.write(&manifest_path).map_err(|e| e.to_string())?;
+
+    // 3. Open the MemorySpace snapshot and query it with combined symbol + semantic filters
+    let space = MemorySpace::open(&manifest_path).map_err(|e| e.to_string())?;
+    let query = RecallQuery {
+        embedding: Some(vec![1.0, 0.0, 0.28, 0.0]),
+        symbols: vec!["route-kernel".to_string()],
+        scope_id: Some(7),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = space.recall(&query)?;
+
+    println!("Scanned {} segments", result.trace.segments_scanned);
+    for hit in result.hits {
+        println!("Hit record ID: {}, Score: {}", hit.record_id, hit.score);
+    }
+
+    // 4. Fork the memory space to create a zero-copy child manifest
+    let fork_path = out_dir.join("fork.apmf");
+    space.fork("experimental-branch", &fork_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
 ```
+
 
 ---
 
-## Python API
+## 🐍 Python API
+
+Aperon exposes both low-level quantized vector index structures and high-level Memory SSTable primitives to Python. For more comprehensive details, see [docs/python_api.md](docs/python_api.md).
+
+### High-Level Memory SSTable Engine
+
+Exposes immutable segment building, manifest versioning, planned semantic recall, and zero-copy branching checkouts:
+
+```python
+import aperon
+
+# 1. Compile immutable memory segments from record dicts
+records = [{
+    "record_id": 191001,
+    "scope_id": 7,
+    "timestamp": 191,
+    "source_id": 1,
+    "confidence": 0.97,
+    "text": "T-191 exposes Memory SSTable bindings.",
+    "embedding": [1.0, 0.0, 0.0, 0.0],
+    "symbols": ["T-191", "python"],
+}]
+
+segment = aperon.MemorySegment.build(segment_id=191, dim=4, records=records)
+segment.write("target/python-demo/segment-191.apms")
+
+# 2. Write a versioned manifest file (.apmf) tracking the active segments
+manifest = aperon.MemoryManifestFile(
+    branch="main",
+    segments=[{"segment_id": 191, "path": "segment-191.apms"}],
+)
+manifest.write("target/python-demo/main.apmf")
+
+# 3. Open the MemorySpace snapshot and query it with combined symbol + semantic filters
+space = aperon.MemorySpace.open("target/python-demo/main.apmf")
+query = aperon.RecallQuery(
+    embedding=[1.0, 0.0, 0.0, 0.0],
+    symbols=["python"],
+    scope_id=7,
+    limit=5,
+)
+result = space.recall(query)
+
+for hit in result["hits"]:
+    print(f"Hit record ID: {hit['record_id']}, Score: {hit['score']}")
+
+# 4. Fork the memory space to create a zero-copy child manifest
+space.fork("python-experimental-branch", "target/python-demo/fork.apmf")
+```
+
+### Low-Level Quantized Vector Indexing
+
+If you only need standalone, high-performance quantized vector indexing (without LSM segments, manifests, and symbolic filtering metadata), you can use the low-level `AperonIndex` class:
 
 ```python
 import numpy as np
@@ -102,43 +231,6 @@ idx.rebuild_n_grains(8)
 
 print(idx.search(queries[0], top_k=5, nprobe=4))
 print(idx.stats())
-```
-
----
-
-## Memory SSTable Rust API Usage
-
-Aperon's Memory SSTable engine allows embedded agents to load segments from versioned manifests, write new snapshots, fork branches, and execute multi-path planned recall.
-
-### Rust Example
-
-```rust
-use aperon_core::{MemorySpace, MemoryQueryPlanner, RecallQuery};
-use std::path::Path;
-
-fn main() -> Result<(), String> {
-    // 1. Open an existing memory space snapshot from manifest
-    let space = MemorySpace::open(Path::new("target/memory-demo/main.apmf"))
-        .map_err(|e| e.to_string())?;
-
-    // 2. Define a query with symbol matching and semantic vector retrieval
-    let query = RecallQuery {
-        embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
-        symbols: vec!["prefix8".to_string()],
-        limit: 5,
-        ..Default::default()
-    };
-
-    // 3. Plan and execute using the 5-layer query planner
-    let planner = MemoryQueryPlanner::new(Default::default());
-    let result = planner.recall(&space, &query)?;
-
-    println!("Scanned {} segments", result.trace.segments_scanned);
-    for hit in result.hits {
-        println!("Record ID: {}, Score: {}", hit.record_id, hit.score);
-    }
-    Ok(())
-}
 ```
 
 ---

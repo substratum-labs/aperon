@@ -1,6 +1,9 @@
 use aperon_core::{
     binary::{load_legacy_index, write_legacy_index},
-    AperonIndex, HierarchicalLatticeLayerConfig, HierarchicalLatticeRouter, HtlaRouter, VectorId,
+    stable_memory_branch_id, AperonIndex, HierarchicalLatticeLayerConfig,
+    HierarchicalLatticeRouter, HtlaRouter, MemoryHit, MemoryManifestFile, MemoryManifestSegment,
+    MemoryQueryPlannerTrace, MemoryRecordInput, MemorySegment, MemorySpace, MemorySpaceRecallTrace,
+    MemorySpaceSegmentTrace, MemoryVectorRouteTrace, RecallQuery, RecallTrace, VectorId,
 };
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -22,6 +25,251 @@ struct PyHlrRouter {
 #[pyclass(name = "HtlaRouter")]
 struct PyHtlaRouter {
     inner: HtlaRouter,
+}
+
+#[pyclass(name = "RecallQuery")]
+#[derive(Clone)]
+struct PyRecallQuery {
+    inner: RecallQuery,
+}
+
+#[pyclass(name = "MemorySegment")]
+#[derive(Clone)]
+struct PyMemorySegment {
+    inner: MemorySegment,
+}
+
+#[pyclass(name = "MemoryManifestFile")]
+#[derive(Clone)]
+struct PyMemoryManifestFile {
+    inner: MemoryManifestFile,
+}
+
+#[pyclass(name = "MemorySpace")]
+#[derive(Clone)]
+struct PyMemorySpace {
+    inner: MemorySpace,
+}
+
+#[pymethods]
+impl PyRecallQuery {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        embedding=None,
+        symbols=Vec::new(),
+        scope_id=None,
+        time_start=None,
+        time_end=None,
+        min_confidence=None,
+        limit=10,
+        candidate_budget=None
+    ))]
+    fn new(
+        embedding: Option<Vec<f32>>,
+        symbols: Vec<String>,
+        scope_id: Option<u32>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        min_confidence: Option<f32>,
+        limit: usize,
+        candidate_budget: Option<usize>,
+    ) -> Self {
+        Self {
+            inner: RecallQuery {
+                embedding,
+                symbols,
+                scope_id,
+                time_start,
+                time_end,
+                min_confidence,
+                limit,
+                candidate_budget,
+            },
+        }
+    }
+
+    #[getter]
+    fn embedding(&self) -> Option<Vec<f32>> {
+        self.inner.embedding.clone()
+    }
+
+    #[setter]
+    fn set_embedding(&mut self, embedding: Option<Vec<f32>>) {
+        self.inner.embedding = embedding;
+    }
+
+    #[getter]
+    fn symbols(&self) -> Vec<String> {
+        self.inner.symbols.clone()
+    }
+
+    #[setter]
+    fn set_symbols(&mut self, symbols: Vec<String>) {
+        self.inner.symbols = symbols;
+    }
+
+    #[getter]
+    fn scope_id(&self) -> Option<u32> {
+        self.inner.scope_id
+    }
+
+    #[setter]
+    fn set_scope_id(&mut self, scope_id: Option<u32>) {
+        self.inner.scope_id = scope_id;
+    }
+
+    #[getter]
+    fn time_start(&self) -> Option<i64> {
+        self.inner.time_start
+    }
+
+    #[setter]
+    fn set_time_start(&mut self, time_start: Option<i64>) {
+        self.inner.time_start = time_start;
+    }
+
+    #[getter]
+    fn time_end(&self) -> Option<i64> {
+        self.inner.time_end
+    }
+
+    #[setter]
+    fn set_time_end(&mut self, time_end: Option<i64>) {
+        self.inner.time_end = time_end;
+    }
+
+    #[getter]
+    fn min_confidence(&self) -> Option<f32> {
+        self.inner.min_confidence
+    }
+
+    #[setter]
+    fn set_min_confidence(&mut self, min_confidence: Option<f32>) {
+        self.inner.min_confidence = min_confidence;
+    }
+
+    #[getter]
+    fn limit(&self) -> usize {
+        self.inner.limit
+    }
+
+    #[setter]
+    fn set_limit(&mut self, limit: usize) {
+        self.inner.limit = limit;
+    }
+
+    #[getter]
+    fn candidate_budget(&self) -> Option<usize> {
+        self.inner.candidate_budget
+    }
+
+    #[setter]
+    fn set_candidate_budget(&mut self, candidate_budget: Option<usize>) {
+        self.inner.candidate_budget = candidate_budget;
+    }
+}
+
+#[pymethods]
+impl PyMemorySegment {
+    #[classmethod]
+    fn build(
+        _cls: &Bound<'_, PyType>,
+        segment_id: u64,
+        dim: usize,
+        records: Vec<Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let records = records
+            .into_iter()
+            .map(|record| memory_record_from_dict(&record))
+            .collect::<PyResult<Vec<_>>>()?;
+        let inner = MemorySegment::build(segment_id, dim, records).map_err(value_error)?;
+        Ok(Self { inner })
+    }
+
+    fn write(&self, path: PathBuf) -> PyResult<()> {
+        self.inner.write(path).map_err(io_error)
+    }
+
+    #[classmethod]
+    fn read(_cls: &Bound<'_, PyType>, path: PathBuf) -> PyResult<Self> {
+        let inner = MemorySegment::read(path).map_err(io_error)?;
+        Ok(Self { inner })
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+#[pymethods]
+impl PyMemoryManifestFile {
+    #[new]
+    #[pyo3(signature = (branch, segments, parent_manifest_id=None))]
+    fn new(
+        branch: &str,
+        segments: Vec<Bound<'_, PyDict>>,
+        parent_manifest_id: Option<u64>,
+    ) -> PyResult<Self> {
+        let branch_id = stable_memory_branch_id(branch);
+        let segments = segments
+            .into_iter()
+            .map(|segment| memory_manifest_segment_from_dict(&segment))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: MemoryManifestFile::new(parent_manifest_id, branch_id, segments),
+        })
+    }
+
+    #[getter]
+    fn manifest_id(&self) -> u64 {
+        self.inner.manifest_id
+    }
+
+    #[getter]
+    fn parent_manifest_id(&self) -> Option<u64> {
+        self.inner.parent_manifest_id
+    }
+
+    #[getter]
+    fn branch_id(&self) -> u64 {
+        self.inner.branch_id
+    }
+
+    fn write(&self, path: PathBuf) -> PyResult<()> {
+        self.inner.write(path).map_err(io_error)
+    }
+
+    #[classmethod]
+    fn read(_cls: &Bound<'_, PyType>, path: PathBuf) -> PyResult<Self> {
+        let inner = MemoryManifestFile::read(path).map_err(io_error)?;
+        Ok(Self { inner })
+    }
+}
+
+#[pymethods]
+impl PyMemorySpace {
+    #[classmethod]
+    fn open(_cls: &Bound<'_, PyType>, manifest_path: PathBuf) -> PyResult<Self> {
+        let inner = MemorySpace::open(manifest_path).map_err(io_error)?;
+        Ok(Self { inner })
+    }
+
+    fn recall(&self, py: Python<'_>, query: &PyRecallQuery) -> PyResult<PyObject> {
+        let result = self.inner.recall(&query.inner).map_err(value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("hits", memory_hits_to_py(py, &result.hits)?)?;
+        out.set_item("trace", memory_space_trace_to_py(py, &result.trace)?)?;
+        Ok(out.into())
+    }
+
+    fn fork(&self, branch: &str, out_path: PathBuf) -> PyResult<()> {
+        self.inner.fork(branch, out_path).map_err(io_error)
+    }
 }
 
 #[pymethods]
@@ -487,7 +735,141 @@ fn aperon(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAperonIndex>()?;
     module.add_class::<PyHlrRouter>()?;
     module.add_class::<PyHtlaRouter>()?;
+    module.add_class::<PyRecallQuery>()?;
+    module.add_class::<PyMemorySegment>()?;
+    module.add_class::<PyMemoryManifestFile>()?;
+    module.add_class::<PyMemorySpace>()?;
     Ok(())
+}
+
+fn memory_record_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<MemoryRecordInput> {
+    Ok(MemoryRecordInput {
+        record_id: required_item(dict, "record_id")?.extract()?,
+        scope_id: required_item(dict, "scope_id")?.extract()?,
+        timestamp: required_item(dict, "timestamp")?.extract()?,
+        source_id: required_item(dict, "source_id")?.extract()?,
+        confidence: required_item(dict, "confidence")?.extract()?,
+        text: required_item(dict, "text")?.extract()?,
+        embedding: required_item(dict, "embedding")?.extract()?,
+        symbols: required_item(dict, "symbols")?.extract()?,
+    })
+}
+
+fn memory_manifest_segment_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<MemoryManifestSegment> {
+    Ok(MemoryManifestSegment {
+        segment_id: required_item(dict, "segment_id")?.extract()?,
+        path: PathBuf::from(required_item(dict, "path")?.extract::<String>()?),
+        vector_sidecar: None,
+    })
+}
+
+fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+    dict.get_item(key)?
+        .ok_or_else(|| value_error(format!("missing required key: {key}")))
+}
+
+fn memory_hits_to_py(py: Python<'_>, hits: &[MemoryHit]) -> PyResult<Vec<PyObject>> {
+    hits.iter()
+        .map(|hit| {
+            let dict = PyDict::new(py);
+            dict.set_item("record_id", hit.record_id)?;
+            dict.set_item("score", hit.score)?;
+            dict.set_item("semantic_distance", hit.semantic_distance)?;
+            dict.set_item("symbol_matches", hit.symbol_matches)?;
+            dict.set_item("confidence", hit.confidence)?;
+            dict.set_item("timestamp", hit.timestamp)?;
+            dict.set_item("text", &hit.text)?;
+            Ok(dict.into())
+        })
+        .collect()
+}
+
+fn memory_space_trace_to_py(py: Python<'_>, trace: &MemorySpaceRecallTrace) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("manifest_id", trace.manifest_id)?;
+    dict.set_item("branch_id", trace.branch_id)?;
+    dict.set_item("segments_considered", trace.segments_considered)?;
+    dict.set_item("segments_scanned", trace.segments_scanned)?;
+    dict.set_item("segments_pruned", trace.segments_pruned)?;
+    dict.set_item("semantic_evals", trace.semantic_evals)?;
+    dict.set_item("returned", trace.returned)?;
+    let segment_traces = trace
+        .segment_traces
+        .iter()
+        .map(|segment_trace| memory_space_segment_trace_to_py(py, segment_trace))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("segment_traces", segment_traces)?;
+    Ok(dict.into())
+}
+
+fn memory_space_segment_trace_to_py(
+    py: Python<'_>,
+    trace: &MemorySpaceSegmentTrace,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("segment_id", trace.segment_id)?;
+    dict.set_item("pruned", trace.pruned)?;
+    dict.set_item("prune_reason", trace.prune_reason)?;
+    dict.set_item(
+        "trace",
+        match &trace.trace {
+            Some(trace) => Some(recall_trace_to_py(py, trace)?),
+            None => None,
+        },
+    )?;
+    Ok(dict.into())
+}
+
+fn recall_trace_to_py(py: Python<'_>, trace: &RecallTrace) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("segment_id", trace.segment_id)?;
+    dict.set_item("access_paths", trace.access_paths.clone())?;
+    dict.set_item("records_total", trace.records_total)?;
+    dict.set_item("candidates_after_filters", trace.candidates_after_filters)?;
+    dict.set_item("candidates_after_symbols", trace.candidates_after_symbols)?;
+    dict.set_item("vector_generator", trace.vector_generator)?;
+    dict.set_item("vector_candidates", trace.vector_candidates)?;
+    dict.set_item(
+        "vector_route",
+        match &trace.vector_route {
+            Some(route) => Some(vector_route_trace_to_py(py, route)?),
+            None => None,
+        },
+    )?;
+    dict.set_item(
+        "planner",
+        match &trace.planner {
+            Some(planner) => Some(planner_trace_to_py(py, planner)?),
+            None => None,
+        },
+    )?;
+    dict.set_item("semantic_evals", trace.semantic_evals)?;
+    dict.set_item("returned", trace.returned)?;
+    Ok(dict.into())
+}
+
+fn vector_route_trace_to_py(py: Python<'_>, trace: &MemoryVectorRouteTrace) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("vector_index_bytes", trace.vector_index_bytes)?;
+    dict.set_item("route_candidates", trace.route_candidates)?;
+    dict.set_item("posting_entries_touched", trace.posting_entries_touched)?;
+    dict.set_item("duplicate_block_rate", trace.duplicate_block_rate)?;
+    dict.set_item("selected_blocks", trace.selected_blocks)?;
+    dict.set_item("centroid_evals", trace.centroid_evals)?;
+    dict.set_item("working_set_bytes", trace.working_set_bytes)?;
+    dict.set_item("fallback_used", trace.fallback_used)?;
+    Ok(dict.into())
+}
+
+fn planner_trace_to_py(py: Python<'_>, trace: &MemoryQueryPlannerTrace) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("selected_path", trace.selected_path)?;
+    dict.set_item("candidate_budget", trace.candidate_budget)?;
+    dict.set_item("expanded_candidate_budget", trace.expanded_candidate_budget)?;
+    dict.set_item("fallback_reason", trace.fallback_reason)?;
+    dict.set_item("candidates_after_symbols", trace.candidates_after_symbols)?;
+    dict.set_item("final_candidates", trace.final_candidates)?;
+    Ok(dict.into())
 }
 
 fn hlr_configs(layer_configs: Vec<(usize, f32)>) -> Vec<HierarchicalLatticeLayerConfig> {
@@ -722,5 +1104,139 @@ mod tests {
             assert_eq!(results[0].0, 2);
             assert!((results[0].1 - 1.0).abs() < 1.0);
         });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn memory_sstable_python_workflow_round_trip() {
+        pyo3::prepare_freethreaded_python();
+        let dir = std::env::temp_dir().join(format!(
+            "aperon-py-memory-sstable-{}-{}",
+            process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let segment_path = dir.join("segment-191.apms");
+        let manifest_path = dir.join("main.apmf");
+        let fork_path = dir.join("fork.apmf");
+
+        Python::with_gil(|py| {
+            let record_a = PyDict::new(py);
+            record_a.set_item("record_id", 191001_u64).unwrap();
+            record_a.set_item("scope_id", 7_u32).unwrap();
+            record_a.set_item("timestamp", 191_i64).unwrap();
+            record_a.set_item("source_id", 1_u16).unwrap();
+            record_a.set_item("confidence", 0.97_f32).unwrap();
+            record_a
+                .set_item("text", "T-191 exposes Memory SSTable bindings.")
+                .unwrap();
+            record_a
+                .set_item("embedding", vec![1.0_f32, 0.0, 0.0, 0.0])
+                .unwrap();
+            record_a
+                .set_item("symbols", vec!["T-191", "python"])
+                .unwrap();
+
+            let record_b = PyDict::new(py);
+            record_b.set_item("record_id", 191002_u64).unwrap();
+            record_b.set_item("scope_id", 7_u32).unwrap();
+            record_b.set_item("timestamp", 192_i64).unwrap();
+            record_b.set_item("source_id", 1_u16).unwrap();
+            record_b.set_item("confidence", 0.90_f32).unwrap();
+            record_b
+                .set_item("text", "Unrelated memory record.")
+                .unwrap();
+            record_b
+                .set_item("embedding", vec![0.0_f32, 1.0, 0.0, 0.0])
+                .unwrap();
+            record_b.set_item("symbols", vec!["other"]).unwrap();
+
+            let segment = PyMemorySegment::build(
+                &py.get_type::<PyMemorySegment>(),
+                191,
+                4,
+                vec![record_a, record_b],
+            )
+            .unwrap();
+            assert_eq!(segment.len(), 2);
+            segment.write(segment_path.clone()).unwrap();
+
+            let manifest_segment = PyDict::new(py);
+            manifest_segment.set_item("segment_id", 191_u64).unwrap();
+            manifest_segment
+                .set_item("path", "segment-191.apms")
+                .unwrap();
+            let manifest = PyMemoryManifestFile::new("main", vec![manifest_segment], None).unwrap();
+            manifest.write(manifest_path.clone()).unwrap();
+
+            let space = PyMemorySpace::open(&py.get_type::<PyMemorySpace>(), manifest_path.clone())
+                .unwrap();
+            let query = PyRecallQuery::new(
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+                vec!["python".to_string()],
+                Some(7),
+                None,
+                None,
+                Some(0.95),
+                5,
+                Some(10),
+            );
+
+            let result = space.recall(py, &query).unwrap();
+            let result = result.bind(py).downcast::<PyDict>().unwrap();
+            let hits = result
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                191001
+            );
+
+            let trace = result.get_item("trace").unwrap().unwrap();
+            let trace = trace.downcast::<PyDict>().unwrap();
+            assert_eq!(
+                trace
+                    .get_item("segments_scanned")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                trace
+                    .get_item("returned")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+
+            space
+                .fork("python-experimental-branch", fork_path.clone())
+                .unwrap();
+            let forked = PyMemoryManifestFile::read(
+                &py.get_type::<PyMemoryManifestFile>(),
+                fork_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(forked.parent_manifest_id(), Some(manifest.manifest_id()));
+            assert_ne!(forked.manifest_id(), manifest.manifest_id());
+        });
+
+        fs::remove_file(segment_path).unwrap();
+        fs::remove_file(manifest_path).unwrap();
+        fs::remove_file(fork_path).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }

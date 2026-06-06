@@ -51,7 +51,97 @@ aperon.AperonIndex(
 
 ---
 
-## 2. `HlrRouter`
+## 2. Memory SSTable Bindings
+
+The high-level Memory SSTable API exposes immutable segment files, versioned manifests, symbolic filters, semantic recall, query tracing, and zero-copy manifest forks.
+
+### `RecallQuery`
+```python
+aperon.RecallQuery(
+    embedding: list[float] | None = None,
+    symbols: list[str] = [],
+    scope_id: int | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    min_confidence: float | None = None,
+    limit: int = 10,
+    candidate_budget: int | None = None,
+)
+```
+
+All constructor fields are exposed as mutable Python properties.
+
+### `MemorySegment`
+* **`MemorySegment.build(segment_id: int, dim: int, records: list[dict]) -> MemorySegment`**  
+  Builds an immutable segment from record dictionaries containing `record_id`, `scope_id`, `timestamp`, `source_id`, `confidence`, `text`, `embedding`, and `symbols`.
+* **`write(path: str)`**  
+  Writes an `.apms` segment file.
+* **`read(path: str) -> MemorySegment`**  
+  Loads an `.apms` segment file.
+* **`len() -> int`**  
+  Returns the number of records in the segment.
+
+### `MemoryManifestFile`
+```python
+aperon.MemoryManifestFile(
+    branch: str,
+    segments: list[dict],
+    parent_manifest_id: int | None = None,
+)
+```
+
+Each segment dictionary must contain `segment_id` and `path`. Segment paths may be relative to the manifest file directory.
+
+* **`write(path: str)`**  
+  Writes a versioned `.apmf` manifest.
+* **`read(path: str) -> MemoryManifestFile`**  
+  Loads a manifest file.
+* **`manifest_id`, `parent_manifest_id`, `branch_id`**  
+  Read-only manifest metadata properties.
+
+### `MemorySpace`
+* **`MemorySpace.open(manifest_path: str) -> MemorySpace`**  
+  Opens a manifest-backed memory space and loads active segment files.
+* **`recall(query: RecallQuery) -> dict`**  
+  Returns `{"hits": [...], "trace": {...}}`, where hit dictionaries contain `record_id`, `score`, `semantic_distance`, `symbol_matches`, `confidence`, `timestamp`, and `text`.
+* **`fork(branch: str, out_path: str)`**  
+  Writes a zero-copy child manifest pointing at the same segment files.
+
+```python
+records = [{
+    "record_id": 191001,
+    "scope_id": 7,
+    "timestamp": 191,
+    "source_id": 1,
+    "confidence": 0.97,
+    "text": "T-191 exposes Memory SSTable bindings.",
+    "embedding": [1.0, 0.0, 0.0, 0.0],
+    "symbols": ["T-191", "python"],
+}]
+
+segment = aperon.MemorySegment.build(segment_id=191, dim=4, records=records)
+segment.write("segment-191.apms")
+
+manifest = aperon.MemoryManifestFile(
+    branch="main",
+    segments=[{"segment_id": 191, "path": "segment-191.apms"}],
+)
+manifest.write("main.apmf")
+
+space = aperon.MemorySpace.open("main.apmf")
+query = aperon.RecallQuery(
+    embedding=[1.0, 0.0, 0.0, 0.0],
+    symbols=["python"],
+    scope_id=7,
+    limit=5,
+)
+result = space.recall(query)
+space.fork("experiment", "experiment.apmf")
+```
+
+---
+
+## 3. `HlrRouter`
 
 A hierarchical routing coordinator for mapping vectors to clustered grid keys.
 
@@ -68,7 +158,7 @@ aperon.HlrRouter(dim: int, vectors: np.ndarray, layer_configs: list[tuple[int, f
 
 ---
 
-## 3. `HtlaRouter`
+## 4. `HtlaRouter`
 
 A tangent-space Hierarchical Tangent Lattice Atlas router.
 

@@ -21,10 +21,15 @@ Represents an active, queryable semantic space loaded from a manifest log.
 A 5-layer query planner that routes queries through direct metadata scans, flat vector scans, array-like indexes, pivot-prefix indexes, or HTLA routing pipelines.
 
 ### Associated Methods
-* **`new(config: MemoryQueryPlannerConfig) -> Self`**  
-  Creates a query planner instance with custom thresholds.
-* **`recall(&self, space: &MemorySpace, query: &RecallQuery) -> Result<(Vec<MemoryHit>, MemorySpaceRecallTrace), String>`**  
-  Routes the query across active space segments and returns matching hits and structured performance traces.
+* **`build(segment: &MemorySegment, config: MemoryQueryPlannerConfig) -> Result<Self, String>`**  
+  Builds a query planner instance for a specific segment.
+* **`build_default(segment: &MemorySegment) -> Result<Self, String>`**  
+  Builds a query planner instance for a specific segment with default configurations.
+
+### Trait Implementation (`MemoryVectorCandidateGenerator` for `MemoryQueryPlanner`)
+* **`candidates(&self, segment: &MemorySegment, query: &RecallQuery, candidates_after_symbols: &[u32]) -> Result<Vec<u32>, String>`**  
+  Routes the query across active segment access paths and generates matching candidates.
+
 
 ### Config Options (`MemoryQueryPlannerConfig`)
 - `direct_candidate_threshold`: Scans metadata directly if candidates are below this limit (bypassing vector indexes).
