@@ -704,10 +704,18 @@ impl AperonIndex {
         Ok(())
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
     pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredVector>, String> {
         self.search_internal(query, top_k, self.rerank_factor)
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
     pub fn search_with_nprobe(
         &self,
         query: &[f32],
@@ -715,6 +723,27 @@ impl AperonIndex {
         nprobe: usize,
     ) -> Result<Vec<ScoredVector>, String> {
         self.search_with_nprobe_internal(query, top_k, nprobe, self.rerank_factor)
+    }
+
+    pub fn search_mode_a(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        nprobe: usize,
+        rerank_factor: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        self.search_with_nprobe_internal(query, top_k, nprobe, rerank_factor)
+    }
+
+    #[allow(deprecated)]
+    pub fn search_mode_b(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> Result<Vec<ScoredVector>, String> {
+        self.search_tiered_with_nprobe(query, top_k, nprobe, candidate_k)
     }
 
     pub fn search_internal(
@@ -848,6 +877,10 @@ impl AperonIndex {
         Ok(candidates)
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
     pub fn search_tiered_with_nprobe(
         &self,
         query: &[f32],

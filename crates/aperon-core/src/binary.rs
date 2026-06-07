@@ -768,4 +768,319 @@ mod tests {
         let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
         assert_eq!(loaded, index);
     }
+
+    #[test]
+    fn test_legacy_version_compatibility() {
+        fn write_u32_le(buf: &mut Vec<u8>, val: u32) {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+
+        fn write_f32_le(buf: &mut Vec<u8>, val: f32) {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+
+        fn write_u8_val(buf: &mut Vec<u8>, val: u8) {
+            buf.push(val);
+        }
+
+        // ==========================================
+        // 1. Single Format Tests (HNTL)
+        // ==========================================
+
+        // Version 1 Single (HNTL)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTL");
+            write_u32_le(&mut buf, 1); // version
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+                                       // body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data (num_blocks (1) * block_bytes (16))
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Single(single) = loaded {
+                assert_eq!(single.num_vectors, 2);
+                assert_eq!(single.dimension, 2);
+                assert_eq!(single.residual_bits, 8); // Assumed default for v1
+            } else {
+                panic!("Expected LegacyIndex::Single");
+            }
+        }
+
+        // Version 2 Single (HNTL)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTL");
+            write_u32_le(&mut buf, 2); // version
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+                                       // body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Single(single) = loaded {
+                assert_eq!(single.num_vectors, 2);
+                assert_eq!(single.residual_bits, 8);
+            } else {
+                panic!("Expected LegacyIndex::Single");
+            }
+        }
+
+        // Version 3 Single (HNTL)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTL");
+            write_u32_le(&mut buf, 3); // version
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 2); // residual_bits (2 bits)
+                                       // body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Single(single) = loaded {
+                assert_eq!(single.num_vectors, 2);
+                assert_eq!(single.residual_bits, 2);
+            } else {
+                panic!("Expected LegacyIndex::Single");
+            }
+        }
+
+        // Version 4 Single (HNTL)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTL");
+            write_u32_le(&mut buf, 4); // version
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 1); // residual_bits (1 bit)
+                                       // body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Single(single) = loaded {
+                assert_eq!(single.num_vectors, 2);
+                assert_eq!(single.residual_bits, 1);
+            } else {
+                panic!("Expected LegacyIndex::Single");
+            }
+        }
+
+        // ==========================================
+        // 2. Multi Format Tests (HNTM)
+        // ==========================================
+
+        // Version 1 Multi (HNTM)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTM");
+            write_u32_le(&mut buf, 1); // version
+            write_u32_le(&mut buf, 1); // num_centroids
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+                                       // centroids
+            write_f32_le(&mut buf, 0.5);
+            write_f32_le(&mut buf, 0.5);
+            // grains
+            write_u32_le(&mut buf, 2); // num_vectors for embedded single
+                                       // embedded single body (version < 3, so configs are inherited, no config prefix)
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Multi(multi) = loaded {
+                assert_eq!(multi.num_centroids, 1);
+                assert_eq!(multi.num_vectors, 2);
+                assert_eq!(multi.residual_bits, 8); // default
+                assert_eq!(multi.grains[0].num_vectors, 2);
+                assert_eq!(multi.grains[0].residual_bits, 8); // inherited
+            } else {
+                panic!("Expected LegacyIndex::Multi");
+            }
+        }
+
+        // Version 2 Multi (HNTM)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTM");
+            write_u32_le(&mut buf, 2); // version
+            write_u32_le(&mut buf, 1); // num_centroids
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+                                       // centroids
+            write_f32_le(&mut buf, 0.5);
+            write_f32_le(&mut buf, 0.5);
+            // grains
+            write_u32_le(&mut buf, 2); // num_vectors for embedded single
+                                       // embedded single body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Multi(multi) = loaded {
+                assert_eq!(multi.num_centroids, 1);
+                assert_eq!(multi.grains[0].num_vectors, 2);
+            } else {
+                panic!("Expected LegacyIndex::Multi");
+            }
+        }
+
+        // Version 3 Multi (HNTM)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTM");
+            write_u32_le(&mut buf, 3); // version
+            write_u32_le(&mut buf, 1); // num_centroids
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+                                       // centroids
+            write_f32_le(&mut buf, 0.5);
+            write_f32_le(&mut buf, 0.5);
+            // grains
+            // embedded single (version >= 3, has configs serialized in each grain)
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+                                       // embedded single body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Multi(multi) = loaded {
+                assert_eq!(multi.num_centroids, 1);
+                assert_eq!(multi.grains[0].num_vectors, 2);
+            } else {
+                panic!("Expected LegacyIndex::Multi");
+            }
+        }
+
+        // Version 4 Multi (HNTM)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTM");
+            write_u32_le(&mut buf, 4); // version
+            write_u32_le(&mut buf, 1); // num_centroids
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 2); // dimension
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+            write_u8_val(&mut buf, V4_FORMAT_LEGACY); // format byte (V4_FORMAT_LEGACY)
+                                                      // centroids
+            write_f32_le(&mut buf, 0.5);
+            write_f32_le(&mut buf, 0.5);
+            // grains
+            write_u32_le(&mut buf, 2); // num_vectors
+            write_u32_le(&mut buf, 1); // local_dim
+            write_u32_le(&mut buf, 2); // block_size
+            write_u32_le(&mut buf, 0); // sketch_dim
+            write_u8_val(&mut buf, 8); // residual_bits
+                                       // embedded single body
+            write_f32_le(&mut buf, 0.0);
+            write_f32_le(&mut buf, 0.0); // mean
+            write_f32_le(&mut buf, 1.0);
+            write_f32_le(&mut buf, 1.0); // projection
+            write_f32_le(&mut buf, 1.0); // proj_scales
+            write_f32_le(&mut buf, 1.0); // residual_scale
+            buf.extend_from_slice(&[0; 16]); // block_data
+
+            let loaded = load_legacy_index(Cursor::new(buf)).unwrap();
+            if let LegacyIndex::Multi(multi) = loaded {
+                assert_eq!(multi.num_centroids, 1);
+                assert_eq!(multi.grains[0].num_vectors, 2);
+            } else {
+                panic!("Expected LegacyIndex::Multi");
+            }
+        }
+
+        // ==========================================
+        // 3. Breaking Changes / Error Tests
+        // ==========================================
+
+        // Invalid magic header
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"BAD!");
+            write_u32_le(&mut buf, 4);
+            let err = load_legacy_index(Cursor::new(buf));
+            assert!(err.is_err());
+            assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+
+        // Unsupported version (version = 5)
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"HNTL");
+            write_u32_le(&mut buf, 5); // Version 5 (unsupported)
+            let err = load_legacy_index(Cursor::new(buf));
+            assert!(err.is_err());
+            assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
 }

@@ -2782,7 +2782,8 @@ fn lock_file(file: &std::fs::File) -> io::Result<()> {
     let res = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if res != 0 {
         let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "WAL file is already locked by another process or cloned MemorySpace writer",
@@ -5131,10 +5132,10 @@ mod tests {
     #[test]
     fn test_wal_exclusive_lock() {
         let path = temp_wal_path("exclusive_lock");
-        
+
         // 1. Open first writer (holds lock)
         let _writer1 = WALWriter::open(&path).unwrap();
-        
+
         // 2. Open second writer on the same path (should fail because of lock)
         let writer2_res = WALWriter::open(&path);
         assert!(writer2_res.is_err());

@@ -641,14 +641,120 @@ impl PyAperonIndex {
         self.inner.enable_hlr_routing(&configs).map_err(value_error)
     }
 
+    #[pyo3(signature = (query, top_k, nprobe, rerank_factor))]
+    fn search_mode_a(
+        &self,
+        query: Vec<f32>,
+        top_k: usize,
+        nprobe: usize,
+        rerank_factor: usize,
+    ) -> PyResult<Vec<(u64, f64)>> {
+        let results = self
+            .inner
+            .search_mode_a(&query, top_k, nprobe, rerank_factor)
+            .map_err(value_error)?;
+
+        Ok(results
+            .into_iter()
+            .map(|scored| (scored.id.get(), scored.distance))
+            .collect())
+    }
+
+    #[pyo3(signature = (query, top_k, nprobe, candidate_k))]
+    fn search_mode_b(
+        &self,
+        query: Vec<f32>,
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> PyResult<Vec<(u64, f64)>> {
+        let results = self
+            .inner
+            .search_mode_b(&query, top_k, nprobe, candidate_k)
+            .map_err(value_error)?;
+
+        Ok(results
+            .into_iter()
+            .map(|scored| (scored.id.get(), scored.distance))
+            .collect())
+    }
+
+    #[pyo3(signature = (queries, top_k, nprobe, rerank_factor))]
+    fn search_many_mode_a(
+        &self,
+        queries: PyReadonlyArray2<'_, f32>,
+        top_k: usize,
+        nprobe: usize,
+        rerank_factor: usize,
+    ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let array = queries.as_array();
+        let mut all_results = Vec::with_capacity(array.shape()[0]);
+        for row in array.outer_iter() {
+            let query: Vec<f32> = row.iter().copied().collect();
+            let results = self
+                .inner
+                .search_mode_a(&query, top_k, nprobe, rerank_factor)
+                .map_err(value_error)?;
+
+            let mapped = results
+                .into_iter()
+                .map(|scored| (scored.id.get(), scored.distance))
+                .collect();
+            all_results.push(mapped);
+        }
+        Ok(all_results)
+    }
+
+    #[pyo3(signature = (queries, top_k, nprobe, candidate_k))]
+    fn search_many_mode_b(
+        &self,
+        queries: PyReadonlyArray2<'_, f32>,
+        top_k: usize,
+        nprobe: usize,
+        candidate_k: usize,
+    ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let array = queries.as_array();
+        let mut all_results = Vec::with_capacity(array.shape()[0]);
+        for row in array.outer_iter() {
+            let query = row.iter().copied().collect::<Vec<_>>();
+            let results = self
+                .inner
+                .search_mode_b(&query, top_k, nprobe, candidate_k)
+                .map_err(value_error)?;
+
+            let mapped = results
+                .into_iter()
+                .map(|scored| (scored.id.get(), scored.distance))
+                .collect();
+            all_results.push(mapped);
+        }
+        Ok(all_results)
+    }
+
     #[pyo3(signature = (query, top_k, nprobe=None, rerank_factor=None))]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
+    #[allow(deprecated)]
     fn search(
         &self,
+        py: Python<'_>,
         query: Vec<f32>,
         top_k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
     ) -> PyResult<Vec<(u64, f64)>> {
+        let warnings = py.import("warnings")?;
+        let deprecation_warning = py.import("builtins")?.getattr("DeprecationWarning")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "AperonIndex.search is deprecated. Please use search_mode_a or search_mode_b instead.",
+                deprecation_warning,
+            ),
+        )?;
+
         let results = match (nprobe, rerank_factor) {
             (Some(np), Some(rf)) => self
                 .inner
@@ -666,13 +772,29 @@ impl PyAperonIndex {
     }
 
     #[pyo3(signature = (queries, top_k, nprobe=None, rerank_factor=None))]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
+    #[allow(deprecated)]
     fn search_many(
         &self,
+        py: Python<'_>,
         queries: PyReadonlyArray2<'_, f32>,
         top_k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
     ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let warnings = py.import("warnings")?;
+        let deprecation_warning = py.import("builtins")?.getattr("DeprecationWarning")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "AperonIndex.search_many is deprecated. Please use search_many_mode_a or search_many_mode_b instead.",
+                deprecation_warning,
+            ),
+        )?;
+
         let array = queries.as_array();
         let mut all_results = Vec::with_capacity(array.shape()[0]);
         for row in array.outer_iter() {
@@ -697,13 +819,29 @@ impl PyAperonIndex {
     }
 
     #[pyo3(signature = (query, top_k, nprobe, candidate_k=100))]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
+    #[allow(deprecated)]
     fn search_tiered(
         &self,
+        py: Python<'_>,
         query: Vec<f32>,
         top_k: usize,
         nprobe: usize,
         candidate_k: usize,
     ) -> PyResult<Vec<(u64, f64)>> {
+        let warnings = py.import("warnings")?;
+        let deprecation_warning = py.import("builtins")?.getattr("DeprecationWarning")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "AperonIndex.search_tiered is deprecated. Please use search_mode_b instead.",
+                deprecation_warning,
+            ),
+        )?;
+
         let results = self
             .inner
             .search_tiered_with_nprobe(&query, top_k, nprobe, candidate_k)
@@ -715,13 +853,29 @@ impl PyAperonIndex {
     }
 
     #[pyo3(signature = (queries, top_k, nprobe, candidate_k=100))]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Please use search_mode_a or search_mode_b instead"
+    )]
+    #[allow(deprecated)]
     fn search_many_tiered(
         &self,
+        py: Python<'_>,
         queries: PyReadonlyArray2<'_, f32>,
         top_k: usize,
         nprobe: usize,
         candidate_k: usize,
     ) -> PyResult<Vec<Vec<(u64, f64)>>> {
+        let warnings = py.import("warnings")?;
+        let deprecation_warning = py.import("builtins")?.getattr("DeprecationWarning")?;
+        warnings.call_method1(
+            "warn",
+            (
+                "AperonIndex.search_many_tiered is deprecated. Please use search_many_mode_b instead.",
+                deprecation_warning,
+            ),
+        )?;
+
         let array = queries.as_array();
         let mut all_results = Vec::with_capacity(array.shape()[0]);
         for row in array.outer_iter() {
@@ -1129,7 +1283,7 @@ mod tests {
         let loaded = PyAperonIndex::load_path(path.clone()).unwrap();
         fs::remove_file(path).unwrap();
 
-        let results = loaded.search(vec![9.0, 0.0], 1, None, None).unwrap();
+        let results = loaded.search_mode_a(vec![9.0, 0.0], 1, 1, 4).unwrap();
         assert_eq!(results[0].0, 1);
         Python::with_gil(|py| {
             let stats = loaded.stats(py).unwrap();
@@ -1167,7 +1321,7 @@ mod tests {
 
             assert_eq!(inserted, 2);
             assert_eq!(
-                index.search(vec![1.8, 0.0], 1, None, None).unwrap()[0].0,
+                index.search_mode_a(vec![1.8, 0.0], 1, 1, 4).unwrap()[0].0,
                 11
             );
         });
@@ -1191,10 +1345,30 @@ mod tests {
             index.rebuild_single_grain().unwrap();
 
             // Reranking should find the correct nearest neighbor
-            let results = index.search(vec![9.0, 0.0, 0.0], 1, None, Some(4)).unwrap();
+            let results = index.search_mode_a(vec![9.0, 0.0, 0.0], 1, 1, 4).unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 2);
             assert!((results[0].1 - 1.0).abs() < 1.0);
+        });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_search_apis() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut index = PyAperonIndex::new(2, None, 0, 4, 4, 8).unwrap();
+            let id = 7_u64.into_pyobject(py).unwrap();
+            let vector = vec![1.0, 2.0].into_pyobject(py).unwrap();
+            index.insert(id.as_any(), Some(vector.as_any())).unwrap();
+
+            // Test deprecated search method
+            let results = index.search(py, vec![1.0, 2.0], 1, None, None).unwrap();
+            assert_eq!(results[0].0, 7);
+
+            // Test deprecated search_tiered method
+            let results_tiered = index.search_tiered(py, vec![1.0, 2.0], 1, 1, 1).unwrap();
+            assert_eq!(results_tiered[0].0, 7);
         });
     }
 
