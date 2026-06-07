@@ -891,6 +891,8 @@ fn recall_space_with_generators(
             semantic_evals,
             returned: hits.len(),
             segment_traces,
+            cold_bytes_read: 0,
+            read_amplification: 0.0,
         },
         hits,
     })
@@ -1231,6 +1233,8 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 min_confidence: Some(0.90),
                 limit: 3,
                 candidate_budget: Some(16),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
         ),
         prepared_scenario(
@@ -1253,6 +1257,8 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 min_confidence: Some(0.90),
                 limit: 3,
                 candidate_budget: Some(8),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
         ),
         prepared_scenario(
@@ -1275,6 +1281,8 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 min_confidence: None,
                 limit: 3,
                 candidate_budget: Some(32),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
         ),
         prepared_scenario(
@@ -1296,6 +1304,8 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 min_confidence: Some(0.90),
                 limit: 3,
                 candidate_budget: Some(8),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
         ),
         prepared_scenario(
@@ -1318,6 +1328,8 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 min_confidence: Some(0.90),
                 limit: 3,
                 candidate_budget: Some(8),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
         ),
         route_fallback_scenario(),
@@ -1344,6 +1356,8 @@ fn route_fallback_scenario() -> Scenario {
                 text: format!("route fallback benchmark record {i}"),
                 embedding: vec![i as f32, 0.0, 0.0, 0.0],
                 symbols: symbols.into_iter().map(str::to_string).collect(),
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
             },
         });
     }
@@ -1365,6 +1379,8 @@ fn route_fallback_scenario() -> Scenario {
                 min_confidence: Some(0.95),
                 limit: 3,
                 candidate_budget: Some(1),
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
             expected_record_id: 250_127,
         }],
@@ -1413,6 +1429,8 @@ fn prepared_record(
             text: format!("prepared memory benchmark record {record_id}"),
             embedding: embedding.to_vec(),
             symbols: symbols.iter().map(|symbol| (*symbol).to_string()).collect(),
+            vector_id: None,
+            metadata: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -1446,6 +1464,8 @@ fn synthetic_scenario(
                 text: format!("synthetic memory record {id} in scope {scope_id} topic {topic_id}"),
                 embedding,
                 symbols: vec![format!("scope-{scope_id}"), format!("topic-{topic_id}")],
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
             },
         });
     }
@@ -1464,6 +1484,8 @@ fn synthetic_scenario(
                 min_confidence: Some((record.confidence - 0.001).max(0.0)),
                 limit: 10,
                 candidate_budget: None,
+                vector_id: None,
+                metadata_filter: std::collections::BTreeMap::new(),
             },
             expected_record_id: record.record_id,
         });
@@ -1510,6 +1532,8 @@ fn synthetic_broad_semantic_scenario(
             min_confidence: None,
             limit: 10,
             candidate_budget: Some(candidate_budget),
+            vector_id: None,
+            metadata_filter: std::collections::BTreeMap::new(),
         };
         query.expected_record_id = record.record_id;
     }
@@ -1616,6 +1640,8 @@ fn read_jsonl(path: &Path) -> Result<Vec<BenchRecord>, String> {
                 text: record.text,
                 embedding: record.embedding,
                 symbols: record.symbols,
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
             },
         });
     }
@@ -1635,6 +1661,8 @@ fn read_query(path: &Path) -> Result<RecallQuery, String> {
         min_confidence: query.min_confidence,
         limit: query.limit,
         candidate_budget: query.candidate_budget,
+        vector_id: None,
+        metadata_filter: std::collections::BTreeMap::new(),
     })
 }
 

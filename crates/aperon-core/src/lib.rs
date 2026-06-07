@@ -18,13 +18,14 @@ pub use index::{AperonIndex, IndexStats};
 pub use layout::{BlockSoaLayout, VectorId, DEFAULT_BLOCK_SIZE};
 pub use memory_sstable::{
     stable_memory_branch_id, ArrayLikeMemoryVectorCandidateGenerator, ArrayLikeMemoryVectorIndex,
-    FlatMemoryVectorCandidateGenerator, HtlaMemoryVectorCandidateGenerator, HtlaMemoryVectorConfig,
-    LoadedMemorySegment, MemoryHit, MemoryManifest, MemoryManifestFile, MemoryManifestSegment,
-    MemoryQueryPlanner, MemoryQueryPlannerConfig, MemoryQueryPlannerTrace, MemoryRecordInput,
-    MemorySegment, MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace,
-    MemorySpaceSegmentTrace, MemoryVectorCandidateGenerator, MemoryVectorRouteTrace,
-    MemoryVectorSidecarFile, MemoryVectorSidecarRef, PivotPrefixMemoryVectorCandidateGenerator,
-    RecallQuery, RecallResult, RecallTrace,
+    ColdVectorStore, Collection, FlatMemoryVectorCandidateGenerator,
+    HtlaMemoryVectorCandidateGenerator, HtlaMemoryVectorConfig, LoadedMemorySegment, MemTable,
+    MemoryHit, MemoryManifest, MemoryManifestFile, MemoryManifestSegment, MemoryQueryPlanner,
+    MemoryQueryPlannerConfig, MemoryQueryPlannerTrace, MemoryRecordInput, MemorySegment,
+    MemorySpace, MemorySpaceRecallResult, MemorySpaceRecallTrace, MemorySpaceSegmentTrace,
+    MemoryVectorCandidateGenerator, MemoryVectorRouteTrace, MemoryVectorSidecarFile,
+    MemoryVectorSidecarRef, PivotPrefixMemoryVectorCandidateGenerator, RecallQuery, RecallResult,
+    RecallTrace, VectorEncoding, WALEntry, WALReader, WALWriter,
 };
 pub use pivot_prefix::{
     coverage, exact_topk, sample_centroids, DensePivotSketch, PivotPrefixConfig, PivotPrefixRouter,

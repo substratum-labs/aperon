@@ -88,5 +88,7 @@ fn record(
         text: text.to_string(),
         embedding: embedding.to_vec(),
         symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
+        vector_id: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }

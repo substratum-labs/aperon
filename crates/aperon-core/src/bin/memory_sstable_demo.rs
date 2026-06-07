@@ -103,6 +103,8 @@ fn build(input: &Path, out: &Path) -> Result<(), String> {
                 text: record.text,
                 embedding: record.embedding,
                 symbols: record.symbols,
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
             });
     }
 
@@ -249,6 +251,8 @@ fn read_query(path: &Path) -> Result<RecallQuery, String> {
         min_confidence: query.min_confidence,
         limit: query.limit,
         candidate_budget: query.candidate_budget,
+        vector_id: None,
+        metadata_filter: std::collections::BTreeMap::new(),
     })
 }
 

@@ -63,7 +63,9 @@ impl PyRecallQuery {
         time_end=None,
         min_confidence=None,
         limit=10,
-        candidate_budget=None
+        candidate_budget=None,
+        vector_id=None,
+        metadata_filter=None
     ))]
     fn new(
         embedding: Option<Vec<f32>>,
@@ -74,6 +76,8 @@ impl PyRecallQuery {
         min_confidence: Option<f32>,
         limit: usize,
         candidate_budget: Option<usize>,
+        vector_id: Option<String>,
+        metadata_filter: Option<std::collections::BTreeMap<String, String>>,
     ) -> Self {
         Self {
             inner: RecallQuery {
@@ -85,6 +89,8 @@ impl PyRecallQuery {
                 min_confidence,
                 limit,
                 candidate_budget,
+                vector_id,
+                metadata_filter: metadata_filter.unwrap_or_default(),
             },
         }
     }
@@ -167,6 +173,26 @@ impl PyRecallQuery {
     #[setter]
     fn set_candidate_budget(&mut self, candidate_budget: Option<usize>) {
         self.inner.candidate_budget = candidate_budget;
+    }
+
+    #[getter]
+    fn vector_id(&self) -> Option<String> {
+        self.inner.vector_id.clone()
+    }
+
+    #[setter]
+    fn set_vector_id(&mut self, vector_id: Option<String>) {
+        self.inner.vector_id = vector_id;
+    }
+
+    #[getter]
+    fn metadata_filter(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.metadata_filter.clone()
+    }
+
+    #[setter]
+    fn set_metadata_filter(&mut self, metadata_filter: std::collections::BTreeMap<String, String>) {
+        self.inner.metadata_filter = metadata_filter;
     }
 }
 
@@ -269,6 +295,54 @@ impl PyMemorySpace {
 
     fn fork(&self, branch: &str, out_path: PathBuf) -> PyResult<()> {
         self.inner.fork(branch, out_path).map_err(io_error)
+    }
+
+    fn insert(&mut self, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
+        let record = memory_record_from_dict(record_dict)?;
+        self.inner.insert(record).map_err(io_error)
+    }
+
+    fn delete(&mut self, record_id: u64) -> PyResult<()> {
+        self.inner.delete(record_id).map_err(io_error)
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.inner.flush().map_err(io_error)
+    }
+}
+
+#[pyclass(name = "Collection")]
+struct PyCollection {
+    inner: aperon_core::Collection,
+}
+
+#[pymethods]
+impl PyCollection {
+    #[classmethod]
+    fn open(_cls: &Bound<'_, PyType>, collection_dir: PathBuf, name: String) -> PyResult<Self> {
+        let inner = aperon_core::Collection::open(collection_dir, name).map_err(io_error)?;
+        Ok(Self { inner })
+    }
+
+    fn insert(&mut self, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
+        let record = memory_record_from_dict(record_dict)?;
+        self.inner.insert(record).map_err(io_error)
+    }
+
+    fn delete(&mut self, record_id: u64) -> PyResult<()> {
+        self.inner.delete(record_id).map_err(io_error)
+    }
+
+    fn recall(&self, py: Python<'_>, query: &PyRecallQuery) -> PyResult<PyObject> {
+        let result = self.inner.recall(&query.inner).map_err(value_error)?;
+        let out = PyDict::new(py);
+        out.set_item("hits", memory_hits_to_py(py, &result.hits)?)?;
+        out.set_item("trace", memory_space_trace_to_py(py, &result.trace)?)?;
+        Ok(out.into())
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.inner.flush().map_err(io_error)
     }
 }
 
@@ -739,10 +813,20 @@ fn aperon(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMemorySegment>()?;
     module.add_class::<PyMemoryManifestFile>()?;
     module.add_class::<PyMemorySpace>()?;
+    module.add_class::<PyCollection>()?;
     Ok(())
 }
 
 fn memory_record_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<MemoryRecordInput> {
+    let vector_id = dict
+        .get_item("vector_id")?
+        .map(|v| v.extract())
+        .transpose()?;
+    let metadata = dict
+        .get_item("metadata")?
+        .map(|m| m.extract::<std::collections::BTreeMap<String, String>>())
+        .transpose()?
+        .unwrap_or_default();
     Ok(MemoryRecordInput {
         record_id: required_item(dict, "record_id")?.extract()?,
         scope_id: required_item(dict, "scope_id")?.extract()?,
@@ -752,6 +836,8 @@ fn memory_record_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<MemoryRecordInp
         text: required_item(dict, "text")?.extract()?,
         embedding: required_item(dict, "embedding")?.extract()?,
         symbols: required_item(dict, "symbols")?.extract()?,
+        vector_id,
+        metadata,
     })
 }
 
@@ -779,6 +865,8 @@ fn memory_hits_to_py(py: Python<'_>, hits: &[MemoryHit]) -> PyResult<Vec<PyObjec
             dict.set_item("confidence", hit.confidence)?;
             dict.set_item("timestamp", hit.timestamp)?;
             dict.set_item("text", &hit.text)?;
+            dict.set_item("vector_id", &hit.vector_id)?;
+            dict.set_item("metadata", &hit.metadata)?;
             Ok(dict.into())
         })
         .collect()
@@ -793,6 +881,8 @@ fn memory_space_trace_to_py(py: Python<'_>, trace: &MemorySpaceRecallTrace) -> P
     dict.set_item("segments_pruned", trace.segments_pruned)?;
     dict.set_item("semantic_evals", trace.semantic_evals)?;
     dict.set_item("returned", trace.returned)?;
+    dict.set_item("cold_bytes_read", trace.cold_bytes_read)?;
+    dict.set_item("read_amplification", trace.read_amplification)?;
     let segment_traces = trace
         .segment_traces
         .iter()
@@ -845,6 +935,8 @@ fn recall_trace_to_py(py: Python<'_>, trace: &RecallTrace) -> PyResult<PyObject>
     )?;
     dict.set_item("semantic_evals", trace.semantic_evals)?;
     dict.set_item("returned", trace.returned)?;
+    dict.set_item("cold_bytes_read", trace.cold_bytes_read)?;
+    dict.set_item("read_amplification", trace.read_amplification)?;
     Ok(dict.into())
 }
 
@@ -1180,6 +1272,8 @@ mod tests {
                 Some(0.95),
                 5,
                 Some(10),
+                None,
+                None,
             );
 
             let result = space.recall(py, &query).unwrap();
@@ -1237,6 +1331,171 @@ mod tests {
         fs::remove_file(segment_path).unwrap();
         fs::remove_file(manifest_path).unwrap();
         fs::remove_file(fork_path).unwrap();
+        let _ = fs::remove_file(dir.join("wal_active.apmw"));
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_memory_space_python_insert_delete_flush_round_trip() {
+        pyo3::prepare_freethreaded_python();
+        let dir = std::env::temp_dir().join(format!(
+            "aperon-py-test-insert-delete-flush-{}-{}",
+            process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("main.apmf");
+
+        Python::with_gil(|py| {
+            // Write initial empty manifest
+            let manifest = PyMemoryManifestFile::new("main", vec![], None).unwrap();
+            manifest.write(manifest_path.clone()).unwrap();
+
+            // Open space
+            let mut space =
+                PyMemorySpace::open(&py.get_type::<PyMemorySpace>(), manifest_path.clone())
+                    .unwrap();
+
+            // Construct record 1 dict
+            let record_1 = PyDict::new(py);
+            record_1.set_item("record_id", 1_u64).unwrap();
+            record_1.set_item("scope_id", 10_u32).unwrap();
+            record_1.set_item("timestamp", 100_i64).unwrap();
+            record_1.set_item("source_id", 1_u16).unwrap();
+            record_1.set_item("confidence", 1.0_f32).unwrap();
+            record_1.set_item("text", "python insert").unwrap();
+            record_1
+                .set_item("embedding", vec![1.0_f32, 0.0, 0.0, 0.0])
+                .unwrap();
+            record_1.set_item("symbols", vec!["py_tag"]).unwrap();
+
+            // Insert record 1
+            space.insert(&record_1).unwrap();
+
+            // Recall and verify
+            let query = PyRecallQuery::new(
+                Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
+                vec!["py_tag".to_string()],
+                Some(10),
+                None,
+                None,
+                Some(1.0),
+                5,
+                Some(10),
+                None,
+                None,
+            );
+            let result = space.recall(py, &query).unwrap();
+            let dict = result.bind(py).downcast::<PyDict>().unwrap();
+            let hits = dict
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+
+            // Construct and insert record 2
+            let record_2 = PyDict::new(py);
+            record_2.set_item("record_id", 2_u64).unwrap();
+            record_2.set_item("scope_id", 10_u32).unwrap();
+            record_2.set_item("timestamp", 110_i64).unwrap();
+            record_2.set_item("source_id", 1_u16).unwrap();
+            record_2.set_item("confidence", 1.0_f32).unwrap();
+            record_2.set_item("text", "to delete").unwrap();
+            record_2
+                .set_item("embedding", vec![0.0_f32, 1.0, 0.0, 0.0])
+                .unwrap();
+            record_2.set_item("symbols", vec!["py_tag"]).unwrap();
+            space.insert(&record_2).unwrap();
+
+            // Delete record 2
+            space.delete(2).unwrap();
+
+            // Recall and verify only record 1 is returned
+            let result2 = space.recall(py, &query).unwrap();
+            let dict2 = result2.bind(py).downcast::<PyDict>().unwrap();
+            let hits2 = dict2
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+            assert_eq!(hits2.len(), 1);
+            assert_eq!(
+                hits2[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+
+            // Drop and reopen space to verify recovery
+            drop(space);
+            let mut space =
+                PyMemorySpace::open(&py.get_type::<PyMemorySpace>(), manifest_path.clone())
+                    .unwrap();
+
+            let result3 = space.recall(py, &query).unwrap();
+            let dict3 = result3.bind(py).downcast::<PyDict>().unwrap();
+            let hits3 = dict3
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+            assert_eq!(hits3.len(), 1);
+            assert_eq!(
+                hits3[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+
+            // Flush the space
+            space.flush().unwrap();
+
+            // Verify recall still works after flush
+            let result4 = space.recall(py, &query).unwrap();
+            let dict4 = result4.bind(py).downcast::<PyDict>().unwrap();
+            let hits4 = dict4
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+            assert_eq!(hits4.len(), 1);
+            assert_eq!(
+                hits4[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+        });
+
+        // Clean up
+        let segment_path = dir.join("segment_1.apms");
+        let active_wal = dir.join("wal_active.apmw");
+        fs::remove_file(segment_path).ok();
+        fs::remove_file(active_wal).ok();
+        fs::remove_file(manifest_path).ok();
         fs::remove_dir(dir).unwrap();
     }
 }
