@@ -2775,6 +2775,45 @@ impl MemTable {
     }
 }
 
+#[cfg(unix)]
+fn lock_file(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let res = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "WAL file is already locked by another process or cloned MemorySpace writer",
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let res = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    if res != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_file(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WALEntry {
     Insert(MemoryRecordInput),
@@ -2786,9 +2825,16 @@ pub struct WALWriter {
     file: File,
 }
 
+impl Drop for WALWriter {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.file);
+    }
+}
+
 impl WALWriter {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().append(true).create(true).open(path)?;
+        lock_file(&file)?;
         Ok(Self { file })
     }
 
@@ -5083,6 +5129,29 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_exclusive_lock() {
+        let path = temp_wal_path("exclusive_lock");
+        
+        // 1. Open first writer (holds lock)
+        let _writer1 = WALWriter::open(&path).unwrap();
+        
+        // 2. Open second writer on the same path (should fail because of lock)
+        let writer2_res = WALWriter::open(&path);
+        assert!(writer2_res.is_err());
+        let err = writer2_res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("locked"));
+
+        // 3. Drop first writer (releases lock)
+        drop(_writer1);
+
+        // 4. Open second writer again (should succeed now)
+        let _writer2 = WALWriter::open(&path).unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_wal_roundtrip() {
         let path = temp_wal_path("roundtrip");
         let rec1 = record(1, 10, 100, "hello", [1.0, 0.0, 0.0], &["tag1"]);
@@ -5479,6 +5548,7 @@ mod tests {
 
             // Flush space -> creates companion cold vector store
             space.flush().unwrap();
+            drop(space);
 
             // Confirm that the .apmc file exists on disk
             let apmc_path = dir.join("segment_1.apmc");
