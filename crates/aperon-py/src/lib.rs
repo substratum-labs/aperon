@@ -46,7 +46,6 @@ struct PyMemoryManifestFile {
 }
 
 #[pyclass(name = "MemorySpace")]
-#[derive(Clone)]
 struct PyMemorySpace {
     inner: MemorySpace,
 }

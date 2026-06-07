@@ -302,28 +302,10 @@ pub struct MemorySpace {
     pub raw_dram_budget: Option<usize>,
 }
 
-impl Clone for MemorySpace {
-    fn clone(&self) -> Self {
-        let memtable_guard = self.memtable.read().unwrap();
-        let cloned_memtable = memtable_guard.clone();
-        drop(memtable_guard);
-
-        let wal_writer =
-            WALWriter::open(&self.wal_path).expect("failed to open WAL for cloned MemorySpace");
-
-        Self {
-            manifest: self.manifest.clone(),
-            segments: self.segments.clone(),
-            memtable: std::sync::RwLock::new(cloned_memtable),
-            wal_writer: std::sync::Mutex::new(wal_writer),
-            wal_path: self.wal_path.clone(),
-            manifest_path: self.manifest_path.clone(),
-            max_memtable_records: self.max_memtable_records,
-            vector_encoding: self.vector_encoding,
-            raw_dram_budget: self.raw_dram_budget,
-        }
-    }
-}
+// MemorySpace is a stateful exclusive database handle (it holds an advisory WAL lock).
+// It must NOT implement Clone — cloning would cause a second WALWriter::open to attempt
+// acquiring the same flock, which always fails with EWOULDBLOCK on Unix.  If branching
+// is needed, use the explicit `fork()` API instead.
 
 impl PartialEq for MemorySpace {
     fn eq(&self, other: &Self) -> bool {
@@ -1462,7 +1444,12 @@ impl MemorySegment {
         std::str::from_utf8(&self.text_bytes[start..end]).unwrap_or("")
     }
 
-    pub fn get_record_input(&self, local_id: usize) -> MemoryRecordInput {
+    /// Reconstruct a [`MemoryRecordInput`] from this segment for the given local record index.
+    ///
+    /// Returns `Err` if the cold-vector store is needed but fails to serve the vector.  Callers
+    /// that perform compaction / flushing **must** propagate this error rather than swallowing it
+    /// to avoid silently writing zero-vector records to disk.
+    pub fn get_record_input(&self, local_id: usize) -> io::Result<MemoryRecordInput> {
         let mut symbols = Vec::new();
         let target_local_id = local_id as u32;
         for (pos, term) in self.symbol_terms.iter().enumerate() {
@@ -1490,25 +1477,30 @@ impl MemorySegment {
             serde_json::from_str(meta_str).unwrap_or_default()
         };
 
-        MemoryRecordInput {
+        // Propagate cold-store read failures rather than silently returning an empty embedding.
+        // An empty embedding written to a new segment during compaction would cause permanent
+        // silent data loss.
+        let embedding = if self.embeddings.is_empty() {
+            match self.cold_store.as_ref() {
+                Some(cs) => cs.read_vector(local_id)?,
+                None => Vec::new(),
+            }
+        } else {
+            self.embedding_row(local_id).to_vec()
+        };
+
+        Ok(MemoryRecordInput {
             record_id: self.record_ids[local_id],
             scope_id: self.scope_ids[local_id],
             timestamp: self.timestamps[local_id],
             source_id: self.source_ids[local_id],
             confidence: self.confidences[local_id],
             text: self.text(local_id).to_string(),
-            embedding: if self.embeddings.is_empty() {
-                self.cold_store
-                    .as_ref()
-                    .and_then(|cs| cs.read_vector(local_id).ok())
-                    .unwrap_or_default()
-            } else {
-                self.embedding_row(local_id).to_vec()
-            },
+            embedding,
             symbols,
             vector_id,
             metadata,
-        }
+        })
     }
 
     fn passes_filters(&self, local_id: usize, query: &RecallQuery) -> bool {
@@ -2172,12 +2164,18 @@ impl MemorySpace {
                     let segment = &mut self.segments[idx].segment;
                     if !apmc_path.exists() {
                         let encoding = self.vector_encoding.unwrap_or(VectorEncoding::Raw);
+                        // Atomic write: write to a temporary file first, then rename.
+                        // This prevents a partial/interrupted write from leaving a corrupt
+                        // .apmc file that would be detected as "complete" on the next open,
+                        // permanently bricking the database.
+                        let apmc_tmp_path = apmc_path.with_extension("apmc.tmp");
                         ColdVectorStore::write(
-                            &apmc_path,
+                            &apmc_tmp_path,
                             encoding,
                             segment.dim,
                             &segment.embeddings,
                         )?;
+                        fs::rename(&apmc_tmp_path, &apmc_path)?;
                     }
 
                     let cold = ColdVectorStore::open(&apmc_path)?;
@@ -2235,7 +2233,7 @@ impl MemorySpace {
                     let rec_id = loaded.segment.record_ids[local_id];
                     if !mem.is_deleted(rec_id) && !mem.records.iter().any(|r| r.record_id == rec_id)
                     {
-                        compacted_records.push(loaded.segment.get_record_input(local_id));
+                        compacted_records.push(loaded.segment.get_record_input(local_id)?);
                     }
                 }
 
@@ -3633,8 +3631,12 @@ impl ColdVectorStore {
         })
     }
 
+    /// Read a single vector by local record index.
+    ///
+    /// Uses a cross-platform seek + read approach so the code compiles on both
+    /// Unix and Windows (avoids `std::os::unix::fs::FileExt::read_exact_at`).
     pub fn read_vector(&self, local_id: usize) -> io::Result<Vec<f32>> {
-        use std::os::unix::fs::FileExt;
+        use std::io::{Read, Seek, SeekFrom};
         if local_id >= self.record_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3647,7 +3649,9 @@ impl ColdVectorStore {
                 let size = self.dim * 4;
                 let offset = 14 + local_id * size;
                 let mut buf = vec![0u8; size];
-                self.file.read_exact_at(&mut buf, offset as u64)?;
+                let mut file = self.file.try_clone()?;
+                file.seek(SeekFrom::Start(offset as u64))?;
+                file.read_exact(&mut buf)?;
                 let mut vec = Vec::with_capacity(self.dim);
                 for i in 0..self.dim {
                     let val = f32::from_le_bytes(buf[i * 4..(i + 1) * 4].try_into().unwrap());
@@ -3659,7 +3663,9 @@ impl ColdVectorStore {
                 let size = self.dim * 2;
                 let offset = 14 + local_id * size;
                 let mut buf = vec![0u8; size];
-                self.file.read_exact_at(&mut buf, offset as u64)?;
+                let mut file = self.file.try_clone()?;
+                file.seek(SeekFrom::Start(offset as u64))?;
+                file.read_exact(&mut buf)?;
                 let mut vec = Vec::with_capacity(self.dim);
                 for i in 0..self.dim {
                     let val = u16::from_le_bytes(buf[i * 2..(i + 1) * 2].try_into().unwrap());
@@ -3671,7 +3677,9 @@ impl ColdVectorStore {
                 let size = 4 + self.dim;
                 let offset = 14 + local_id * size;
                 let mut buf = vec![0u8; size];
-                self.file.read_exact_at(&mut buf, offset as u64)?;
+                let mut file = self.file.try_clone()?;
+                file.seek(SeekFrom::Start(offset as u64))?;
+                file.read_exact(&mut buf)?;
                 let scale = f32::from_le_bytes(buf[0..4].try_into().unwrap());
                 let mut vec = Vec::with_capacity(self.dim);
                 for i in 0..self.dim {
