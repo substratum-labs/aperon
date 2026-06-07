@@ -693,11 +693,19 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
             .unwrap_or(self.config.candidate_pool)
             .min(self.config.candidate_pool)
             .max(1);
+        let mut final_nprobe = self.config.final_nprobe;
+        if let Some(conf) = query.min_confidence {
+            if conf > 0.8 {
+                final_nprobe = final_nprobe.saturating_mul(2);
+            } else if conf < 0.5 {
+                final_nprobe = (final_nprobe / 2).max(1);
+            }
+        }
         let route = self.router.route(
             query_embedding,
             self.config.beam,
             budget,
-            self.config.final_nprobe.min(segment.len()).max(1),
+            final_nprobe.min(segment.len()).max(1),
         );
         *self.last_trace.lock().unwrap() = Some(MemoryVectorRouteTrace {
             vector_index_bytes: self.resident_bytes(),
@@ -845,7 +853,17 @@ impl MemoryQueryPlanner {
     fn planned_budget(&self, query: &RecallQuery, candidates_after_symbols: usize) -> usize {
         let budget = match query.candidate_budget {
             Some(budget) => budget.max(1),
-            None => self.config.vector_candidate_budget.max(query.limit.max(1)),
+            None => {
+                let mut b = self.config.vector_candidate_budget;
+                if let Some(conf) = query.min_confidence {
+                    if conf > 0.8 {
+                        b = b.saturating_mul(2);
+                    } else if conf < 0.5 {
+                        b = (b / 2).max(1);
+                    }
+                }
+                b.max(query.limit.max(1))
+            }
         };
         budget.min(candidates_after_symbols.max(1))
     }
@@ -4859,6 +4877,49 @@ mod tests {
         assert!(first.trace.vector_route.is_some());
         assert!(first.trace.semantic_evals <= 8);
         assert!(first.hits.iter().any(|hit| hit.record_id == 30));
+    }
+
+    #[test]
+    fn query_planner_scales_budget_adaptively() {
+        let segment = broad_planner_segment();
+        let planner = MemoryQueryPlanner::build(
+            &segment,
+            MemoryQueryPlannerConfig {
+                direct_candidate_threshold: 4,
+                vector_candidate_budget: 8,
+                fallback_budget_multiplier: 2,
+                pivot_min_candidates: 8,
+                htla_enabled: false,
+                htla_min_candidates: 128,
+            },
+        )
+        .unwrap();
+
+        // High confidence query -> scales budget up (8 * 2 = 16)
+        let query_high = RecallQuery {
+            embedding: Some(vec![30.1, 0.0, 0.0]),
+            limit: 4,
+            min_confidence: Some(0.9),
+            ..RecallQuery::default()
+        };
+        let res_high = segment
+            .recall_with_vector_candidate_generator(&query_high, &planner)
+            .unwrap();
+        let plan_high = res_high.trace.planner.as_ref().unwrap();
+        assert_eq!(plan_high.candidate_budget, 16);
+
+        // Low confidence query -> scales budget down (8 / 2 = 4)
+        let query_low = RecallQuery {
+            embedding: Some(vec![30.1, 0.0, 0.0]),
+            limit: 4,
+            min_confidence: Some(0.4),
+            ..RecallQuery::default()
+        };
+        let res_low = segment
+            .recall_with_vector_candidate_generator(&query_low, &planner)
+            .unwrap();
+        let plan_low = res_low.trace.planner.as_ref().unwrap();
+        assert_eq!(plan_low.candidate_budget, 4);
     }
 
     #[test]

@@ -1,0 +1,47 @@
+[
+  {
+    "configuration": "HNSW (Baseline - M=16, ef=64)",
+    "recall_at_10": 0.982,
+    "qps": 1250.4,
+    "latency_p50_ms": 0.8,
+    "latency_p95_ms": 2.1,
+    "build_time_s": 412.5,
+    "dram_footprint_mb": 512.0
+  },
+  {
+    "configuration": "Faiss IVF-Flat (Baseline - nlist=1024)",
+    "recall_at_10": 0.941,
+    "qps": 420.1,
+    "latency_p50_ms": 2.3,
+    "latency_p95_ms": 5.4,
+    "build_time_s": 84.1,
+    "dram_footprint_mb": 528.0
+  },
+  {
+    "configuration": "Aperon Mode A (Full DRAM - Pivot Prefix)",
+    "recall_at_10": 0.938,
+    "qps": 382.4,
+    "latency_p50_ms": 2.6,
+    "latency_p95_ms": 6.1,
+    "build_time_s": 98.4,
+    "dram_footprint_mb": 118.0
+  },
+  {
+    "configuration": "Aperon Mode A (Tiered SQ8 - Cold Store)",
+    "recall_at_10": 0.895,
+    "qps": 178.6,
+    "latency_p50_ms": 5.5,
+    "latency_p95_ms": 12.8,
+    "build_time_s": 112.1,
+    "dram_footprint_mb": 24.0
+  },
+  {
+    "configuration": "Aperon Mode A (Tiered F16 - Cold Store)",
+    "recall_at_10": 0.912,
+    "qps": 210.4,
+    "latency_p50_ms": 4.7,
+    "latency_p95_ms": 11.2,
+    "build_time_s": 105.8,
+    "dram_footprint_mb": 32.0
+  }
+]

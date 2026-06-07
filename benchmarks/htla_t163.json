@@ -1,0 +1,98 @@
+[
+  {
+    "k": 1024,
+    "levels": 3,
+    "chart_dim": 12,
+    "beam": 8,
+    "pool": 256,
+    "index_type": "Morton (Baseline)",
+    "coverage_at_16": 0.261875,
+    "neighbor_recall": 0.15125,
+    "qps": 1539.3664024298132,
+    "memory_bytes": 16384
+  },
+  {
+    "k": 1024,
+    "levels": 3,
+    "chart_dim": 12,
+    "beam": 8,
+    "pool": 256,
+    "index_type": "Gray-Morton",
+    "coverage_at_16": 0.45625,
+    "neighbor_recall": 0.19625,
+    "qps": 1495.6196969240807,
+    "memory_bytes": 16384
+  },
+  {
+    "k": 1024,
+    "levels": 3,
+    "chart_dim": 12,
+    "beam": 8,
+    "pool": 256,
+    "index_type": "Hilbert",
+    "coverage_at_16": 0.234375,
+    "neighbor_recall": 0.005,
+    "qps": 4201.974994648862,
+    "memory_bytes": 16384
+  },
+  {
+    "k": 1024,
+    "levels": 3,
+    "chart_dim": 12,
+    "beam": 8,
+    "pool": 256,
+    "index_type": "Lattice Trie",
+    "coverage_at_16": 0.018125,
+    "neighbor_recall": 0.045,
+    "qps": 5701.823171509624,
+    "memory_bytes": 24576
+  },
+  {
+    "k": 4096,
+    "levels": 4,
+    "chart_dim": 16,
+    "beam": 16,
+    "pool": 512,
+    "index_type": "Morton (Baseline)",
+    "coverage_at_16": 0.1325,
+    "neighbor_recall": 0.10125,
+    "qps": 330.0517933782196,
+    "memory_bytes": 65536
+  },
+  {
+    "k": 4096,
+    "levels": 4,
+    "chart_dim": 16,
+    "beam": 16,
+    "pool": 512,
+    "index_type": "Gray-Morton",
+    "coverage_at_16": 0.31625,
+    "neighbor_recall": 0.12125,
+    "qps": 327.3583612066571,
+    "memory_bytes": 65536
+  },
+  {
+    "k": 4096,
+    "levels": 4,
+    "chart_dim": 16,
+    "beam": 16,
+    "pool": 512,
+    "index_type": "Hilbert",
+    "coverage_at_16": 0.111875,
+    "neighbor_recall": 0.01125,
+    "qps": 1064.7666457407026,
+    "memory_bytes": 65536
+  },
+  {
+    "k": 4096,
+    "levels": 4,
+    "chart_dim": 16,
+    "beam": 16,
+    "pool": 512,
+    "index_type": "Lattice Trie",
+    "coverage_at_16": 0.009375,
+    "neighbor_recall": 0.025,
+    "qps": 1508.5819374337257,
+    "memory_bytes": 131072
+  }
+]

@@ -1,0 +1,8 @@
+{
+  "standard_qps": 823.9135435402904,
+  "standard_recall": 1.0,
+  "bandit_qps": 773.0676166966648,
+  "bandit_recall": 0.23500000000000004,
+  "qps_improvement_percent": -6.171269697199633,
+  "recall_loss_percent": 76.49999999999999
+}

@@ -405,6 +405,184 @@ fn add_scalar_sketch_tail(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub(crate) fn scan_block_pruned_into(
+    layout: &BlockSoaLayout,
+    block: usize,
+    lanes: usize,
+    query_coords: &[i16],
+    query_residual: u16,
+    query_sketches: &[i8],
+    weights: ScanWeights<'_>,
+    scores: &mut [i64],
+    threshold: i64,
+) -> bool {
+    residual_scores(
+        &layout.residual_block(block)[..lanes],
+        query_residual,
+        weights.residual,
+        scores,
+    );
+
+    let mut lane = 0;
+    while lane + 8 <= lanes {
+        for (dim, (&query, &weight)) in query_coords.iter().zip(weights.coord).enumerate() {
+            if dim % 4 == 0 {
+                let mut all_exceed = true;
+                for l in lane..lane + 8 {
+                    if scores[l] < threshold {
+                        all_exceed = false;
+                        break;
+                    }
+                }
+                if all_exceed {
+                    break;
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let raw = vld1q_s16(layout.coord_block(block, dim).as_ptr().add(lane));
+                let lo = vsubq_s32(vdupq_n_s32(i32::from(query)), vmovl_s16(vget_low_s16(raw)));
+                add_neon_i32x4_square_lanes(&mut scores[lane..lane + 4], lo, weight);
+                let hi = vsubq_s32(vdupq_n_s32(i32::from(query)), vmovl_s16(vget_high_s16(raw)));
+                add_neon_i32x4_square_lanes(&mut scores[lane + 4..lane + 8], hi, weight);
+            }
+
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                #[cfg(target_arch = "x86")]
+                use std::arch::x86::*;
+                #[cfg(target_arch = "x86_64")]
+                use std::arch::x86_64::*;
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let ptr = layout.coord_block(block, dim).as_ptr().add(lane) as *const __m128i;
+                    let values = _mm256_cvtepi16_epi32(_mm_loadu_si128(ptr));
+                    add_i32_square_lanes(
+                        &mut scores[lane..lane + 8],
+                        values,
+                        i32::from(query),
+                        weight,
+                    );
+                } else {
+                    let coords = layout.coord_block(block, dim);
+                    for l in lane..lane + 8 {
+                        let diff = i64::from(query) - i64::from(coords[l]);
+                        scores[l] += diff * diff * weight;
+                    }
+                }
+            }
+
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+            {
+                let coords = layout.coord_block(block, dim);
+                for l in lane..lane + 8 {
+                    let diff = i64::from(query) - i64::from(coords[l]);
+                    scores[l] += diff * diff * weight;
+                }
+            }
+        }
+        lane += 8;
+    }
+
+    for (dim, (&query, &weight)) in query_coords.iter().zip(weights.coord).enumerate() {
+        let coords = layout.coord_block(block, dim);
+        for l in lane..lanes {
+            if scores[l] < threshold {
+                let diff = i64::from(query) - i64::from(coords[l]);
+                scores[l] += diff * diff * weight;
+            }
+        }
+    }
+
+    let mut lane_sk = 0;
+    while lane_sk + 8 <= lanes {
+        for (dim, (&query, &weight)) in query_sketches.iter().zip(weights.sketch).enumerate() {
+            if dim % 2 == 0 {
+                let mut all_exceed = true;
+                for l in lane_sk..lane_sk + 8 {
+                    if scores[l] < threshold {
+                        all_exceed = false;
+                        break;
+                    }
+                }
+                if all_exceed {
+                    break;
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let raw = vld1_s8(layout.sketch_block(block, dim).as_ptr().add(lane_sk));
+                let expanded = vmovl_s8(raw);
+                let lo = vsubq_s32(
+                    vdupq_n_s32(i32::from(query)),
+                    vmovl_s16(vget_low_s16(expanded)),
+                );
+                add_neon_i32x4_square_lanes(&mut scores[lane_sk..lane_sk + 4], lo, weight);
+                let hi = vsubq_s32(
+                    vdupq_n_s32(i32::from(query)),
+                    vmovl_s16(vget_high_s16(expanded)),
+                );
+                add_neon_i32x4_square_lanes(&mut scores[lane_sk + 4..lane_sk + 8], hi, weight);
+            }
+
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                #[cfg(target_arch = "x86")]
+                use std::arch::x86::*;
+                #[cfg(target_arch = "x86_64")]
+                use std::arch::x86_64::*;
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let ptr = layout.sketch_block(block, dim).as_ptr().add(lane_sk) as *const i64;
+                    let packed = std::ptr::read_unaligned(ptr);
+                    let values = _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(packed));
+                    add_i32_square_lanes(
+                        &mut scores[lane_sk..lane_sk + 8],
+                        values,
+                        i32::from(query),
+                        weight,
+                    );
+                } else {
+                    for l in lane_sk..lane_sk + 8 {
+                        let diff = i64::from(query) - i64::from(layout.sketch(block, dim, l));
+                        scores[l] += diff * diff * weight;
+                    }
+                }
+            }
+
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+            {
+                for l in lane_sk..lane_sk + 8 {
+                    let diff = i64::from(query) - i64::from(layout.sketch(block, dim, l));
+                    scores[l] += diff * diff * weight;
+                }
+            }
+        }
+        lane_sk += 8;
+    }
+
+    for (dim, (&query, &weight)) in query_sketches.iter().zip(weights.sketch).enumerate() {
+        for l in lane_sk..lanes {
+            if scores[l] < threshold {
+                let diff = i64::from(query) - i64::from(layout.sketch(block, dim, l));
+                scores[l] += diff * diff * weight;
+            }
+        }
+    }
+
+    let mut final_exceed = true;
+    for &score in scores.iter().take(lanes) {
+        if score < threshold {
+            final_exceed = false;
+            break;
+        }
+    }
+    final_exceed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +749,70 @@ mod tests {
             ns_per_vector <= 5.0,
             "block scan took {ns_per_vector:.3} ns/vector"
         );
+    }
+
+    #[test]
+    fn test_scan_block_pruning() {
+        let mut layout = BlockSoaLayout::with_shape(3, 2, 8);
+        for lane in 0..8 {
+            layout
+                .push_quantized(
+                    VectorId::new(lane as u64),
+                    &[lane as i16, lane as i16 * 2, 8 - lane as i16],
+                    lane as u16 + 5,
+                    &[lane as i8, 4 - lane as i8],
+                )
+                .unwrap();
+        }
+        let weights = ScanWeights {
+            coord: &[2, 3, 5],
+            residual: 7,
+            sketch: &[11, 13],
+        };
+
+        // When threshold is very high (no pruning should happen)
+        let mut scores_normal = vec![0; 8];
+        let pruned = scan_block_pruned_into(
+            &layout,
+            0,
+            8,
+            &[4, 2, 1],
+            9,
+            &[3, -4],
+            weights,
+            &mut scores_normal,
+            9999999, // high threshold
+        );
+        assert!(!pruned);
+
+        // Verify matches scalar calculation
+        let mut scores_ref = vec![0; 8];
+        scalar_scan_block_into(
+            &layout,
+            0,
+            8,
+            &[4, 2, 1],
+            9,
+            &[3, -4],
+            weights,
+            &mut scores_ref,
+        );
+        assert_eq!(scores_normal, scores_ref);
+
+        // When threshold is very low (e.g. 50, all lanes in reference scores are > 100)
+        let mut scores_pruned = vec![0; 8];
+        let pruned_active = scan_block_pruned_into(
+            &layout,
+            0,
+            8,
+            &[4, 2, 1],
+            9,
+            &[3, -4],
+            weights,
+            &mut scores_pruned,
+            10, // very low threshold, will trigger early pruning
+        );
+        // Residual score alone is (9 + 5) * 7 = 98 for lane 0, so it will exceed 10 instantly!
+        assert!(pruned_active);
     }
 }

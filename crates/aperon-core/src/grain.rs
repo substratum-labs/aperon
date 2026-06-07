@@ -527,6 +527,57 @@ impl Grain {
         Ok(out)
     }
 
+    pub fn scan_pruned(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        threshold: f64,
+    ) -> Result<Vec<ScoredVector>, String> {
+        let raw_threshold = (threshold / self.distance_unit).ceil() as i64;
+        let projected = self.project_query(query)?;
+        let mut out = Vec::new();
+        let mut distances = vec![0; self.layout.block_size()];
+        for block in 0..self.layout.block_count() {
+            let lanes = self.layout.block_len(block);
+            let pruned = crate::scan::scan_block_pruned_into(
+                &self.layout,
+                block,
+                lanes,
+                &projected.coords,
+                projected.residual,
+                &projected.sketches,
+                ScanWeights {
+                    coord: &self.coord_weights,
+                    residual: self.residual_weight,
+                    sketch: &self.sketch_weights,
+                },
+                &mut distances,
+                raw_threshold,
+            );
+            if pruned {
+                continue;
+            }
+            for (lane, dist) in distances.iter().copied().take(lanes).enumerate() {
+                let final_dist = dist as f64 * self.distance_unit;
+                if final_dist < threshold {
+                    if let Some(id) = self.layout.id_at(block * self.layout.block_size() + lane) {
+                        out.push(ScoredVector {
+                            id,
+                            distance: final_dist,
+                        });
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out.truncate(top_k);
+        Ok(out)
+    }
+
     fn project_query(&self, query: &[f32]) -> Result<QueryProjection, String> {
         if query.len() != self.source_dim {
             return Err(format!(
@@ -1030,5 +1081,26 @@ mod tests {
             let dist = crate::distance::l2_squared(vector, &recon).unwrap().sqrt();
             assert!(dist < 2.0, "reconstruction error too high: {}", dist);
         }
+    }
+
+    #[test]
+    fn test_grain_scan_pruned() {
+        let vectors = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![10.0, 0.0, 0.0],
+            vec![0.0, 10.0, 0.0],
+        ];
+        let ids = vec![VectorId::new(1), VectorId::new(2), VectorId::new(3)];
+        let grain = Grain::build(GrainId::new(0), &vectors, &ids, 3, 2, 1, 4).unwrap();
+
+        // High threshold (no pruning)
+        let results_normal = grain.scan_pruned(&[9.0, 0.0, 0.0], 2, 999999.0).unwrap();
+        assert_eq!(results_normal.len(), 2);
+        assert_eq!(results_normal[0].id, VectorId::new(2));
+
+        // Low threshold (pruning occurs)
+        let results_pruned = grain.scan_pruned(&[9.0, 0.0, 0.0], 2, 0.0001).unwrap();
+        assert_eq!(results_pruned.len(), 1);
+        assert_eq!(results_pruned[0].id, VectorId::new(2));
     }
 }
