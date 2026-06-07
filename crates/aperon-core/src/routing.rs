@@ -245,7 +245,6 @@ pub struct HierarchicalLatticeEntry {
     pub index: usize,
 }
 
-/// Array-backed parent-local HTLA router for route-only centroid experiments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HtlaRouter {
     pub dim: usize,
@@ -255,14 +254,23 @@ pub struct HtlaRouter {
     pub child_entries: Vec<HtlaChildEntry>,
     pub centroids: Vec<Vec<f32>>,
     pub diagnostics: HtlaDiagnostics,
+    
+    // Contiguous arrays for cache locality & memory locality
+    pub node_centroids: Vec<f32>,
+    pub node_projections: Vec<f32>,
+    pub node_projection_biases: Vec<f32>,
+    pub node_eigenvalues: Vec<f32>,
+    
+    // Configurable soft-spill threshold (L1 L-inf squared distance gap)
+    pub soft_spill_threshold: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HtlaNode {
-    pub centroid: Vec<f32>,
-    /// Column-major basis with shape dim x chart_dim.
-    pub projection: Vec<f32>,
-    pub eigenvalues: Vec<f32>,
+    pub centroid_offset: usize,
+    pub projection_offset: usize,
+    pub bias_offset: usize,
+    pub eigenvalues_offset: usize,
     pub child_start: usize,
     pub child_len: usize,
     pub level: usize,
@@ -336,6 +344,11 @@ impl HtlaRouter {
             child_entries: Vec::new(),
             centroids: centroids.to_vec(),
             diagnostics: HtlaDiagnostics::default(),
+            node_centroids: Vec::new(),
+            node_projections: Vec::new(),
+            node_projection_biases: Vec::new(),
+            node_eigenvalues: Vec::new(),
+            soft_spill_threshold: 3000.0,
         };
         let indices = (0..centroids.len()).collect::<Vec<_>>();
         router.build_node(0, &indices);
@@ -397,7 +410,13 @@ impl HtlaRouter {
                 break;
             }
             scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            let keep = beam.min(scored.len());
+            let mut keep = beam.min(scored.len());
+            if scored.len() > 1 {
+                let score_gap = scored[1].1 - scored[0].1;
+                if score_gap > self.soft_spill_threshold {
+                    keep = 1;
+                }
+            }
             frontier = scored.into_iter().take(keep).collect();
         }
 
@@ -436,6 +455,22 @@ impl HtlaRouter {
         }
     }
 
+    pub fn node_centroid(&self, node: &HtlaNode) -> &[f32] {
+        &self.node_centroids[node.centroid_offset..node.centroid_offset + self.dim]
+    }
+
+    pub fn node_projection(&self, node: &HtlaNode) -> &[f32] {
+        &self.node_projections[node.projection_offset..node.projection_offset + self.dim * self.chart_dim]
+    }
+
+    pub fn node_projection_bias(&self, node: &HtlaNode) -> &[f32] {
+        &self.node_projection_biases[node.bias_offset..node.bias_offset + self.chart_dim]
+    }
+
+    pub fn node_eigenvalues(&self, node: &HtlaNode) -> &[f32] {
+        &self.node_eigenvalues[node.eigenvalues_offset..node.eigenvalues_offset + self.chart_dim]
+    }
+
     pub fn resident_bytes(&self) -> usize {
         self.centroids.len() * self.dim * size_of::<f32>()
             + self.nodes.len() * self.node_bytes()
@@ -447,6 +482,7 @@ impl HtlaRouter {
         size_of::<HtlaNode>()
             + self.dim * size_of::<f32>()
             + self.dim * self.chart_dim * size_of::<f32>()
+            + self.chart_dim * size_of::<f32>()
             + self.chart_dim * size_of::<f32>()
     }
 
@@ -463,10 +499,31 @@ impl HtlaRouter {
             .iter()
             .map(|point| l2_squared(point, &centroid).unwrap_or(0.0).sqrt())
             .fold(0.0, f32::max);
+
+        // Contiguous storage for node data
+        let centroid_offset = self.node_centroids.len();
+        self.node_centroids.extend_from_slice(&centroid);
+
+        let projection_offset = self.node_projections.len();
+        self.node_projections.extend_from_slice(&projection);
+
+        let bias_offset = self.node_projection_biases.len();
+        for component in 0..self.chart_dim {
+            let mut dot = 0.0;
+            for d in 0..self.dim {
+                dot += centroid[d] * projection[d * self.chart_dim + component];
+            }
+            self.node_projection_biases.push(-dot);
+        }
+
+        let eigenvalues_offset = self.node_eigenvalues.len();
+        self.node_eigenvalues.extend_from_slice(&eigenvalues);
+
         self.nodes.push(HtlaNode {
-            centroid,
-            projection,
-            eigenvalues,
+            centroid_offset,
+            projection_offset,
+            bias_offset,
+            eigenvalues_offset,
             child_start: self.child_entries.len(),
             child_len: 0,
             level,
@@ -485,16 +542,32 @@ impl HtlaRouter {
                     let coords = self.project_centroid_to_node(idx, node_idx);
                     let key = morton_u128(&coords);
                     let leaf_idx = self.nodes.len();
+
+                    let c_offset = self.node_centroids.len();
+                    self.node_centroids.extend_from_slice(&self.centroids[idx]);
+
+                    let p_offset = self.node_projections.len();
+                    self.node_projections.resize(p_offset + self.dim * self.chart_dim, 0.0);
+
+                    let b_offset = self.node_projection_biases.len();
+                    self.node_projection_biases.resize(b_offset + self.chart_dim, 0.0);
+
+                    let e_offset = self.node_eigenvalues.len();
+                    self.node_eigenvalues.resize(e_offset + self.chart_dim, 0.0);
+
                     self.nodes.push(HtlaNode {
-                        centroid: self.centroids[idx].clone(),
-                        projection: vec![0.0; self.dim * self.chart_dim],
-                        eigenvalues: vec![0.0; self.chart_dim],
+                        centroid_offset: c_offset,
+                        projection_offset: p_offset,
+                        bias_offset: b_offset,
+                        eigenvalues_offset: e_offset,
                         child_start: self.child_entries.len(),
                         child_len: 0,
                         level: level + 1,
                         centroid_index: Some(idx),
                         radius: 0.0,
                     });
+                    
+                    let parent_centroid = self.node_centroid(&self.nodes[node_idx]).to_vec();
                     self.child_entries.push(HtlaChildEntry {
                         key,
                         coords,
@@ -502,7 +575,7 @@ impl HtlaRouter {
                         centroid_index: Some(idx),
                         distance_to_parent: l2_squared(
                             &self.centroids[idx],
-                            &self.nodes[node_idx].centroid,
+                            &parent_centroid,
                         )
                         .unwrap_or(0.0)
                         .sqrt(),
@@ -531,15 +604,17 @@ impl HtlaRouter {
         let mut pending = Vec::with_capacity(groups.len());
         for group in groups {
             let child_idx = self.build_node(level + 1, &group);
-            let coords = self.project_vector_to_node(&self.nodes[child_idx].centroid, node_idx);
+            let child_centroid = self.node_centroid(&self.nodes[child_idx]).to_vec();
+            let coords = self.project_vector_to_node(&child_centroid, node_idx);
+            let parent_centroid = self.node_centroid(&self.nodes[node_idx]).to_vec();
             pending.push(HtlaChildEntry {
                 key: morton_u128(&coords),
                 coords,
                 child_node: child_idx,
                 centroid_index: None,
                 distance_to_parent: l2_squared(
-                    &self.nodes[child_idx].centroid,
-                    &self.nodes[node_idx].centroid,
+                    &child_centroid,
+                    &parent_centroid,
                 )
                 .unwrap_or(0.0)
                 .sqrt(),
@@ -561,8 +636,8 @@ impl HtlaRouter {
         quantized_project(
             query,
             self.dim,
-            &node.centroid,
-            &node.projection,
+            self.node_projection(node),
+            self.node_projection_bias(node),
             self.chart_dim,
         )
     }
@@ -576,8 +651,8 @@ impl HtlaRouter {
         quantized_project(
             vector,
             self.dim,
-            &node.centroid,
-            &node.projection,
+            self.node_projection(node),
+            self.node_projection_bias(node),
             self.chart_dim,
         )
     }
@@ -586,21 +661,26 @@ impl HtlaRouter {
         let mut residual_energy = vec![mean_energy(&self.centroids)];
         let mut radius_shrink = Vec::new();
         let mut sep = Vec::new();
-        for node in &self.nodes {
+        let n_nodes = self.nodes.len();
+        for i in 0..n_nodes {
+            let node = &self.nodes[i];
             if node.child_len == 0 {
                 continue;
             }
-            let total = node.eigenvalues.iter().sum::<f32>().max(1e-9);
+            let start = node.eigenvalues_offset;
+            let end = start + self.chart_dim;
+            let node_ev = &self.node_eigenvalues[start..end];
+            let total = node_ev.iter().sum::<f32>().max(1e-9);
             self.diagnostics.pca_energy.push(total);
             self.diagnostics
                 .d80
-                .push(energy_dim(&node.eigenvalues, 0.80));
+                .push(energy_dim(node_ev, 0.80));
             self.diagnostics
                 .d90
-                .push(energy_dim(&node.eigenvalues, 0.90));
+                .push(energy_dim(node_ev, 0.90));
             self.diagnostics
                 .d95
-                .push(energy_dim(&node.eigenvalues, 0.95));
+                .push(energy_dim(node_ev, 0.95));
             let child_radius = self.child_entries
                 [node.child_start..node.child_start + node.child_len]
                 .iter()
@@ -900,15 +980,15 @@ fn projected_variance(
 fn quantized_project(
     vector: &[f32],
     dim: usize,
-    mean: &[f32],
     projection: &[f32],
+    bias: &[f32],
     k: usize,
 ) -> Vec<i16> {
     let mut coords = vec![0_i16; k];
     for component in 0..k {
-        let mut dot = 0.0;
+        let mut dot = bias[component];
         for d in 0..dim {
-            dot += (vector[d] - mean[d]) * projection[d * k + component];
+            dot += vector[d] * projection[d * k + component];
         }
         coords[component] = dot.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }

@@ -8,7 +8,7 @@
     "index_type": "Morton (Baseline)",
     "coverage_at_16": 0.261875,
     "neighbor_recall": 0.15125,
-    "qps": 1539.3664024298132,
+    "qps": 1487.5215459785416,
     "memory_bytes": 16384
   },
   {
@@ -20,7 +20,7 @@
     "index_type": "Gray-Morton",
     "coverage_at_16": 0.45625,
     "neighbor_recall": 0.19625,
-    "qps": 1495.6196969240807,
+    "qps": 1460.394126279341,
     "memory_bytes": 16384
   },
   {
@@ -32,7 +32,7 @@
     "index_type": "Hilbert",
     "coverage_at_16": 0.234375,
     "neighbor_recall": 0.005,
-    "qps": 4201.974994648862,
+    "qps": 4072.9672045218076,
     "memory_bytes": 16384
   },
   {
@@ -44,7 +44,7 @@
     "index_type": "Lattice Trie",
     "coverage_at_16": 0.018125,
     "neighbor_recall": 0.045,
-    "qps": 5701.823171509624,
+    "qps": 5648.294898788442,
     "memory_bytes": 24576
   },
   {
@@ -56,7 +56,7 @@
     "index_type": "Morton (Baseline)",
     "coverage_at_16": 0.1325,
     "neighbor_recall": 0.10125,
-    "qps": 330.0517933782196,
+    "qps": 333.40191297301453,
     "memory_bytes": 65536
   },
   {
@@ -68,7 +68,7 @@
     "index_type": "Gray-Morton",
     "coverage_at_16": 0.31625,
     "neighbor_recall": 0.12125,
-    "qps": 327.3583612066571,
+    "qps": 329.0632355069434,
     "memory_bytes": 65536
   },
   {
@@ -80,7 +80,7 @@
     "index_type": "Hilbert",
     "coverage_at_16": 0.111875,
     "neighbor_recall": 0.01125,
-    "qps": 1064.7666457407026,
+    "qps": 1044.0020774098007,
     "memory_bytes": 65536
   },
   {
@@ -92,7 +92,7 @@
     "index_type": "Lattice Trie",
     "coverage_at_16": 0.009375,
     "neighbor_recall": 0.025,
-    "qps": 1508.5819374337257,
+    "qps": 1508.2027443014867,
     "memory_bytes": 131072
   }
 ]
