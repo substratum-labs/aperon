@@ -200,6 +200,7 @@ pub struct RecallQuery {
     pub candidate_budget: Option<usize>,
     pub vector_id: Option<String>,
     pub metadata_filter: std::collections::BTreeMap<String, String>,
+    pub fallback_to_recon_on_cold: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,6 +299,7 @@ pub struct MemorySpace {
     pub manifest_path: PathBuf,
     pub max_memtable_records: usize,
     pub vector_encoding: Option<VectorEncoding>,
+    pub raw_dram_budget: Option<usize>,
 }
 
 impl Clone for MemorySpace {
@@ -318,6 +320,7 @@ impl Clone for MemorySpace {
             manifest_path: self.manifest_path.clone(),
             max_memtable_records: self.max_memtable_records,
             vector_encoding: self.vector_encoding,
+            raw_dram_budget: self.raw_dram_budget,
         }
     }
 }
@@ -333,6 +336,7 @@ impl PartialEq for MemorySpace {
             && self.manifest_path == other.manifest_path
             && self.max_memtable_records == other.max_memtable_records
             && self.vector_encoding == other.vector_encoding
+            && self.raw_dram_budget == other.raw_dram_budget
     }
 }
 
@@ -1335,17 +1339,25 @@ impl MemorySegment {
 
         let mut cold_bytes_read = 0;
         let mut loaded_vectors = Vec::new();
+        let fallback_to_recon = query.embedding.is_some()
+            && self.embeddings.is_empty()
+            && query.fallback_to_recon_on_cold;
+
         if query.embedding.is_some() && self.embeddings.is_empty() {
-            if let Some(cold_store) = &self.cold_store {
-                let (vecs, bytes_read) = cold_store
-                    .read_vectors(&candidates)
-                    .map_err(|e| e.to_string())?;
-                loaded_vectors = vecs;
-                cold_bytes_read = bytes_read;
+            if fallback_to_recon {
+                // Bypasses reading from cold_store.
             } else {
-                return Err(
-                    "embeddings are empty but no cold vector store is available".to_string()
-                );
+                if let Some(cold_store) = &self.cold_store {
+                    let (vecs, bytes_read) = cold_store
+                        .read_vectors(&candidates)
+                        .map_err(|e| e.to_string())?;
+                    loaded_vectors = vecs;
+                    cold_bytes_read = bytes_read;
+                } else {
+                    return Err(
+                        "embeddings are empty but no cold vector store is available".to_string()
+                    );
+                }
             }
         }
 
@@ -1353,16 +1365,24 @@ impl MemorySegment {
         if query.embedding.is_some() {
             access_paths.push("semantic_rerank");
         }
+        if fallback_to_recon {
+            access_paths.push("fallback_to_recon");
+        }
+
         let query_embedding = query.embedding.as_deref();
         for (i, &local_id) in candidates.iter().enumerate() {
             let local_id = local_id as usize;
             let semantic_distance = query_embedding.map(|embedding| {
-                let emb_ref = if self.embeddings.is_empty() {
-                    &loaded_vectors[i]
+                if fallback_to_recon {
+                    0.0f32
                 } else {
-                    self.embedding_row(local_id)
-                };
-                l2_squared_unchecked(embedding, emb_ref).sqrt()
+                    let emb_ref = if self.embeddings.is_empty() {
+                        &loaded_vectors[i]
+                    } else {
+                        self.embedding_row(local_id)
+                    };
+                    l2_squared_unchecked(embedding, emb_ref).sqrt()
+                }
             });
             let symbol_matches = self.symbol_match_count(local_id, &query.symbols);
             let score = self.score(local_id, semantic_distance, symbol_matches);
@@ -1408,7 +1428,9 @@ impl MemorySegment {
         let bytes_per_vector = self.dim * 4;
         let returned_count = hits.len();
         let bytes_needed = returned_count * bytes_per_vector;
-        let read_amplification = if bytes_needed > 0 {
+        let read_amplification = if fallback_to_recon {
+            0.0
+        } else if bytes_needed > 0 {
             cold_bytes_read as f32 / bytes_needed as f32
         } else {
             1.0
@@ -2041,7 +2063,7 @@ impl MemorySpace {
         }
         let wal_writer = WALWriter::open(&wal_path)?;
 
-        Ok(Self {
+        let mut space = Self {
             manifest,
             segments,
             memtable: std::sync::RwLock::new(memtable),
@@ -2050,7 +2072,10 @@ impl MemorySpace {
             manifest_path: manifest_path.to_path_buf(),
             max_memtable_records: 5000,
             vector_encoding: None,
-        })
+            raw_dram_budget: None,
+        };
+        space.enforce_dram_budget()?;
+        Ok(space)
     }
 
     pub fn insert(&mut self, record: MemoryRecordInput) -> io::Result<()> {
@@ -2067,6 +2092,7 @@ impl MemorySpace {
         if should_flush {
             self.flush()?;
         }
+        self.enforce_dram_budget()?;
         Ok(())
     }
 
@@ -2081,6 +2107,91 @@ impl MemorySpace {
             mem.delete(record_id);
         }
         Ok(())
+    }
+
+    pub fn resident_raw_dram_bytes(&self) -> usize {
+        let dim = self
+            .segments
+            .first()
+            .map(|s| s.segment.dim)
+            .or_else(|| {
+                self.memtable
+                    .read()
+                    .unwrap()
+                    .records
+                    .first()
+                    .map(|r| r.embedding.len())
+            })
+            .unwrap_or(0);
+        let memtable_bytes = self.memtable.read().unwrap().records.len() * dim * 4;
+        let segments_bytes: usize = self
+            .segments
+            .iter()
+            .map(|s| s.segment.embeddings.len() * 4)
+            .sum();
+        memtable_bytes + segments_bytes
+    }
+
+    pub fn enforce_dram_budget(&mut self) -> std::io::Result<usize> {
+        let mut total_offloaded = 0;
+        if let Some(limit) = self.raw_dram_budget {
+            while self.resident_raw_dram_bytes() > limit {
+                let mut target_idx = None;
+                for (idx, loaded_seg) in self.segments.iter().enumerate() {
+                    if !loaded_seg.segment.embeddings.is_empty() {
+                        target_idx = Some(idx);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = target_idx {
+                    let base_dir = self
+                        .manifest_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."));
+                    let segment_id = self.segments[idx].segment.segment_id;
+                    let segment_entry = self
+                        .manifest
+                        .segments
+                        .iter()
+                        .find(|s| s.segment_id == segment_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Segment ID {} not found in manifest", segment_id),
+                            )
+                        })?;
+                    let segment_path = if segment_entry.path.is_absolute() {
+                        segment_entry.path.clone()
+                    } else {
+                        base_dir.join(&segment_entry.path)
+                    };
+                    let apmc_path = segment_path.with_extension("apmc");
+
+                    let segment = &mut self.segments[idx].segment;
+                    if !apmc_path.exists() {
+                        let encoding = self.vector_encoding.unwrap_or(VectorEncoding::Raw);
+                        ColdVectorStore::write(
+                            &apmc_path,
+                            encoding,
+                            segment.dim,
+                            &segment.embeddings,
+                        )?;
+                    }
+
+                    let cold = ColdVectorStore::open(&apmc_path)?;
+                    segment.cold_store = Some(std::sync::Arc::new(cold));
+
+                    let bytes_offloaded = segment.embeddings.len() * 4;
+                    segment.embeddings = Vec::new();
+                    total_offloaded += bytes_offloaded;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(total_offloaded)
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -5587,5 +5698,102 @@ mod tests {
             std::fs::remove_file(dir.join("wal_active.apmw")).ok();
             std::fs::remove_file(manifest_path).ok();
         }
+    }
+
+    #[test]
+    fn test_elastic_fallback_cache() {
+        let manifest_path = temp_manifest_path("elastic_fallback_cache");
+        let dir = manifest_path.parent().unwrap().to_path_buf();
+
+        // Create initial manifest
+        let manifest = MemoryManifestFile::new(None, 10, Vec::new());
+        manifest.write(&manifest_path).unwrap();
+
+        let mut space = MemorySpace::open(&manifest_path).unwrap();
+        // Insert 3 records with embeddings (each has 3 float32 elements -> 12 bytes raw embedding size)
+        let rec1 = record(1, 10, 100, "rec1", [1.0, 0.0, 0.0], &["tag"]);
+        let rec2 = record(2, 10, 110, "rec2", [0.0, 1.0, 0.0], &["tag"]);
+        let rec3 = record(3, 10, 120, "rec3", [0.0, 0.0, 1.0], &["tag"]);
+
+        space.insert(rec1).unwrap();
+        space.insert(rec2).unwrap();
+        space.insert(rec3).unwrap();
+
+        // Flush space to disk to write a segment
+        space.flush().unwrap();
+
+        // Check DRAM resident raw bytes before setting budget
+        // Segment has 3 records * 3 dim * 4 bytes = 36 bytes.
+        // MemTable is empty, so 0 bytes.
+        // Total = 36 bytes.
+        assert_eq!(space.resident_raw_dram_bytes(), 36);
+        assert!(!space.segments[0].segment.embeddings.is_empty());
+
+        // 1. Setting raw_dram_budget triggers offload on insert when budget is breached
+        space.raw_dram_budget = Some(20);
+        let rec4 = record(4, 10, 130, "rec4", [1.0, 1.0, 1.0], &["tag"]);
+        space.insert(rec4).unwrap();
+
+        // After insert, raw dram bytes limit (20) was breached.
+        // The segment should have been offloaded to companion .apmc file.
+        // The resident bytes now should only be the new record in memtable: 1 record * 3 dim * 4 = 12 bytes.
+        assert_eq!(space.resident_raw_dram_bytes(), 12);
+        assert!(space.segments[0].segment.embeddings.is_empty());
+        assert!(space.segments[0].segment.cold_store.is_some());
+        let apmc_path = dir.join("segment_1.apmc");
+        assert!(apmc_path.exists());
+
+        // Drop space to release lock on WAL
+        drop(space);
+
+        // 2. Open enforces budget
+        let mut space2 = MemorySpace::open(&manifest_path).unwrap();
+        // At this point, the segment is loaded with embeddings because they exist in the segment file.
+        // We set the budget and enforce it, simulating startup enforcement when a budget is configured.
+        space2.raw_dram_budget = Some(20);
+        space2.enforce_dram_budget().unwrap();
+        assert!(space2.segments[0].segment.embeddings.is_empty());
+        assert!(space2.segments[0].segment.cold_store.is_some());
+
+        // 3. fallback_to_recon_on_cold query bypasses cold store reads and registers "fallback_to_recon"
+        // and cold_bytes_read = 0 in the trace.
+        let query_normal = RecallQuery {
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            fallback_to_recon_on_cold: false,
+            limit: 10,
+            ..Default::default()
+        };
+        let res_normal = space2.recall(&query_normal).unwrap();
+        let segment_trace_normal = res_normal.trace.segment_traces[0].trace.as_ref().unwrap();
+        assert!(!segment_trace_normal
+            .access_paths
+            .contains(&"fallback_to_recon"));
+        assert!(segment_trace_normal.cold_bytes_read > 0);
+
+        let query_fallback = RecallQuery {
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            fallback_to_recon_on_cold: true,
+            limit: 10,
+            ..Default::default()
+        };
+        let res_fallback = space2.recall(&query_fallback).unwrap();
+        let segment_trace_fallback = res_fallback.trace.segment_traces[0].trace.as_ref().unwrap();
+        assert!(segment_trace_fallback
+            .access_paths
+            .contains(&"fallback_to_recon"));
+        assert_eq!(segment_trace_fallback.cold_bytes_read, 0);
+        assert_eq!(segment_trace_fallback.read_amplification, 0.0);
+
+        // Clean up
+        let segments_to_cleanup = space2.manifest.segments.clone();
+        drop(space2);
+
+        for segment_ref in &segments_to_cleanup {
+            let p = dir.join(&segment_ref.path);
+            std::fs::remove_file(p).ok();
+        }
+        std::fs::remove_file(apmc_path).ok();
+        std::fs::remove_file(dir.join("wal_active.apmw")).ok();
+        std::fs::remove_file(manifest_path).ok();
     }
 }

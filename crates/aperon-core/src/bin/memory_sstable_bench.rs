@@ -1235,6 +1235,7 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(16),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
         ),
         prepared_scenario(
@@ -1259,6 +1260,7 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(8),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
         ),
         prepared_scenario(
@@ -1283,6 +1285,7 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(32),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
         ),
         prepared_scenario(
@@ -1306,6 +1309,7 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(8),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
         ),
         prepared_scenario(
@@ -1330,6 +1334,7 @@ fn required_scenarios() -> Result<Vec<Scenario>, String> {
                 candidate_budget: Some(8),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
         ),
         route_fallback_scenario(),
@@ -1381,6 +1386,7 @@ fn route_fallback_scenario() -> Scenario {
                 candidate_budget: Some(1),
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
             expected_record_id: 250_127,
         }],
@@ -1486,6 +1492,7 @@ fn synthetic_scenario(
                 candidate_budget: None,
                 vector_id: None,
                 metadata_filter: std::collections::BTreeMap::new(),
+                ..RecallQuery::default()
             },
             expected_record_id: record.record_id,
         });
@@ -1534,6 +1541,7 @@ fn synthetic_broad_semantic_scenario(
             candidate_budget: Some(candidate_budget),
             vector_id: None,
             metadata_filter: std::collections::BTreeMap::new(),
+            ..RecallQuery::default()
         };
         query.expected_record_id = record.record_id;
     }
@@ -1663,6 +1671,7 @@ fn read_query(path: &Path) -> Result<RecallQuery, String> {
         candidate_budget: query.candidate_budget,
         vector_id: None,
         metadata_filter: std::collections::BTreeMap::new(),
+        ..RecallQuery::default()
     })
 }
 

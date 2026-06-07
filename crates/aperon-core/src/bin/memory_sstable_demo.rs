@@ -253,6 +253,7 @@ fn read_query(path: &Path) -> Result<RecallQuery, String> {
         candidate_budget: query.candidate_budget,
         vector_id: None,
         metadata_filter: std::collections::BTreeMap::new(),
+        ..RecallQuery::default()
     })
 }
 

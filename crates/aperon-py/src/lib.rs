@@ -65,7 +65,8 @@ impl PyRecallQuery {
         limit=10,
         candidate_budget=None,
         vector_id=None,
-        metadata_filter=None
+        metadata_filter=None,
+        fallback_to_recon_on_cold=false
     ))]
     fn new(
         embedding: Option<Vec<f32>>,
@@ -78,6 +79,7 @@ impl PyRecallQuery {
         candidate_budget: Option<usize>,
         vector_id: Option<String>,
         metadata_filter: Option<std::collections::BTreeMap<String, String>>,
+        fallback_to_recon_on_cold: bool,
     ) -> Self {
         Self {
             inner: RecallQuery {
@@ -91,8 +93,19 @@ impl PyRecallQuery {
                 candidate_budget,
                 vector_id,
                 metadata_filter: metadata_filter.unwrap_or_default(),
+                fallback_to_recon_on_cold,
             },
         }
+    }
+
+    #[getter]
+    fn fallback_to_recon_on_cold(&self) -> bool {
+        self.inner.fallback_to_recon_on_cold
+    }
+
+    #[setter]
+    fn set_fallback_to_recon_on_cold(&mut self, fallback_to_recon_on_cold: bool) {
+        self.inner.fallback_to_recon_on_cold = fallback_to_recon_on_cold;
     }
 
     #[getter]
@@ -308,6 +321,23 @@ impl PyMemorySpace {
 
     fn flush(&mut self) -> PyResult<()> {
         self.inner.flush().map_err(io_error)
+    }
+
+    #[getter]
+    fn raw_dram_budget(&self) -> Option<usize> {
+        self.inner.raw_dram_budget
+    }
+
+    #[setter]
+    fn set_raw_dram_budget(&mut self, budget: Option<usize>) -> PyResult<()> {
+        self.inner.raw_dram_budget = budget;
+        self.inner.enforce_dram_budget().map_err(io_error)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn resident_raw_dram_bytes(&self) -> usize {
+        self.inner.resident_raw_dram_bytes()
     }
 }
 
@@ -1448,6 +1478,7 @@ mod tests {
                 Some(10),
                 None,
                 None,
+                false,
             );
 
             let result = space.recall(py, &query).unwrap();
@@ -1558,6 +1589,7 @@ mod tests {
                 Some(10),
                 None,
                 None,
+                false,
             );
             let result = space.recall(py, &query).unwrap();
             let dict = result.bind(py).downcast::<PyDict>().unwrap();
