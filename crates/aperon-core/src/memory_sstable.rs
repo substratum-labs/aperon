@@ -1530,6 +1530,9 @@ impl MemorySegment {
             let start = self.metadata_offsets[local_id] as usize;
             let end = self.metadata_offsets[local_id + 1] as usize;
             let meta_str = std::str::from_utf8(&self.metadata_bytes[start..end]).unwrap_or("{}");
+            if meta_str == "{}" || meta_str.is_empty() {
+                return false;
+            }
             let record_meta: std::collections::BTreeMap<String, String> =
                 serde_json::from_str(meta_str).unwrap_or_default();
             for (k, v) in &query.metadata_filter {
