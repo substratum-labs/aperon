@@ -29,7 +29,7 @@ def standard_rerank(candidates: np.ndarray, query: np.ndarray, top_k: int) -> li
     dists = np.sum(diff ** 2, axis=1)
     return np.argsort(dists)[:top_k].tolist()
 
-def bandit_rerank(candidates: np.ndarray, query: np.ndarray, top_k: int, chunk_size: int = 16, confidence: float = 1.2) -> list[int]:
+def bandit_rerank(candidates: np.ndarray, query: np.ndarray, top_k: int, chunk_size: int = 16, confidence: float = 2.2) -> list[int]:
     # PCA-batch sequential probabilistic pruning:
     # We compute L2 distance incrementally in chunks of PCA dimensions.
     # After each chunk, we compute the running distance.
@@ -40,32 +40,29 @@ def bandit_rerank(candidates: np.ndarray, query: np.ndarray, top_k: int, chunk_s
         return standard_rerank(candidates, query, top_k)
         
     dim = candidates.shape[1]
-    active_indices = np.arange(n_cands)
-    running_dists = np.zeros(n_cands)
+    diffs_sq = (candidates - query) ** 2
     
-    # Process dimension by dimension in chunks
-    for start in range(0, dim, chunk_size):
-        end = min(start + chunk_size, dim)
-        # Compute partial distance for active candidates
-        diff = candidates[active_indices, start:end] - query[start:end]
-        partial_dists = np.sum(diff ** 2, axis=1)
-        running_dists[active_indices] += partial_dists
+    num_chunks = dim // chunk_size
+    chunks_diff = diffs_sq.reshape(n_cands, num_chunks, chunk_size)
+    chunk_sums = np.sum(chunks_diff, axis=2)
+    cum_sums = np.cumsum(chunk_sums, axis=1)
+    
+    active = np.ones(n_cands, dtype=bool)
+    for c in range(num_chunks - 1):
+        dists_at_c = cum_sums[:, c]
+        active_dists = dists_at_c[active]
+        if len(active_dists) > top_k:
+            threshold = np.partition(active_dists, top_k - 1)[top_k - 1] * confidence
+            active = active & (dists_at_c <= threshold)
+            if np.sum(active) <= top_k:
+                break
+                
+    active_indices = np.where(active)[0]
+    if len(active_indices) == 0:
+        return standard_rerank(candidates, query, top_k)
         
-        # Sort current running distances to find the top_k threshold
-        sorted_dists = np.sort(running_dists[active_indices])
-        threshold = sorted_dists[min(top_k - 1, len(sorted_dists) - 1)] * confidence
-        
-        # Prune candidates that exceed the threshold
-        keep = running_dists[active_indices] <= threshold
-        active_indices = active_indices[keep]
-        
-        # Stop early if we have pruned down to top_k
-        if len(active_indices) <= top_k:
-            break
-            
-    # Final exact reranking of remaining candidates
-    remaining_cands = candidates[active_indices]
-    final_order = standard_rerank(remaining_cands, query, top_k)
+    full_dists = np.sum(diffs_sq[active_indices], axis=1)
+    final_order = np.argsort(full_dists)[:top_k]
     return active_indices[final_order].tolist()
 
 def run_bench(data_dir: Path):
@@ -73,10 +70,16 @@ def run_bench(data_dir: Path):
     xq = read_fvecs(data_dir / "siftsmall_query.fvecs")
     
     # Pre-project to simulate PCA coordinates
-    # Using simple centered representation
-    xb_centered = xb - xb.mean(axis=0)
-    basis = np.eye(xb.shape[1])
-    xb_pca = xb_centered @ basis
+    # Using actual covariance-based PCA projection
+    mean = xb.mean(axis=0)
+    xb_centered = xb - mean
+    cov = np.cov(xb_centered, rowvar=False)
+    evals, evecs = np.linalg.eigh(cov)
+    idx = np.argsort(evals)[::-1]
+    evecs = evecs[:, idx]
+    
+    xb_pca = xb_centered @ evecs
+    xq_pca = (xq - mean) @ evecs
     
     # Evaluate Standard vs Bandit reranking
     top_k = 10
@@ -88,7 +91,7 @@ def run_bench(data_dir: Path):
     bandit_results = []
     
     # Warmup
-    for q in xq[:10]:
+    for q in xq_pca[:10]:
         # Find candidates using close subset
         dists = np.sum((xb_pca - q) ** 2, axis=1)
         candidates = np.argsort(dists)[:pool_size]
@@ -97,7 +100,7 @@ def run_bench(data_dir: Path):
         
     # Standard Reranking benchmark
     start = time.perf_counter()
-    for q in xq:
+    for q in xq_pca:
         dists = np.sum((xb_pca - q) ** 2, axis=1)
         candidates = np.argsort(dists)[:pool_size]
         standard_results.append([candidates[idx] for idx in standard_rerank(xb_pca[candidates], q, top_k)])
@@ -105,14 +108,14 @@ def run_bench(data_dir: Path):
     
     # Bandit Reranking benchmark
     start = time.perf_counter()
-    for q in xq:
+    for q in xq_pca:
         dists = np.sum((xb_pca - q) ** 2, axis=1)
         candidates = np.argsort(dists)[:pool_size]
         bandit_results.append([candidates[idx] for idx in bandit_rerank(xb_pca[candidates], q, top_k, chunk_size=16)])
     bandit_elapsed = time.perf_counter() - start
     
     # Compute Exact Top-K
-    for q in xq:
+    for q in xq_pca:
         dists = np.sum((xb_pca - q) ** 2, axis=1)
         exact_results.append(np.argsort(dists)[:top_k].tolist())
         
