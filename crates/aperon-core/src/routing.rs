@@ -254,13 +254,13 @@ pub struct HtlaRouter {
     pub child_entries: Vec<HtlaChildEntry>,
     pub centroids: Vec<Vec<f32>>,
     pub diagnostics: HtlaDiagnostics,
-    
+
     // Contiguous arrays for cache locality & memory locality
     pub node_centroids: Vec<f32>,
     pub node_projections: Vec<f32>,
     pub node_projection_biases: Vec<f32>,
     pub node_eigenvalues: Vec<f32>,
-    
+
     // Configurable soft-spill threshold (L1 L-inf squared distance gap)
     pub soft_spill_threshold: f32,
 }
@@ -460,7 +460,8 @@ impl HtlaRouter {
     }
 
     pub fn node_projection(&self, node: &HtlaNode) -> &[f32] {
-        &self.node_projections[node.projection_offset..node.projection_offset + self.dim * self.chart_dim]
+        &self.node_projections
+            [node.projection_offset..node.projection_offset + self.dim * self.chart_dim]
     }
 
     pub fn node_projection_bias(&self, node: &HtlaNode) -> &[f32] {
@@ -547,10 +548,12 @@ impl HtlaRouter {
                     self.node_centroids.extend_from_slice(&self.centroids[idx]);
 
                     let p_offset = self.node_projections.len();
-                    self.node_projections.resize(p_offset + self.dim * self.chart_dim, 0.0);
+                    self.node_projections
+                        .resize(p_offset + self.dim * self.chart_dim, 0.0);
 
                     let b_offset = self.node_projection_biases.len();
-                    self.node_projection_biases.resize(b_offset + self.chart_dim, 0.0);
+                    self.node_projection_biases
+                        .resize(b_offset + self.chart_dim, 0.0);
 
                     let e_offset = self.node_eigenvalues.len();
                     self.node_eigenvalues.resize(e_offset + self.chart_dim, 0.0);
@@ -566,19 +569,16 @@ impl HtlaRouter {
                         centroid_index: Some(idx),
                         radius: 0.0,
                     });
-                    
+
                     let parent_centroid = self.node_centroid(&self.nodes[node_idx]).to_vec();
                     self.child_entries.push(HtlaChildEntry {
                         key,
                         coords,
                         child_node: leaf_idx,
                         centroid_index: Some(idx),
-                        distance_to_parent: l2_squared(
-                            &self.centroids[idx],
-                            &parent_centroid,
-                        )
-                        .unwrap_or(0.0)
-                        .sqrt(),
+                        distance_to_parent: l2_squared(&self.centroids[idx], &parent_centroid)
+                            .unwrap_or(0.0)
+                            .sqrt(),
                     });
                 }
                 self.child_entries[child_start..].sort_by(|a, b| a.key.cmp(&b.key));
@@ -612,12 +612,9 @@ impl HtlaRouter {
                 coords,
                 child_node: child_idx,
                 centroid_index: None,
-                distance_to_parent: l2_squared(
-                    &child_centroid,
-                    &parent_centroid,
-                )
-                .unwrap_or(0.0)
-                .sqrt(),
+                distance_to_parent: l2_squared(&child_centroid, &parent_centroid)
+                    .unwrap_or(0.0)
+                    .sqrt(),
             });
         }
         pending.sort_by(|a, b| {
@@ -672,15 +669,9 @@ impl HtlaRouter {
             let node_ev = &self.node_eigenvalues[start..end];
             let total = node_ev.iter().sum::<f32>().max(1e-9);
             self.diagnostics.pca_energy.push(total);
-            self.diagnostics
-                .d80
-                .push(energy_dim(node_ev, 0.80));
-            self.diagnostics
-                .d90
-                .push(energy_dim(node_ev, 0.90));
-            self.diagnostics
-                .d95
-                .push(energy_dim(node_ev, 0.95));
+            self.diagnostics.d80.push(energy_dim(node_ev, 0.80));
+            self.diagnostics.d90.push(energy_dim(node_ev, 0.90));
+            self.diagnostics.d95.push(energy_dim(node_ev, 0.95));
             let child_radius = self.child_entries
                 [node.child_start..node.child_start + node.child_len]
                 .iter()

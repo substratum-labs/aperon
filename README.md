@@ -95,121 +95,126 @@ cargo run -p aperon-core --bin memory_sstable_demo -- fork \
 
 ### 2. Rust Programmatic API
 
-Here is the exact same build, recall, and fork workflow implemented programmatically in Rust:
+Aperon provides a high-level, thread-safe, and crash-safe `Collection` API. This API automatically manages:
+* **Write-Ahead Logging (WAL)**: All inserts/deletes are appended to WAL before memtable updates for crash recovery.
+* **Segment Compaction**: Automated or manual memory flushes serialize memtable entries into immutable columnar `.apms` segment files.
+* **Manifest Synchronization**: Transparently writes and updates versioned manifest logs (`main.apmf`) recording active segments.
+* **5-Layer Query Planning**: Recall queries automatically choose the most efficient execution path based on filters, symbols, and computational budget.
+
+Here is the mutable `Collection` workflow implemented programmatically in Rust:
 
 ```rust
-use std::path::{Path, PathBuf};
-use aperon_core::{
-    MemoryRecordInput, MemorySegment, MemoryManifestFile, MemoryManifestSegment,
-    MemorySpace, RecallQuery, stable_memory_branch_id
-};
+use std::path::Path;
+use std::collections::BTreeMap;
+use aperon_core::{Collection, MemoryRecordInput, RecallQuery};
 
 fn main() -> Result<(), String> {
     let out_dir = Path::new("target/readme-demo");
-    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
 
-    // 1. Build and write immutable columnar segment files (.apms) from memory inputs
-    let records = vec![MemoryRecordInput {
-        record_id: 171001,
-        scope_id: 7,
-        timestamp: 171,
+    // 1. Open or create a Collection (automatically replays WAL & opens the MemorySpace)
+    let mut collection = Collection::open(out_dir, "agent-memory".to_string())
+        .map_err(|e| e.to_string())?;
+
+    // 2. Insert records with vector embeddings, symbols, optional vector ID, and metadata map
+    let mut metadata = BTreeMap::new();
+    metadata.insert("project".to_string(), "castor".to_string());
+    metadata.insert("importance".to_string(), "high".to_string());
+
+    let record = MemoryRecordInput {
+        record_id: 20260607,
+        scope_id: 42,
+        timestamp: 1717750800,
         source_id: 1,
-        confidence: 0.96,
-        text: "T-171 proved the route kernel is fast.".to_string(),
-        embedding: vec![1.0, 0.05, 0.0, 0.0],
-        symbols: vec!["T-171".to_string(), "route-kernel".to_string()],
-    }];
-    let segment = MemorySegment::build(171, 4, records)?;
-    let segment_path = out_dir.join("segment-171.apms");
-    segment.write(&segment_path).map_err(|e| e.to_string())?;
+        confidence: 0.98,
+        text: "MVP Collection API is fully integrated and thread-safe.".to_string(),
+        embedding: vec![0.15, -0.42, 0.88, 0.02],
+        symbols: vec!["mvp".to_string(), "collection-api".to_string()],
+        vector_id: Some("vec-record-001".to_string()),
+        metadata,
+    };
 
-    // 2. Write a versioned manifest file (.apmf) tracking the active segments
-    let manifest = MemoryManifestFile::new(
-        None, // parent_manifest_id
-        stable_memory_branch_id("main"),
-        vec![MemoryManifestSegment {
-            segment_id: 171,
-            path: PathBuf::from("segment-171.apms"),
-            vector_sidecar: None,
-        }],
-    );
-    let manifest_path = out_dir.join("main.apmf");
-    manifest.write(&manifest_path).map_err(|e| e.to_string())?;
+    collection.insert(record).map_err(|e| e.to_string())?;
 
-    // 3. Open the MemorySpace snapshot and query it with combined symbol + semantic filters
-    let space = MemorySpace::open(&manifest_path).map_err(|e| e.to_string())?;
+    // 3. Recall memory records combining timestamp, scope, symbols, and semantic embeddings
+    let mut query_metadata_filter = BTreeMap::new();
+    query_metadata_filter.insert("project".to_string(), "castor".to_string());
+
     let query = RecallQuery {
-        embedding: Some(vec![1.0, 0.0, 0.28, 0.0]),
-        symbols: vec!["route-kernel".to_string()],
-        scope_id: Some(7),
+        embedding: Some(vec![0.12, -0.40, 0.85, 0.0]),
+        symbols: vec!["mvp".to_string()],
+        scope_id: Some(42),
+        metadata_filter: query_metadata_filter,
         limit: 5,
         ..Default::default()
     };
-    let result = space.recall(&query)?;
 
-    println!("Scanned {} segments", result.trace.segments_scanned);
+    let result = collection.recall(&query)?;
+
+    println!("Recall paths traversed: {:?}", result.trace.access_paths);
     for hit in result.hits {
-        println!("Hit record ID: {}, Score: {}", hit.record_id, hit.score);
+        println!(
+            "Hit ID: {}, Vector ID: {:?}, Score: {}, Text: '{}'",
+            hit.record_id, hit.vector_id, hit.score, hit.text
+        );
     }
 
-    // 4. Fork the memory space to create a zero-copy child manifest
-    let fork_path = out_dir.join("fork.apmf");
-    space.fork("experimental-branch", &fork_path).map_err(|e| e.to_string())?;
+    // 4. Compact the memtable and sync all changes to disk
+    collection.flush().map_err(|e| e.to_string())?;
+
     Ok(())
 }
 ```
-
 
 ---
 
 ## 🐍 Python API
 
-Aperon exposes both low-level quantized vector index structures and high-level Memory SSTable primitives to Python. For more comprehensive details, see [docs/python_api.md](docs/python_api.md).
+Aperon exposes the high-level `Collection` engine and low-level quantized vector index structures to Python. For more comprehensive details, see [docs/python_api.md](docs/python_api.md).
 
-### High-Level Memory SSTable Engine
+### High-Level Memory Collection Engine
 
-Exposes immutable segment building, manifest versioning, planned semantic recall, and zero-copy branching checkouts:
+Exposes the mutable thread-safe Collection API supporting inserts, batch inserts, symbolic filters, semantic search, and automatic file management:
 
 ```python
+from pathlib import Path
 import aperon
 
-# 1. Compile immutable memory segments from record dicts
-records = [{
-    "record_id": 191001,
-    "scope_id": 7,
-    "timestamp": 191,
+# 1. Open or create the collection (replays WAL log automatically)
+collection_dir = Path("target/python-demo")
+collection = aperon.Collection.open(collection_dir, "agent-memory")
+
+# 2. Insert records using standard Python dictionaries
+record = {
+    "record_id": 20260607,
+    "scope_id": 42,
+    "timestamp": 1717750800,
     "source_id": 1,
-    "confidence": 0.97,
-    "text": "T-191 exposes Memory SSTable bindings.",
-    "embedding": [1.0, 0.0, 0.0, 0.0],
-    "symbols": ["T-191", "python"],
-}]
+    "confidence": 0.98,
+    "text": "MVP Collection API is fully integrated and thread-safe.",
+    "embedding": [0.15, -0.42, 0.88, 0.02],
+    "symbols": ["mvp", "collection-api"],
+    "vector_id": "vec-record-001",
+    "metadata": {"project": "castor", "importance": "high"},
+}
 
-segment = aperon.MemorySegment.build(segment_id=191, dim=4, records=records)
-segment.write("target/python-demo/segment-191.apms")
+collection.insert(record)
 
-# 2. Write a versioned manifest file (.apmf) tracking the active segments
-manifest = aperon.MemoryManifestFile(
-    branch="main",
-    segments=[{"segment_id": 191, "path": "segment-191.apms"}],
-)
-manifest.write("target/python-demo/main.apmf")
-
-# 3. Open the MemorySpace snapshot and query it with combined symbol + semantic filters
-space = aperon.MemorySpace.open("target/python-demo/main.apmf")
+# 3. Query the collection using RecallQuery and PyO3 bindings
 query = aperon.RecallQuery(
-    embedding=[1.0, 0.0, 0.0, 0.0],
-    symbols=["python"],
-    scope_id=7,
+    embedding=[0.12, -0.40, 0.85, 0.0],
+    symbols=["mvp"],
+    scope_id=42,
+    metadata_filter={"project": "castor"},
     limit=5,
 )
-result = space.recall(query)
+result = collection.recall(query)
 
+# 4. Iterate over the results
 for hit in result["hits"]:
-    print(f"Hit record ID: {hit['record_id']}, Score: {hit['score']}")
+    print(f"Hit ID: {hit['record_id']}, Score: {hit['score']}, Text: {hit['text']}")
 
-# 4. Fork the memory space to create a zero-copy child manifest
-space.fork("python-experimental-branch", "target/python-demo/fork.apmf")
+# 5. Flush and compact the active memtable to disk
+collection.flush()
 ```
 
 ### Low-Level Quantized Vector Indexing
