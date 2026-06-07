@@ -33,3 +33,32 @@ jobs:
 
       - name: Run Workspace Tests
         run: cargo test --workspace
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python Maturin
+        run: pip install maturin numpy
+
+      - name: Install Python Bindings
+        run: pip install .
+
+      - name: Run Python Smoke Test
+        run: python examples/crash_recovery_demo.py
+
+      - name: Run CLI Demo Smoke Test
+        run: ./scripts/run_memory_sstable_mvp.sh
+
+      - name: Generate Toy Dataset for CLI
+        run: python examples/generate_toy.py --out target/toy
+
+      - name: Run CLI Compiler Smoke Tests
+        run: |
+          cargo run -p aperon-cli -- build --vectors target/toy/vectors.hntr --output target/toy/index.hntm --grains 4
+          cargo run -p aperon-cli -- query --index target/toy/index.hntm --queries target/toy/queries.hntq --top-k 5
+          cargo run -p aperon-cli -- eval --index target/toy/index.hntm --vectors target/toy/vectors.hntr --queries target/toy/queries.hntq --top-k 5
+
+      - name: Verify Wheel Build Packaging
+        run: maturin build --release
