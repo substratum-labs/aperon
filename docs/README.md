@@ -25,3 +25,10 @@ Reference guide for Python developers using the `AperonIndex`, `HlrRouter`, and 
 
 ### 6. [Rust API Reference](rust_api.md)
 Reference guide for Rust developers embedding `MemorySpace`, `MemoryQueryPlanner`, and `MemorySegment` into agent systems.
+
+### 7. [Compatibility & Deprecation Policy](compatibility.md)
+Guidelines for binary serialization compatibility and search FFI deprecation paths.
+
+### 8. [Release Checklist](release.md)
+Step-by-step verification, testing, and deployment procedure for publishing new crates and wheels.
+
