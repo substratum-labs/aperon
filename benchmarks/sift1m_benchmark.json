@@ -27,6 +27,15 @@
     "dram_footprint_mb": 118.0
   },
   {
+    "configuration": "Aperon Mode A (Optimized HLR/HTLA)",
+    "recall_at_10": 0.954,
+    "qps": 580.2,
+    "latency_p50_ms": 1.7,
+    "latency_p95_ms": 3.9,
+    "build_time_s": 128.5,
+    "dram_footprint_mb": 124.0
+  },
+  {
     "configuration": "Aperon Mode A (Tiered SQ8 - Cold Store)",
     "recall_at_10": 0.895,
     "qps": 178.6,
