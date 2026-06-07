@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aperon_core::{
     binary::{load_legacy_index, write_legacy_index},
     stable_memory_branch_id, AperonIndex, HierarchicalLatticeLayerConfig,

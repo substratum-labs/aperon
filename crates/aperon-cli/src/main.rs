@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aperon_core::{
     binary::{load_legacy_index, load_queries, load_raw_vectors, write_legacy_index},
     l2_squared, AperonIndex, ScoredVector, VectorId,

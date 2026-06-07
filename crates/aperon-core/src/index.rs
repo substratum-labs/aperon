@@ -1640,6 +1640,7 @@ fn ids_from_block_data(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
