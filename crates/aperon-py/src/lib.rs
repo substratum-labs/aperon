@@ -298,28 +298,42 @@ impl PyMemorySpace {
     }
 
     fn recall(&self, py: Python<'_>, query: &PyRecallQuery) -> PyResult<PyObject> {
-        let result = self.inner.recall(&query.inner).map_err(value_error)?;
+        let result = py
+            .allow_threads(|| self.inner.recall(&query.inner))
+            .map_err(value_error)?;
         let out = PyDict::new(py);
         out.set_item("hits", memory_hits_to_py(py, &result.hits)?)?;
         out.set_item("trace", memory_space_trace_to_py(py, &result.trace)?)?;
         Ok(out.into())
     }
 
-    fn fork(&self, branch: &str, out_path: PathBuf) -> PyResult<()> {
-        self.inner.fork(branch, out_path).map_err(io_error)
+    fn fork(&self, py: Python<'_>, branch: &str, out_path: PathBuf) -> PyResult<()> {
+        py.allow_threads(|| self.inner.fork(branch, out_path))
+            .map_err(io_error)
     }
 
-    fn insert(&mut self, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn insert(&mut self, py: Python<'_>, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
         let record = memory_record_from_dict(record_dict)?;
-        self.inner.insert(record).map_err(io_error)
+        py.allow_threads(|| self.inner.insert(record))
+            .map_err(io_error)
     }
 
-    fn delete(&mut self, record_id: u64) -> PyResult<()> {
-        self.inner.delete(record_id).map_err(io_error)
+    fn insert_many(&mut self, py: Python<'_>, records: Vec<Bound<'_, PyDict>>) -> PyResult<()> {
+        let mut extracted = Vec::with_capacity(records.len());
+        for record_dict in records {
+            extracted.push(memory_record_from_dict(&record_dict)?);
+        }
+        py.allow_threads(|| self.inner.insert_many(extracted))
+            .map_err(io_error)
     }
 
-    fn flush(&mut self) -> PyResult<()> {
-        self.inner.flush().map_err(io_error)
+    fn delete(&mut self, py: Python<'_>, record_id: u64) -> PyResult<()> {
+        py.allow_threads(|| self.inner.delete(record_id))
+            .map_err(io_error)
+    }
+
+    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.flush()).map_err(io_error)
     }
 
     #[getter]
@@ -328,9 +342,10 @@ impl PyMemorySpace {
     }
 
     #[setter]
-    fn set_raw_dram_budget(&mut self, budget: Option<usize>) -> PyResult<()> {
+    fn set_raw_dram_budget(&mut self, py: Python<'_>, budget: Option<usize>) -> PyResult<()> {
         self.inner.raw_dram_budget = budget;
-        self.inner.enforce_dram_budget().map_err(io_error)?;
+        py.allow_threads(|| self.inner.enforce_dram_budget())
+            .map_err(io_error)?;
         Ok(())
     }
 
@@ -353,25 +368,38 @@ impl PyCollection {
         Ok(Self { inner })
     }
 
-    fn insert(&mut self, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn insert(&mut self, py: Python<'_>, record_dict: &Bound<'_, PyDict>) -> PyResult<()> {
         let record = memory_record_from_dict(record_dict)?;
-        self.inner.insert(record).map_err(io_error)
+        py.allow_threads(|| self.inner.insert(record))
+            .map_err(io_error)
     }
 
-    fn delete(&mut self, record_id: u64) -> PyResult<()> {
-        self.inner.delete(record_id).map_err(io_error)
+    fn insert_many(&mut self, py: Python<'_>, records: Vec<Bound<'_, PyDict>>) -> PyResult<()> {
+        let mut extracted = Vec::with_capacity(records.len());
+        for record_dict in records {
+            extracted.push(memory_record_from_dict(&record_dict)?);
+        }
+        py.allow_threads(|| self.inner.insert_many(extracted))
+            .map_err(io_error)
+    }
+
+    fn delete(&mut self, py: Python<'_>, record_id: u64) -> PyResult<()> {
+        py.allow_threads(|| self.inner.delete(record_id))
+            .map_err(io_error)
     }
 
     fn recall(&self, py: Python<'_>, query: &PyRecallQuery) -> PyResult<PyObject> {
-        let result = self.inner.recall(&query.inner).map_err(value_error)?;
+        let result = py
+            .allow_threads(|| self.inner.recall(&query.inner))
+            .map_err(value_error)?;
         let out = PyDict::new(py);
         out.set_item("hits", memory_hits_to_py(py, &result.hits)?)?;
         out.set_item("trace", memory_space_trace_to_py(py, &result.trace)?)?;
         Ok(out.into())
     }
 
-    fn flush(&mut self) -> PyResult<()> {
-        self.inner.flush().map_err(io_error)
+    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.flush()).map_err(io_error)
     }
 }
 
@@ -588,16 +616,19 @@ impl PyAperonIndex {
         Ok(count)
     }
 
-    fn rebuild_single_grain(&mut self) -> PyResult<()> {
-        self.inner.rebuild_single_grain().map_err(value_error)
+    fn rebuild_single_grain(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.rebuild_single_grain())
+            .map_err(value_error)
     }
 
-    fn rebuild_two_grains(&mut self) -> PyResult<()> {
-        self.inner.rebuild_two_grains().map_err(value_error)
+    fn rebuild_two_grains(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.rebuild_two_grains())
+            .map_err(value_error)
     }
 
-    fn rebuild_n_grains(&mut self, grains: usize) -> PyResult<()> {
-        self.inner.rebuild_n_grains(grains).map_err(value_error)
+    fn rebuild_n_grains(&mut self, py: Python<'_>, grains: usize) -> PyResult<()> {
+        py.allow_threads(|| self.inner.rebuild_n_grains(grains))
+            .map_err(value_error)
     }
 
     fn enable_dynamic_splitting(&mut self, split_threshold: usize) -> PyResult<()> {
@@ -673,14 +704,17 @@ impl PyAperonIndex {
     #[pyo3(signature = (query, top_k, nprobe, rerank_factor))]
     fn search_mode_a(
         &self,
+        py: Python<'_>,
         query: Vec<f32>,
         top_k: usize,
         nprobe: usize,
         rerank_factor: usize,
     ) -> PyResult<Vec<(u64, f64)>> {
-        let results = self
-            .inner
-            .search_mode_a(&query, top_k, nprobe, rerank_factor)
+        let results = py
+            .allow_threads(|| {
+                self.inner
+                    .search_mode_a(&query, top_k, nprobe, rerank_factor)
+            })
             .map_err(value_error)?;
 
         Ok(results
@@ -692,14 +726,14 @@ impl PyAperonIndex {
     #[pyo3(signature = (query, top_k, nprobe, candidate_k))]
     fn search_mode_b(
         &self,
+        py: Python<'_>,
         query: Vec<f32>,
         top_k: usize,
         nprobe: usize,
         candidate_k: usize,
     ) -> PyResult<Vec<(u64, f64)>> {
-        let results = self
-            .inner
-            .search_mode_b(&query, top_k, nprobe, candidate_k)
+        let results = py
+            .allow_threads(|| self.inner.search_mode_b(&query, top_k, nprobe, candidate_k))
             .map_err(value_error)?;
 
         Ok(results
@@ -711,53 +745,77 @@ impl PyAperonIndex {
     #[pyo3(signature = (queries, top_k, nprobe, rerank_factor))]
     fn search_many_mode_a(
         &self,
+        py: Python<'_>,
         queries: PyReadonlyArray2<'_, f32>,
         top_k: usize,
         nprobe: usize,
         rerank_factor: usize,
     ) -> PyResult<Vec<Vec<(u64, f64)>>> {
         let array = queries.as_array();
-        let mut all_results = Vec::with_capacity(array.shape()[0]);
-        for row in array.outer_iter() {
-            let query: Vec<f32> = row.iter().copied().collect();
-            let results = self
-                .inner
-                .search_mode_a(&query, top_k, nprobe, rerank_factor)
-                .map_err(value_error)?;
+        let query_vecs: Vec<Vec<f32>> = array
+            .outer_iter()
+            .map(|row| row.iter().copied().collect())
+            .collect();
 
-            let mapped = results
-                .into_iter()
-                .map(|scored| (scored.id.get(), scored.distance))
-                .collect();
-            all_results.push(mapped);
-        }
-        Ok(all_results)
+        let results = py
+            .allow_threads(|| {
+                let mut all_results = Vec::with_capacity(query_vecs.len());
+                for query in &query_vecs {
+                    let results = self
+                        .inner
+                        .search_mode_a(query, top_k, nprobe, rerank_factor)?;
+                    all_results.push(results);
+                }
+                Ok::<_, String>(all_results)
+            })
+            .map_err(value_error)?;
+
+        Ok(results
+            .into_iter()
+            .map(|list| {
+                list.into_iter()
+                    .map(|scored| (scored.id.get(), scored.distance))
+                    .collect()
+            })
+            .collect())
     }
 
     #[pyo3(signature = (queries, top_k, nprobe, candidate_k))]
     fn search_many_mode_b(
         &self,
+        py: Python<'_>,
         queries: PyReadonlyArray2<'_, f32>,
         top_k: usize,
         nprobe: usize,
         candidate_k: usize,
     ) -> PyResult<Vec<Vec<(u64, f64)>>> {
         let array = queries.as_array();
-        let mut all_results = Vec::with_capacity(array.shape()[0]);
-        for row in array.outer_iter() {
-            let query = row.iter().copied().collect::<Vec<_>>();
-            let results = self
-                .inner
-                .search_mode_b(&query, top_k, nprobe, candidate_k)
-                .map_err(value_error)?;
+        let query_vecs: Vec<Vec<f32>> = array
+            .outer_iter()
+            .map(|row| row.iter().copied().collect())
+            .collect();
 
-            let mapped = results
-                .into_iter()
-                .map(|scored| (scored.id.get(), scored.distance))
-                .collect();
-            all_results.push(mapped);
-        }
-        Ok(all_results)
+        let results = py
+            .allow_threads(|| {
+                let mut all_results = Vec::with_capacity(query_vecs.len());
+                for query in &query_vecs {
+                    let results = self
+                        .inner
+                        .search_mode_b(query, top_k, nprobe, candidate_k)?;
+                    all_results.push(results);
+                }
+                Ok::<_, String>(all_results)
+            })
+            .map_err(value_error)?;
+
+        Ok(results
+            .into_iter()
+            .map(|list| {
+                list.into_iter()
+                    .map(|scored| (scored.id.get(), scored.distance))
+                    .collect()
+            })
+            .collect())
     }
 
     #[pyo3(signature = (query, top_k, nprobe=None, rerank_factor=None))]
@@ -1269,7 +1327,7 @@ mod tests {
                     index.insert(id.as_any(), Some(vector.as_any())).unwrap();
                 }
             }
-            index.rebuild_n_grains(4).unwrap();
+            index.rebuild_n_grains(py, 4).unwrap();
 
             let stats = index.stats(py).unwrap();
 
@@ -1305,16 +1363,14 @@ mod tests {
                 let vector = vector.into_pyobject(py).unwrap();
                 index.insert(id.as_any(), Some(vector.as_any())).unwrap();
             }
-        });
-        index.rebuild_single_grain().unwrap();
+            index.rebuild_single_grain(py).unwrap();
 
-        index.save(path.clone()).unwrap();
-        let loaded = PyAperonIndex::load_path(path.clone()).unwrap();
-        fs::remove_file(path).unwrap();
+            index.save(path.clone()).unwrap();
+            let loaded = PyAperonIndex::load_path(path.clone()).unwrap();
+            fs::remove_file(path).unwrap();
 
-        let results = loaded.search_mode_a(vec![9.0, 0.0], 1, 1, 4).unwrap();
-        assert_eq!(results[0].0, 1);
-        Python::with_gil(|py| {
+            let results = loaded.search_mode_a(py, vec![9.0, 0.0], 1, 1, 4).unwrap();
+            assert_eq!(results[0].0, 1);
             let stats = loaded.stats(py).unwrap();
             assert_eq!(
                 stats
@@ -1350,7 +1406,7 @@ mod tests {
 
             assert_eq!(inserted, 2);
             assert_eq!(
-                index.search_mode_a(vec![1.8, 0.0], 1, 1, 4).unwrap()[0].0,
+                index.search_mode_a(py, vec![1.8, 0.0], 1, 1, 4).unwrap()[0].0,
                 11
             );
         });
@@ -1371,10 +1427,12 @@ mod tests {
             .into_pyobject(py)
             .unwrap();
             index.insert_many(ids.as_any(), matrix.as_any()).unwrap();
-            index.rebuild_single_grain().unwrap();
+            index.rebuild_single_grain(py).unwrap();
 
             // Reranking should find the correct nearest neighbor
-            let results = index.search_mode_a(vec![9.0, 0.0, 0.0], 1, 1, 4).unwrap();
+            let results = index
+                .search_mode_a(py, vec![9.0, 0.0, 0.0], 1, 1, 4)
+                .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 2);
             assert!((results[0].1 - 1.0).abs() < 1.0);
@@ -1521,7 +1579,7 @@ mod tests {
             );
 
             space
-                .fork("python-experimental-branch", fork_path.clone())
+                .fork(py, "python-experimental-branch", fork_path.clone())
                 .unwrap();
             let forked = PyMemoryManifestFile::read(
                 &py.get_type::<PyMemoryManifestFile>(),
@@ -1574,7 +1632,7 @@ mod tests {
             record_1.set_item("symbols", vec!["py_tag"]).unwrap();
 
             // Insert record 1
-            space.insert(&record_1).unwrap();
+            space.insert(py, &record_1).unwrap();
 
             // Recall and verify
             let query = PyRecallQuery::new(
@@ -1621,10 +1679,10 @@ mod tests {
                 .set_item("embedding", vec![0.0_f32, 1.0, 0.0, 0.0])
                 .unwrap();
             record_2.set_item("symbols", vec!["py_tag"]).unwrap();
-            space.insert(&record_2).unwrap();
+            space.insert(py, &record_2).unwrap();
 
             // Delete record 2
-            space.delete(2).unwrap();
+            space.delete(py, 2).unwrap();
 
             // Recall and verify only record 1 is returned
             let result2 = space.recall(py, &query).unwrap();
@@ -1672,7 +1730,7 @@ mod tests {
             );
 
             // Flush the space
-            space.flush().unwrap();
+            space.flush(py).unwrap();
 
             // Verify recall still works after flush
             let result4 = space.recall(py, &query).unwrap();
@@ -1699,6 +1757,104 @@ mod tests {
         let segment_path = dir.join("segment_1.apms");
         let active_wal = dir.join("wal_active.apmw");
         fs::remove_file(segment_path).ok();
+        fs::remove_file(active_wal).ok();
+        fs::remove_file(manifest_path).ok();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_memory_space_python_insert_many() {
+        pyo3::prepare_freethreaded_python();
+        let dir = std::env::temp_dir().join(format!(
+            "aperon-py-test-insert-many-{}-{}",
+            process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("main.apmf");
+
+        Python::with_gil(|py| {
+            let manifest = PyMemoryManifestFile::new("main", vec![], None).unwrap();
+            manifest.write(manifest_path.clone()).unwrap();
+
+            let mut space =
+                PyMemorySpace::open(&py.get_type::<PyMemorySpace>(), manifest_path.clone())
+                    .unwrap();
+
+            let record_1 = PyDict::new(py);
+            record_1.set_item("record_id", 101_u64).unwrap();
+            record_1.set_item("scope_id", 20_u32).unwrap();
+            record_1.set_item("timestamp", 200_i64).unwrap();
+            record_1.set_item("source_id", 2_u16).unwrap();
+            record_1.set_item("confidence", 0.9_f32).unwrap();
+            record_1.set_item("text", "bulk 1").unwrap();
+            record_1
+                .set_item("embedding", vec![1.0_f32, 0.0, 0.0, 0.0])
+                .unwrap();
+            record_1.set_item("symbols", vec!["bulk_tag"]).unwrap();
+
+            let record_2 = PyDict::new(py);
+            record_2.set_item("record_id", 102_u64).unwrap();
+            record_2.set_item("scope_id", 20_u32).unwrap();
+            record_2.set_item("timestamp", 210_i64).unwrap();
+            record_2.set_item("source_id", 2_u16).unwrap();
+            record_2.set_item("confidence", 0.9_f32).unwrap();
+            record_2.set_item("text", "bulk 2").unwrap();
+            record_2
+                .set_item("embedding", vec![0.0_f32, 1.0, 0.0, 0.0])
+                .unwrap();
+            record_2.set_item("symbols", vec!["bulk_tag"]).unwrap();
+
+            // Insert many
+            space.insert_many(py, vec![record_1, record_2]).unwrap();
+
+            // Recall query
+            let query = PyRecallQuery::new(
+                Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
+                vec!["bulk_tag".to_string()],
+                Some(20),
+                None,
+                None,
+                Some(0.8),
+                5,
+                Some(10),
+                None,
+                None,
+                false,
+            );
+
+            let result = space.recall(py, &query).unwrap();
+            let dict = result.bind(py).downcast::<PyDict>().unwrap();
+            let hits = dict
+                .get_item("hits")
+                .unwrap()
+                .unwrap()
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .unwrap();
+
+            assert_eq!(hits.len(), 2);
+            assert_eq!(
+                hits[0]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                101
+            );
+            assert_eq!(
+                hits[1]
+                    .get_item("record_id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                102
+            );
+        });
+
+        // Clean up
+        let active_wal = dir.join("wal_active.apmw");
         fs::remove_file(active_wal).ok();
         fs::remove_file(manifest_path).ok();
         fs::remove_dir(dir).unwrap();
