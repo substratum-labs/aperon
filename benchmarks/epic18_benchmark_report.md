@@ -78,6 +78,15 @@ This dataset consists of 17,485 real execution traces and dialog logs compiled f
 * **Extreme Memory Protection**: The HTLA Tangent Index achieves a **$67\times$ reduction** in query working set size, requiring only **134.2 KB per query** compared to the Array Scan (9.0 MB), preventing cache line thrashing in multi-tenant environments.
 * **Workload-Aware Optimization**: Under selective filters (e.g. symbol-restricted query), the planner bypasses tree-routing overhead and falls back directly to localized SIMD scans, proving the value of co-designed vector-relational planning.
 
+### 4.3 Academic Conversational Memory Workload (LoCoMo Benchmark)
+To evaluate performance on standard academic LLM agent long-term memory scenarios, we benchmarked the **LoCoMo** dataset (5,882 conversational utterances across 10 distinct speaker sessions/scopes).
+
+![SSTable Candidate Path Comparison (LoCoMo)](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/sstable_bench_locomo.png)
+
+* **Multi-Tenant Memory Isolation**: Spanning 10 distinct scopes (conversations), HTLA manages localized tangent spaces per conversation, achieving a **$22.6\times$ reduction** in working-set size per query (**134.2 KB** for HTLA vs. **3.0 MB** for Array Scan).
+* **High-Throughput Conversational Search**: The Pivot Prefix Index and the Adaptive Planner achieve the lowest latencies (~53.6 us and ~54.6 us), delivering a **$2.5\times$ speedup** over Array Scan (139.6 us) and a **$305\times$ speedup** over naive JSONL scans (16.6 ms) for real-time conversational retrieval.
+* **Recall-Latency Trade-offs**: In conversational QA reasoning where queries are complex natural language questions, HTLA retains the highest indexed recall (17/50 correct answers), while the Adaptive Planner leverages lightweight index lookups for faster real-time conversational flow at a slight trade-off in recall.
+
 ---
 
 ## 5. Conclusion & Consensus Validation

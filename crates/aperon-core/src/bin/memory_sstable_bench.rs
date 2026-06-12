@@ -236,6 +236,9 @@ fn run() -> Result<(), String> {
     let agent_memory_scenario = load_agent_memory_scenario()?;
     run_scenario(&agent_memory_scenario, &args.out.join("agent-memory"))?;
 
+    let locomo_scenario = load_locomo_scenario()?;
+    run_scenario(&locomo_scenario, &args.out.join("locomo"))?;
+
     Ok(())
 }
 
@@ -1878,6 +1881,90 @@ fn load_agent_memory_scenario() -> Result<Scenario, String> {
         name: "agent-memory".to_string(),
         category: "agent-memory-real",
         description: "real vectorized multi-agent dev logs trajectory scenario",
+        required: false,
+        records,
+        queries,
+    })
+}
+
+fn load_locomo_scenario() -> Result<Scenario, String> {
+    let records_path = Path::new("benchmarks/data/locomo/locomo_records.json");
+    let queries_path = Path::new("benchmarks/data/locomo/locomo_queries.json");
+    if !records_path.exists() || !queries_path.exists() {
+        return Err(format!("LoCoMo dataset files not found under benchmarks/data/locomo/"));
+    }
+    
+    let records_str = std::fs::read_to_string(records_path)
+        .map_err(|err| format!("read locomo records: {err}"))?;
+    let queries_str = std::fs::read_to_string(queries_path)
+        .map_err(|err| format!("read locomo queries: {err}"))?;
+        
+    let json_records: Vec<JsonMemoryRecord> = serde_json::from_str(&records_str)
+        .map_err(|err| format!("parse locomo records: {err}"))?;
+        
+    #[derive(Debug, Deserialize)]
+    struct JsonLocomoQuery {
+        query_id: u64,
+        scope_id: u32,
+        expected_record_ids: Vec<u64>,
+        embedding: Vec<f32>,
+    }
+    
+    let json_queries: Vec<JsonLocomoQuery> = serde_json::from_str(&queries_str)
+        .map_err(|err| format!("parse locomo queries: {err}"))?;
+        
+    let mut records = Vec::with_capacity(json_records.len());
+    let mut queries = Vec::new();
+    
+    let num_segments = 10;
+    
+    for jr in &json_records {
+        let segment_id = (jr.record_id % num_segments) as u64;
+        
+        let record = BenchRecord {
+            segment_id,
+            record: MemoryRecordInput {
+                record_id: jr.record_id,
+                scope_id: jr.scope_id,
+                timestamp: jr.timestamp,
+                source_id: jr.source_id,
+                confidence: jr.confidence,
+                text: jr.text.clone(),
+                embedding: jr.embedding.clone(),
+                symbols: jr.symbols.clone(),
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
+            },
+        };
+        records.push(record);
+    }
+    
+    // Select a subset of queries to speed up benchmark (e.g. 50 queries)
+    for (i, jq) in json_queries.iter().enumerate() {
+        if i % 40 == 0 && !jq.expected_record_ids.is_empty() {
+            queries.push(BenchQuery {
+                query: RecallQuery {
+                    embedding: Some(jq.embedding.clone()),
+                    symbols: Vec::new(), // Pure semantic query represents conversational memory
+                    scope_id: Some(jq.scope_id),
+                    time_start: None,
+                    time_end: None,
+                    min_confidence: None,
+                    limit: 10,
+                    candidate_budget: Some(128),
+                    vector_id: None,
+                    metadata_filter: std::collections::BTreeMap::new(),
+                    fallback_to_recon_on_cold: false,
+                },
+                expected_record_id: jq.expected_record_ids[0],
+            });
+        }
+    }
+    
+    Ok(Scenario {
+        name: "locomo".to_string(),
+        category: "locomo-conversational-memory",
+        description: "LoCoMo long-term conversational memory dataset scenario",
         required: false,
         records,
         queries,
