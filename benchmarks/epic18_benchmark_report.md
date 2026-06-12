@@ -9,7 +9,7 @@ This report summarizes the performance metrics, hardware PMU profiling analysis,
 The QPS vs. Recall Pareto Frontier evaluates search throughput (QPS) at varying Recall@10 accuracy levels on the SIFT dataset.
 
 ### Pareto Frontier Plot
-![QPS vs Recall Pareto Frontier](file:///Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/latency_recall.png)
+![QPS vs Recall Pareto Frontier](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/latency_recall.png)
 
 ### Key Observations:
 - **Accuracy Parity**: Aperon Mode B (Tiered Rerank) achieves a final Recall@10 of **1.000** (nearing HNSW's 1.000), while operating inside a heavily constrained memory footprint.
@@ -22,7 +22,7 @@ The QPS vs. Recall Pareto Frontier evaluates search throughput (QPS) at varying 
 Zero-copy session forking allows agents to branch their memory state instantly without duplicating physical vectors on disk or in memory.
 
 ### Fork Latency Comparison
-![Fork Latency vs Database Size](file:///Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/fork_latency.png)
+![Fork Latency vs Database Size](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/fork_latency.png)
 
 ### Latency Scale Table:
 | Scale (N) | FAISS HNSW Save/Copy (ms) | Aperon Zero-Copy Fork (ms) | Speedup Ratio |
@@ -58,7 +58,29 @@ The CPU Performance Monitoring Unit (PMU) logs confirm the "pointer tax" of grap
 
 ---
 
-## 4. Conclusion & Consensus Validation
+## 4. SSTable Candidate Path Comparison
+
+To evaluate Aperon's integrated storage engine performance, we run the Rust-native `memory_sstable_bench` simulating metadata-filtered, symbol-selective, and semantic queries across two distinct workloads: a large synthetic dataset and a real-world multi-agent trajectory dataset.
+
+### 4.1 Synthetic Workload (N = 100,000)
+![SSTable Candidate Path Comparison (Synthetic)](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/sstable_bench_comparison.png)
+
+* **Memory Overhead Reduction**: The HTLA Tangent Index reduces the query working-set size to **222.4 KB per query**, representing a **$30\times$ reduction** compared to the full Array Scan (~6,800.0 KB), while still maintaining **1.000 Recall@10** in this scenario.
+* **Latency Trade-offs**: The pure Array Scan (Flat) and the Adaptive Planner achieve the lowest latency (~165 us), whereas the HTLA tree routing overhead adds around 560 us of latency, showing a clear trade-off between memory workspace footprint and search speed.
+* **Adaptive Routing**: The Adaptive Planner dynamically chooses the optimal routing path based on query confidence and filter selectivity, delivering the highest recall with balanced latency.
+
+### 4.2 Real-world Agent Memory Workload (N = 17,485)
+This dataset consists of 17,485 real execution traces and dialog logs compiled from the Substratum multi-agent development trajectories, vectorized using TF-IDF and deterministic random projection.
+
+![SSTable Candidate Path Comparison (Agent Memory)](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/sstable_bench_agent_memory.png)
+
+* **Planner Performance Dominance**: On the real agent workload (which features highly selective relational and symbolic filters), the **Adaptive Planner** achieves the absolute lowest latency of **170.5 us**, which is **$3.7\times$ faster** than the Array Scan (630.8 us) and **$320\times$ faster** than the naive JSONL scan (54.4 ms).
+* **Extreme Memory Protection**: The HTLA Tangent Index achieves a **$67\times$ reduction** in query working set size, requiring only **134.2 KB per query** compared to the Array Scan (9.0 MB), preventing cache line thrashing in multi-tenant environments.
+* **Workload-Aware Optimization**: Under selective filters (e.g. symbol-restricted query), the planner bypasses tree-routing overhead and falls back directly to localized SIMD scans, proving the value of co-designed vector-relational planning.
+
+---
+
+## 5. Conclusion & Consensus Validation
 
 The benchmarking results validate that:
 * **Zero-copy branching** is scalable and constant-time, enabling rapid agent context switching.
