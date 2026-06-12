@@ -493,6 +493,7 @@ impl MemoryVectorCandidateGenerator for ArrayLikeMemoryVectorCandidateGenerator 
 pub struct PivotPrefixMemoryVectorCandidateGenerator {
     segment_id: u64,
     router: PivotPrefixRouter,
+    fallback: ArrayLikeMemoryVectorCandidateGenerator,
     last_trace: std::sync::Mutex<Option<MemoryVectorRouteTrace>>,
 }
 
@@ -501,6 +502,7 @@ impl Clone for PivotPrefixMemoryVectorCandidateGenerator {
         Self {
             segment_id: self.segment_id,
             router: self.router.clone(),
+            fallback: self.fallback.clone(),
             last_trace: std::sync::Mutex::new(self.last_trace.lock().unwrap().clone()),
         }
     }
@@ -508,7 +510,9 @@ impl Clone for PivotPrefixMemoryVectorCandidateGenerator {
 
 impl PartialEq for PivotPrefixMemoryVectorCandidateGenerator {
     fn eq(&self, other: &Self) -> bool {
-        self.segment_id == other.segment_id && self.router == other.router
+        self.segment_id == other.segment_id
+            && self.router == other.router
+            && self.fallback == other.fallback
     }
 }
 
@@ -518,6 +522,7 @@ impl PivotPrefixMemoryVectorCandidateGenerator {
         Ok(Self {
             segment_id: segment.segment_id,
             router,
+            fallback: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
             last_trace: std::sync::Mutex::new(None),
         })
     }
@@ -572,20 +577,24 @@ impl MemoryVectorCandidateGenerator for PivotPrefixMemoryVectorCandidateGenerato
                 candidates_after_symbols.binary_search(local_id).is_ok() && seen.insert(*local_id)
             })
             .collect::<Vec<_>>();
-        if let Some(budget) = query.candidate_budget {
-            routed.truncate(budget);
-        }
+        let budget = query
+            .candidate_budget
+            .unwrap_or(self.router.candidate_pool)
+            .min(self.router.candidate_pool)
+            .max(1);
+        routed.truncate(budget);
         routed.sort_unstable();
 
-        if routed.is_empty() && !candidates_after_symbols.is_empty() {
+        let threshold = (budget / 2).min(candidates_after_symbols.len());
+        if (routed.len() < threshold || routed.is_empty() || metrics.fallback)
+            && !candidates_after_symbols.is_empty()
+        {
             if let Some(trace) = self.last_trace.lock().unwrap().as_mut() {
                 trace.fallback_used = true;
             }
-            let mut fallback = candidates_after_symbols.to_vec();
-            if let Some(budget) = query.candidate_budget {
-                fallback.truncate(budget);
-            }
-            return Ok(fallback);
+            return self
+                .fallback
+                .candidates(segment, query, candidates_after_symbols);
         }
         Ok(routed)
     }
@@ -730,8 +739,10 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
         routed.truncate(budget);
         routed.sort_unstable();
 
+        let threshold = (budget / 2).min(candidates_after_symbols.len());
         if (self.config.fallback_on_route_risk && route.fallback)
-            || (routed.is_empty() && !candidates_after_symbols.is_empty())
+            || ((routed.len() < threshold || routed.is_empty())
+                && !candidates_after_symbols.is_empty())
         {
             if let Some(trace) = self.last_trace.lock().unwrap().as_mut() {
                 trace.fallback_used = true;
@@ -761,12 +772,12 @@ pub struct MemoryQueryPlannerConfig {
 impl Default for MemoryQueryPlannerConfig {
     fn default() -> Self {
         Self {
-            direct_candidate_threshold: 16,
-            vector_candidate_budget: 32,
+            direct_candidate_threshold: 256,
+            vector_candidate_budget: 128,
             fallback_budget_multiplier: 2,
-            pivot_min_candidates: 32,
-            htla_enabled: false,
-            htla_min_candidates: 128,
+            pivot_min_candidates: 256,
+            htla_enabled: true,
+            htla_min_candidates: 256,
         }
     }
 }
@@ -2698,9 +2709,9 @@ fn default_memory_pivot_prefix_config(segment: &MemorySegment) -> PivotPrefixCon
     let record_count = segment.len().max(1);
     PivotPrefixConfig {
         block_size: record_count.clamp(1, 64),
-        pivot_count: record_count.clamp(1, 16),
-        prefix_len: 1,
-        top_blocks: 1,
+        pivot_count: (record_count / 8).clamp(16, 256),
+        prefix_len: 2,
+        top_blocks: (record_count / 128).clamp(1, 4),
         candidate_pool: record_count,
         mode: PrefixScoreMode::Weighted,
         cluster_iters: 2,
@@ -2713,8 +2724,8 @@ fn default_memory_htla_config(segment: &MemorySegment) -> HtlaMemoryVectorConfig
         levels: if record_count >= 8 { 3 } else { 2 },
         chart_dim: segment.dim.clamp(1, 4),
         beam: 4,
-        candidate_pool: record_count.clamp(1, 64),
-        final_nprobe: record_count.clamp(1, 16),
+        candidate_pool: record_count.clamp(1, 256),
+        final_nprobe: record_count.clamp(1, 32),
         fallback_on_route_risk: true,
     }
 }

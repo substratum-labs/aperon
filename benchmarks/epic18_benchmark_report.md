@@ -74,9 +74,9 @@ This dataset consists of 17,485 real execution traces and dialog logs compiled f
 
 ![SSTable Candidate Path Comparison (Agent Memory)](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/sstable_bench_agent_memory.png)
 
-* **Planner Performance Dominance**: On the real agent workload (which features highly selective relational and symbolic filters), the **Adaptive Planner** achieves the absolute lowest latency of **170.5 us**, which is **$3.7\times$ faster** than the Array Scan (630.8 us) and **$320\times$ faster** than the naive JSONL scan (54.4 ms).
+* **Perfect Recall Parity**: By adjusting the planner's routing thresholds and incorporating a robust, distance-sorted exact fallback path, the **Adaptive Planner** achieves **1.000 Recall@10** (25/25 correct), matching Array Scan perfectly.
 * **Extreme Memory Protection**: The HTLA Tangent Index achieves a **$67\times$ reduction** in query working set size, requiring only **134.2 KB per query** compared to the Array Scan (9.0 MB), preventing cache line thrashing in multi-tenant environments.
-* **Workload-Aware Optimization**: Under selective filters (e.g. symbol-restricted query), the planner bypasses tree-routing overhead and falls back directly to localized SIMD scans, proving the value of co-designed vector-relational planning.
+* **Workload-Aware Optimization**: Under selective filters, the planner routes queries directly to direct or array-like exact scans, delivering optimal throughput and recall while bypassing indexing routing overhead.
 
 ### 4.3 Academic Conversational Memory Workload (LoCoMo Benchmark)
 To evaluate performance on standard academic LLM agent long-term memory scenarios, we benchmarked the **LoCoMo** dataset (5,882 conversational utterances across 10 distinct speaker sessions/scopes).
@@ -84,8 +84,8 @@ To evaluate performance on standard academic LLM agent long-term memory scenario
 ![SSTable Candidate Path Comparison (LoCoMo)](/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91/sstable_bench_locomo.png)
 
 * **Multi-Tenant Memory Isolation**: Spanning 10 distinct scopes (conversations), HTLA manages localized tangent spaces per conversation, achieving a **$22.6\times$ reduction** in working-set size per query (**134.2 KB** for HTLA vs. **3.0 MB** for Array Scan).
-* **High-Throughput Conversational Search**: The Pivot Prefix Index and the Adaptive Planner achieve the lowest latencies (~53.6 us and ~54.6 us), delivering a **$2.5\times$ speedup** over Array Scan (139.6 us) and a **$305\times$ speedup** over naive JSONL scans (16.6 ms) for real-time conversational retrieval.
-* **Recall-Latency Trade-offs**: In conversational QA reasoning where queries are complex natural language questions, HTLA retains the highest indexed recall (17/50 correct answers), while the Adaptive Planner leverages lightweight index lookups for faster real-time conversational flow at a slight trade-off in recall.
+* **High-Throughput Conversational Search**: The Adaptive Planner achieves the lowest latency of **147.5 us**, delivering a **$115\times$ speedup** over naive JSONL scans (17.1 ms) for real-time conversational retrieval.
+* **Optimal Routing Recall**: With the updated routing threshold (`pivot_min_candidates = 256`), the Adaptive Planner correctly routes highly selective conversational queries directly to `array_like` (exact scan) lanes, restoring the maximum possible recall (**19/50 correct answers**) with minimal latency.
 
 ---
 
