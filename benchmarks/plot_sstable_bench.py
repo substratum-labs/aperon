@@ -108,5 +108,12 @@ def main():
         "SSTable Search Candidate Generation Path Comparison (Real Agent Memory N = 17,485)"
     )
 
+    # Plot Scenario 3: LoCoMo Dataset (5.8k records)
+    plot_scenario(
+        Path("/Users/yong/projects/aperon/target/memory-sstable-bench/locomo/summary.json"),
+        "sstable_bench_locomo.png",
+        "SSTable Search Candidate Generation Path Comparison (LoCoMo N = 5,882)"
+    )
+
 if __name__ == "__main__":
     main()
