@@ -38,10 +38,10 @@ pub struct BlockSoaLayout {
     sketch_dim: usize,
     residual_bits: u8,
     block_size: usize,
-    ids: Vec<VectorId>,
-    coords: Vec<i16>,
-    residuals: Vec<u16>,
-    sketches: Vec<u8>,
+    ids: std::sync::Arc<Vec<VectorId>>,
+    coords: std::sync::Arc<Vec<i16>>,
+    residuals: std::sync::Arc<Vec<u16>>,
+    sketches: std::sync::Arc<Vec<u8>>,
 }
 
 impl BlockSoaLayout {
@@ -69,10 +69,10 @@ impl BlockSoaLayout {
             sketch_dim,
             residual_bits,
             block_size,
-            ids: Vec::new(),
-            coords: Vec::new(),
-            residuals: Vec::new(),
-            sketches: Vec::new(),
+            ids: std::sync::Arc::new(Vec::new()),
+            coords: std::sync::Arc::new(Vec::new()),
+            residuals: std::sync::Arc::new(Vec::new()),
+            sketches: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -149,19 +149,25 @@ impl BlockSoaLayout {
         }
 
         let block = self.ids.len() / self.block_size;
-        for (k, coord) in coords.iter().enumerate() {
-            let offset = self.coord_offset(block, k, slot);
-            self.coords[offset] = *coord;
+
+        {
+            let coords_vec = std::sync::Arc::make_mut(&mut self.coords);
+            let local_dim = self.local_dim;
+            let block_size = self.block_size;
+            for (k, coord) in coords.iter().enumerate() {
+                let offset = block * local_dim * block_size + k * block_size + slot;
+                coords_vec[offset] = *coord;
+            }
         }
 
         let residual_offset = block * self.block_size + slot;
-        self.residuals[residual_offset] = residual;
+        std::sync::Arc::make_mut(&mut self.residuals)[residual_offset] = residual;
 
         for (m, sketch) in sketches.iter().enumerate() {
             self.set_sketch(block, m, slot, *sketch);
         }
 
-        self.ids.push(id);
+        std::sync::Arc::make_mut(&mut self.ids).push(id);
         Ok(())
     }
 
@@ -204,6 +210,18 @@ impl BlockSoaLayout {
         &self.coords[start..start + self.block_size]
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn block_coords_ptr(&self, block: usize) -> *const i16 {
+        let start = block * self.local_dim * self.block_size;
+        unsafe { self.coords.as_ptr().add(start) }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn block_sketches_ptr(&self, block: usize) -> *const i8 {
+        let start = block * self.sketch_dim * self.block_size;
+        unsafe { self.sketches.as_ptr().add(start) as *const i8 }
+    }
+
     pub(crate) fn residual_block(&self, block: usize) -> &[u16] {
         let start = block * self.block_size;
         &self.residuals[start..start + self.block_size]
@@ -218,14 +236,16 @@ impl BlockSoaLayout {
     }
 
     fn start_block(&mut self) {
-        self.coords.extend(std::iter::repeat_n(
-            i16::MAX,
-            self.local_dim * self.block_size,
-        ));
-        self.residuals
-            .extend(std::iter::repeat_n(u16::MAX, self.block_size));
-        self.sketches
-            .extend(std::iter::repeat_n(0xff, self.sketch_bytes_per_block()));
+        let coords_len = self.local_dim * self.block_size;
+        let block_size = self.block_size;
+        let sketch_bytes = self.sketch_bytes_per_block();
+
+        std::sync::Arc::make_mut(&mut self.coords)
+            .extend(std::iter::repeat_n(i16::MAX, coords_len));
+        std::sync::Arc::make_mut(&mut self.residuals)
+            .extend(std::iter::repeat_n(u16::MAX, block_size));
+        std::sync::Arc::make_mut(&mut self.sketches)
+            .extend(std::iter::repeat_n(0xff, sketch_bytes));
     }
 
     fn coord_offset(&self, block: usize, dim: usize, lane: usize) -> usize {
@@ -257,7 +277,7 @@ impl BlockSoaLayout {
         match self.residual_bits {
             8 => {
                 let offset = self.sketch_offset(block, dim, lane);
-                self.sketches[offset] = value as u8;
+                std::sync::Arc::make_mut(&mut self.sketches)[offset] = value as u8;
             }
             2 => self.set_sketch_code(block, dim, lane, encode_2bit(value)),
             1 => self.set_sketch_code(block, dim, lane, encode_1bit(value)),
@@ -268,7 +288,8 @@ impl BlockSoaLayout {
     fn set_sketch_code(&mut self, block: usize, dim: usize, lane: usize, code: u8) {
         let (byte, shift) = self.packed_sketch_offset(block, dim, lane);
         let mask = ((1_u8 << self.residual_bits) - 1) << shift;
-        self.sketches[byte] = (self.sketches[byte] & !mask) | ((code << shift) & mask);
+        let sketches = std::sync::Arc::make_mut(&mut self.sketches);
+        sketches[byte] = (sketches[byte] & !mask) | ((code << shift) & mask);
     }
 
     /// Serialise all blocks into the wire-format byte sequence expected by
@@ -402,6 +423,85 @@ impl BlockSoaLayout {
     }
 }
 
+/// A cache-aligned structure-of-arrays block representing a subset of quantized vectors.
+/// Maps directly to disk/memory-mapped files for zero-copy scans.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PackedBlock<const LOCAL_DIM: usize, const BLOCK_SIZE: usize> {
+    pub coords: [[i16; BLOCK_SIZE]; LOCAL_DIM],
+    pub residual_norms: [u16; BLOCK_SIZE],
+    pub ids: [u32; BLOCK_SIZE],
+}
+
+impl<const LOCAL_DIM: usize, const BLOCK_SIZE: usize> PackedBlock<LOCAL_DIM, BLOCK_SIZE> {
+    /// Casts a byte slice directly to a reference to `PackedBlock`.
+    ///
+    /// # Safety
+    /// The caller must ensure the byte slice is aligned to 64 bytes.
+    /// If alignment is incorrect, this returns an Err indicating alignment mismatch.
+    pub fn from_bytes(bytes: &[u8]) -> Result<&Self, String> {
+        let expected_size = std::mem::size_of::<Self>();
+        if bytes.len() < expected_size {
+            return Err(format!(
+                "byte slice is too small: expected at least {}, got {}",
+                expected_size,
+                bytes.len()
+            ));
+        }
+
+        let ptr = bytes.as_ptr();
+        if !(ptr as usize).is_multiple_of(std::mem::align_of::<Self>()) {
+            return Err(format!(
+                "byte slice pointer ({:p}) is not aligned to {}",
+                ptr,
+                std::mem::align_of::<Self>()
+            ));
+        }
+
+        // Safety: We have verified the size and alignment.
+        // PackedBlock only contains primitive types (i16, u16, u32) which have no invalid bit patterns.
+        unsafe { Ok(&*(ptr as *const Self)) }
+    }
+
+    /// Casts a mutable byte slice directly to a mutable reference to `PackedBlock`.
+    pub fn from_bytes_mut(bytes: &mut [u8]) -> Result<&mut Self, String> {
+        let expected_size = std::mem::size_of::<Self>();
+        if bytes.len() < expected_size {
+            return Err(format!(
+                "byte slice is too small: expected at least {}, got {}",
+                expected_size,
+                bytes.len()
+            ));
+        }
+
+        let ptr = bytes.as_mut_ptr();
+        if !(ptr as usize).is_multiple_of(std::mem::align_of::<Self>()) {
+            return Err(format!(
+                "byte slice pointer ({:p}) is not aligned to {}",
+                ptr,
+                std::mem::align_of::<Self>()
+            ));
+        }
+
+        // Safety: We have verified the size and alignment.
+        unsafe { Ok(&mut *(ptr as *mut Self)) }
+    }
+
+    /// Reads an unaligned byte slice into a `PackedBlock` copy.
+    pub fn read_unaligned(bytes: &[u8]) -> Result<Self, String> {
+        let expected_size = std::mem::size_of::<Self>();
+        if bytes.len() < expected_size {
+            return Err(format!(
+                "byte slice is too small: expected at least {}, got {}",
+                expected_size,
+                bytes.len()
+            ));
+        }
+        // Safety: PackedBlock only contains plain-old-data copy types.
+        unsafe { Ok(std::ptr::read_unaligned(bytes.as_ptr() as *const Self)) }
+    }
+}
+
 pub fn validate_residual_bits(bits: u8) -> Result<(), String> {
     if matches!(bits, 1 | 2 | 8) {
         Ok(())
@@ -430,7 +530,7 @@ fn decode_1bit(code: u8) -> i8 {
     }
 }
 
-fn encode_2bit(value: i8) -> u8 {
+pub(crate) fn encode_2bit(value: i8) -> u8 {
     match value {
         i8::MIN..=-2 => 0,
         -1 => 1,
@@ -439,7 +539,7 @@ fn encode_2bit(value: i8) -> u8 {
     }
 }
 
-fn decode_2bit(code: u8) -> i8 {
+pub(crate) fn decode_2bit(code: u8) -> i8 {
     match code & 0b11 {
         0 => -3,
         1 => -1,
@@ -511,5 +611,70 @@ mod tests {
         assert_eq!(layout.sketch(0, 1, 0), 1);
         assert_eq!(layout.sketch(0, 1, 1), 3);
         assert_eq!(layout.raw_block_bytes().len(), 4 * (2 + 2 + 4) + 2);
+    }
+
+    #[test]
+    fn zero_copy_packed_block_casting() {
+        // We use a local dim of 2 and a block size of 4.
+        // Size: coords = 2 * 4 * 2 = 16 bytes.
+        // residual_norms = 4 * 2 = 8 bytes.
+        // ids = 4 * 4 = 16 bytes.
+        // Total = 40 bytes.
+        // Aligned to 64 bytes, so size_of is 64.
+
+        #[repr(C, align(64))]
+        #[derive(Clone, Copy)]
+        struct AlignedBuffer([u8; 64]);
+        let mut buf = AlignedBuffer([0u8; 64]);
+
+        let coords_0 = [1i16, 2, 3, 4];
+        let coords_1 = [10i16, 20, 30, 40];
+        let residuals = [100u16, 200, 300, 400];
+        let ids = [1000u32, 2000, 3000, 4000];
+
+        // Copy them into the buffer using native endianness (since PackedBlock zero-copy cast accesses native).
+        let mut offset = 0;
+        for &val in &coords_0 {
+            buf.0[offset..offset + 2].copy_from_slice(&val.to_ne_bytes());
+            offset += 2;
+        }
+        for &val in &coords_1 {
+            buf.0[offset..offset + 2].copy_from_slice(&val.to_ne_bytes());
+            offset += 2;
+        }
+        for &val in &residuals {
+            buf.0[offset..offset + 2].copy_from_slice(&val.to_ne_bytes());
+            offset += 2;
+        }
+        for &val in &ids {
+            buf.0[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
+            offset += 4;
+        }
+
+        // Try casting it.
+        let block = PackedBlock::<2, 4>::from_bytes(&buf.0).unwrap();
+        assert_eq!(block.coords[0], coords_0);
+        assert_eq!(block.coords[1], coords_1);
+        assert_eq!(block.residual_norms, residuals);
+        assert_eq!(block.ids, ids);
+
+        // Try mutable casting.
+        let mut buf_mut = buf;
+        let block_mut = PackedBlock::<2, 4>::from_bytes_mut(&mut buf_mut.0).unwrap();
+        block_mut.coords[0][0] = 999;
+        assert_eq!(block_mut.coords[0][0], 999);
+
+        // Try unaligned.
+        let mut unaligned_buf = [0u8; 64];
+        unaligned_buf[..40].copy_from_slice(&buf.0[..40]);
+        let block_unaligned = PackedBlock::<2, 4>::read_unaligned(&unaligned_buf).unwrap();
+        assert_eq!(block_unaligned.coords[0], coords_0);
+        assert_eq!(block_unaligned.coords[1], coords_1);
+        assert_eq!(block_unaligned.residual_norms, residuals);
+        assert_eq!(block_unaligned.ids, ids);
+
+        // Verify that casting on unaligned returns an error (using an odd offset guaranteed to be unaligned for align=64).
+        let shifted_buf = &unaligned_buf[1..];
+        assert!(PackedBlock::<2, 4>::from_bytes(shifted_buf).is_err());
     }
 }

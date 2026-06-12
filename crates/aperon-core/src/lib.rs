@@ -11,11 +11,14 @@ pub mod quantization;
 pub mod routing;
 mod scan;
 pub mod shared;
+pub mod wab;
+
+pub use wab::{WabRecord, WriteAheadBuffer};
 
 pub use distance::{l2_squared, Distance};
 pub use grain::{Grain, GrainId, ScoredVector};
 pub use index::{AperonIndex, IndexStats};
-pub use layout::{BlockSoaLayout, VectorId, DEFAULT_BLOCK_SIZE};
+pub use layout::{BlockSoaLayout, PackedBlock, VectorId, DEFAULT_BLOCK_SIZE};
 pub use memory_sstable::{
     stable_memory_branch_id, ArrayLikeMemoryVectorCandidateGenerator, ArrayLikeMemoryVectorIndex,
     ColdVectorStore, Collection, FlatMemoryVectorCandidateGenerator,
