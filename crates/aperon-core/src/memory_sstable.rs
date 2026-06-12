@@ -321,6 +321,11 @@ impl PartialEq for MemorySpace {
     }
 }
 
+thread_local! {
+    static LAST_ROUTE_TRACE: std::cell::RefCell<Option<(usize, MemoryVectorRouteTrace)>> = const { std::cell::RefCell::new(None) };
+    static LAST_PLANNER_TRACE: std::cell::RefCell<Option<(usize, MemoryQueryPlannerTrace)>> = const { std::cell::RefCell::new(None) };
+}
+
 pub trait MemoryVectorCandidateGenerator {
     fn name(&self) -> &'static str;
 
@@ -366,8 +371,7 @@ impl MemoryVectorCandidateGenerator for FlatMemoryVectorCandidateGenerator {
 pub struct ArrayLikeMemoryVectorIndex {
     dim: usize,
     segment_id: u64,
-    local_ids: Vec<u32>,
-    embeddings: Vec<f32>,
+    len: usize,
 }
 
 impl ArrayLikeMemoryVectorIndex {
@@ -375,31 +379,24 @@ impl ArrayLikeMemoryVectorIndex {
         Self {
             dim: segment.dim,
             segment_id: segment.segment_id,
-            local_ids: (0..segment.len()).map(|local_id| local_id as u32).collect(),
-            embeddings: segment.embeddings.clone(),
+            len: segment.len(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.local_ids.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.local_ids.is_empty()
+        self.len == 0
     }
 
     pub fn vector_index_bytes(&self) -> usize {
-        self.local_ids.len() * std::mem::size_of::<u32>()
-            + self.embeddings.len() * std::mem::size_of::<f32>()
+        self.len * std::mem::size_of::<u32>() + self.len * self.dim * std::mem::size_of::<f32>()
     }
 
     pub fn segment_id(&self) -> u64 {
         self.segment_id
-    }
-
-    fn embedding_row(&self, local_id: u32) -> &[f32] {
-        let local_id = local_id as usize;
-        &self.embeddings[local_id * self.dim..(local_id + 1) * self.dim]
     }
 }
 
@@ -440,7 +437,7 @@ impl MemoryVectorCandidateGenerator for ArrayLikeMemoryVectorCandidateGenerator 
         if self.index.dim != segment.dim || self.index.len() != segment.len() {
             return Err("array-like vector index layout mismatch".to_string());
         }
-        if self.index.embeddings.is_empty() {
+        if segment.embeddings.is_empty() {
             return Ok(candidates_after_symbols.to_vec());
         }
 
@@ -461,8 +458,10 @@ impl MemoryVectorCandidateGenerator for ArrayLikeMemoryVectorCandidateGenerator 
         let mut scored = candidates_after_symbols
             .iter()
             .map(|&local_id| {
+                let start = local_id as usize * segment.dim;
+                let end = start + segment.dim;
                 let distance =
-                    l2_squared_unchecked(query_embedding, self.index.embedding_row(local_id));
+                    l2_squared_unchecked(query_embedding, &segment.embeddings[start..end]);
                 (local_id, distance)
             })
             .collect::<Vec<_>>();
@@ -489,27 +488,11 @@ impl MemoryVectorCandidateGenerator for ArrayLikeMemoryVectorCandidateGenerator 
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PivotPrefixMemoryVectorCandidateGenerator {
     segment_id: u64,
     router: PivotPrefixRouter,
-    last_trace: std::sync::Mutex<Option<MemoryVectorRouteTrace>>,
-}
-
-impl Clone for PivotPrefixMemoryVectorCandidateGenerator {
-    fn clone(&self) -> Self {
-        Self {
-            segment_id: self.segment_id,
-            router: self.router.clone(),
-            last_trace: std::sync::Mutex::new(self.last_trace.lock().unwrap().clone()),
-        }
-    }
-}
-
-impl PartialEq for PivotPrefixMemoryVectorCandidateGenerator {
-    fn eq(&self, other: &Self) -> bool {
-        self.segment_id == other.segment_id && self.router == other.router
-    }
+    fallback: ArrayLikeMemoryVectorCandidateGenerator,
 }
 
 impl PivotPrefixMemoryVectorCandidateGenerator {
@@ -518,7 +501,7 @@ impl PivotPrefixMemoryVectorCandidateGenerator {
         Ok(Self {
             segment_id: segment.segment_id,
             router,
-            last_trace: std::sync::Mutex::new(None),
+            fallback: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
         })
     }
 
@@ -542,7 +525,8 @@ impl MemoryVectorCandidateGenerator for PivotPrefixMemoryVectorCandidateGenerato
         query: &RecallQuery,
         candidates_after_symbols: &[u32],
     ) -> Result<Vec<u32>, String> {
-        *self.last_trace.lock().unwrap() = None;
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| *cell.borrow_mut() = None);
         if self.segment_id != segment.segment_id {
             return Err(format!(
                 "pivot-prefix vector index segment id mismatch: expected {}, got {}",
@@ -560,8 +544,7 @@ impl MemoryVectorCandidateGenerator for PivotPrefixMemoryVectorCandidateGenerato
 
         let mut scratch = self.router.scratch();
         let metrics = self.router.route(query_embedding, &mut scratch);
-        *self.last_trace.lock().unwrap() =
-            Some(memory_vector_route_trace(self.resident_bytes(), metrics));
+        let mut trace = memory_vector_route_trace(self.resident_bytes(), metrics);
 
         let mut seen = BTreeSet::new();
         let mut routed = scratch
@@ -572,26 +555,43 @@ impl MemoryVectorCandidateGenerator for PivotPrefixMemoryVectorCandidateGenerato
                 candidates_after_symbols.binary_search(local_id).is_ok() && seen.insert(*local_id)
             })
             .collect::<Vec<_>>();
-        if let Some(budget) = query.candidate_budget {
-            routed.truncate(budget);
-        }
+        let budget = query
+            .candidate_budget
+            .unwrap_or(self.router.candidate_pool)
+            .min(self.router.candidate_pool)
+            .max(1);
+        routed.truncate(budget);
         routed.sort_unstable();
 
-        if routed.is_empty() && !candidates_after_symbols.is_empty() {
-            if let Some(trace) = self.last_trace.lock().unwrap().as_mut() {
-                trace.fallback_used = true;
-            }
-            let mut fallback = candidates_after_symbols.to_vec();
-            if let Some(budget) = query.candidate_budget {
-                fallback.truncate(budget);
-            }
-            return Ok(fallback);
+        let threshold = budget.div_ceil(2).min(candidates_after_symbols.len());
+        if (routed.len() < threshold || routed.is_empty() || metrics.fallback)
+            && !candidates_after_symbols.is_empty()
+        {
+            trace.fallback_used = true;
+            LAST_ROUTE_TRACE.with(|cell| {
+                *cell.borrow_mut() = Some((self_ptr, trace));
+            });
+            return self
+                .fallback
+                .candidates(segment, query, candidates_after_symbols);
         }
+        LAST_ROUTE_TRACE.with(|cell| {
+            *cell.borrow_mut() = Some((self_ptr, trace));
+        });
         Ok(routed)
     }
 
     fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
-        self.last_trace.lock().unwrap().clone()
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| {
+            cell.borrow().as_ref().and_then(|(ptr, trace)| {
+                if *ptr == self_ptr {
+                    Some(trace.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 }
 
@@ -605,34 +605,12 @@ pub struct HtlaMemoryVectorConfig {
     pub fallback_on_route_risk: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HtlaMemoryVectorCandidateGenerator {
     segment_id: u64,
     router: HtlaRouter,
     config: HtlaMemoryVectorConfig,
     fallback: ArrayLikeMemoryVectorCandidateGenerator,
-    last_trace: std::sync::Mutex<Option<MemoryVectorRouteTrace>>,
-}
-
-impl Clone for HtlaMemoryVectorCandidateGenerator {
-    fn clone(&self) -> Self {
-        Self {
-            segment_id: self.segment_id,
-            router: self.router.clone(),
-            config: self.config.clone(),
-            fallback: self.fallback.clone(),
-            last_trace: std::sync::Mutex::new(self.last_trace.lock().unwrap().clone()),
-        }
-    }
-}
-
-impl PartialEq for HtlaMemoryVectorCandidateGenerator {
-    fn eq(&self, other: &Self) -> bool {
-        self.segment_id == other.segment_id
-            && self.router == other.router
-            && self.config == other.config
-            && self.fallback == other.fallback
-    }
 }
 
 impl HtlaMemoryVectorCandidateGenerator {
@@ -648,7 +626,6 @@ impl HtlaMemoryVectorCandidateGenerator {
             router,
             config,
             fallback: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
-            last_trace: std::sync::Mutex::new(None),
         })
     }
 
@@ -672,7 +649,8 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
         query: &RecallQuery,
         candidates_after_symbols: &[u32],
     ) -> Result<Vec<u32>, String> {
-        *self.last_trace.lock().unwrap() = None;
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| *cell.borrow_mut() = None);
         if self.segment_id != segment.segment_id {
             return Err(format!(
                 "htla vector index segment id mismatch: expected {}, got {}",
@@ -707,7 +685,7 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
             budget,
             final_nprobe.min(segment.len()).max(1),
         );
-        *self.last_trace.lock().unwrap() = Some(MemoryVectorRouteTrace {
+        let mut trace = MemoryVectorRouteTrace {
             vector_index_bytes: self.resident_bytes(),
             route_candidates: route.candidates.len(),
             posting_entries_touched: 0,
@@ -716,7 +694,7 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
             centroid_evals: route.candidates.len(),
             working_set_bytes: route.working_set_bytes,
             fallback_used: route.fallback,
-        });
+        };
 
         let mut seen = BTreeSet::new();
         let mut routed = route
@@ -730,21 +708,36 @@ impl MemoryVectorCandidateGenerator for HtlaMemoryVectorCandidateGenerator {
         routed.truncate(budget);
         routed.sort_unstable();
 
+        let threshold = budget.div_ceil(2).min(candidates_after_symbols.len());
         if (self.config.fallback_on_route_risk && route.fallback)
-            || (routed.is_empty() && !candidates_after_symbols.is_empty())
+            || ((routed.len() < threshold || routed.is_empty())
+                && !candidates_after_symbols.is_empty())
         {
-            if let Some(trace) = self.last_trace.lock().unwrap().as_mut() {
-                trace.fallback_used = true;
-            }
+            trace.fallback_used = true;
+            LAST_ROUTE_TRACE.with(|cell| {
+                *cell.borrow_mut() = Some((self_ptr, trace));
+            });
             return self
                 .fallback
                 .candidates(segment, query, candidates_after_symbols);
         }
+        LAST_ROUTE_TRACE.with(|cell| {
+            *cell.borrow_mut() = Some((self_ptr, trace));
+        });
         Ok(routed)
     }
 
     fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
-        self.last_trace.lock().unwrap().clone()
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| {
+            cell.borrow().as_ref().and_then(|(ptr, trace)| {
+                if *ptr == self_ptr {
+                    Some(trace.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 }
 
@@ -761,48 +754,24 @@ pub struct MemoryQueryPlannerConfig {
 impl Default for MemoryQueryPlannerConfig {
     fn default() -> Self {
         Self {
-            direct_candidate_threshold: 16,
-            vector_candidate_budget: 32,
+            direct_candidate_threshold: 256,
+            vector_candidate_budget: 128,
             fallback_budget_multiplier: 2,
-            pivot_min_candidates: 32,
-            htla_enabled: false,
-            htla_min_candidates: 128,
+            pivot_min_candidates: 256,
+            htla_enabled: true,
+            htla_min_candidates: 256,
         }
     }
 }
 
 /// A 5-layer query planner that routes queries through direct scans, flat scans,
 /// array-like indexes, pivot-prefix indexes, or HTLA lanes based on available metadata and budget.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MemoryQueryPlanner {
     config: MemoryQueryPlannerConfig,
     array_like: ArrayLikeMemoryVectorCandidateGenerator,
     pivot_prefix: Option<PivotPrefixMemoryVectorCandidateGenerator>,
     htla: Option<HtlaMemoryVectorCandidateGenerator>,
-    last_route: std::sync::Mutex<Option<MemoryVectorRouteTrace>>,
-    last_trace: std::sync::Mutex<Option<MemoryQueryPlannerTrace>>,
-}
-
-impl Clone for MemoryQueryPlanner {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            array_like: self.array_like.clone(),
-            pivot_prefix: self.pivot_prefix.clone(),
-            htla: self.htla.clone(),
-            last_route: std::sync::Mutex::new(self.last_route.lock().unwrap().clone()),
-            last_trace: std::sync::Mutex::new(self.last_trace.lock().unwrap().clone()),
-        }
-    }
-}
-
-impl PartialEq for MemoryQueryPlanner {
-    fn eq(&self, other: &Self) -> bool {
-        self.config == other.config
-            && self.array_like == other.array_like
-            && self.pivot_prefix == other.pivot_prefix
-            && self.htla == other.htla
-    }
 }
 
 impl MemoryQueryPlanner {
@@ -827,8 +796,6 @@ impl MemoryQueryPlanner {
             array_like: ArrayLikeMemoryVectorCandidateGenerator::build(segment),
             pivot_prefix,
             htla,
-            last_route: std::sync::Mutex::new(None),
-            last_trace: std::sync::Mutex::new(None),
         })
     }
 
@@ -890,13 +857,17 @@ impl MemoryQueryPlanner {
         candidates_after_symbols: usize,
         final_candidates: usize,
     ) {
-        *self.last_trace.lock().unwrap() = Some(MemoryQueryPlannerTrace {
+        let self_ptr = self as *const Self as usize;
+        let trace = MemoryQueryPlannerTrace {
             selected_path,
             candidate_budget,
             expanded_candidate_budget,
             fallback_reason,
             candidates_after_symbols,
             final_candidates,
+        };
+        LAST_PLANNER_TRACE.with(|cell| {
+            *cell.borrow_mut() = Some((self_ptr, trace));
         });
     }
 }
@@ -912,8 +883,9 @@ impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
         query: &RecallQuery,
         candidates_after_symbols: &[u32],
     ) -> Result<Vec<u32>, String> {
-        *self.last_route.lock().unwrap() = None;
-        *self.last_trace.lock().unwrap() = None;
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| *cell.borrow_mut() = None);
+        LAST_PLANNER_TRACE.with(|cell| *cell.borrow_mut() = None);
 
         let candidates_len = candidates_after_symbols.len();
         let budget = self.planned_budget(query, candidates_len);
@@ -991,7 +963,15 @@ impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
             candidates =
                 self.array_like
                     .candidates(segment, &expanded_query, candidates_after_symbols)?;
-            *self.last_route.lock().unwrap() = route;
+            if let Some(ref r) = route {
+                LAST_ROUTE_TRACE.with(|cell| {
+                    *cell.borrow_mut() = Some((self_ptr, r.clone()));
+                });
+            } else {
+                LAST_ROUTE_TRACE.with(|cell| {
+                    *cell.borrow_mut() = None;
+                });
+            }
             self.record_trace(
                 selected_path,
                 budget,
@@ -1003,7 +983,15 @@ impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
             return Ok(candidates);
         }
 
-        *self.last_route.lock().unwrap() = route;
+        if let Some(ref r) = route {
+            LAST_ROUTE_TRACE.with(|cell| {
+                *cell.borrow_mut() = Some((self_ptr, r.clone()));
+            });
+        } else {
+            LAST_ROUTE_TRACE.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        }
         self.record_trace(
             selected_path,
             budget,
@@ -1016,11 +1004,29 @@ impl MemoryVectorCandidateGenerator for MemoryQueryPlanner {
     }
 
     fn route_trace(&self) -> Option<MemoryVectorRouteTrace> {
-        self.last_route.lock().unwrap().clone()
+        let self_ptr = self as *const Self as usize;
+        LAST_ROUTE_TRACE.with(|cell| {
+            cell.borrow().as_ref().and_then(|(ptr, trace)| {
+                if *ptr == self_ptr {
+                    Some(trace.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     fn planner_trace(&self) -> Option<MemoryQueryPlannerTrace> {
-        self.last_trace.lock().unwrap().clone()
+        let self_ptr = self as *const Self as usize;
+        LAST_PLANNER_TRACE.with(|cell| {
+            cell.borrow().as_ref().and_then(|(ptr, trace)| {
+                if *ptr == self_ptr {
+                    Some(trace.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 }
 
@@ -2698,9 +2704,9 @@ fn default_memory_pivot_prefix_config(segment: &MemorySegment) -> PivotPrefixCon
     let record_count = segment.len().max(1);
     PivotPrefixConfig {
         block_size: record_count.clamp(1, 64),
-        pivot_count: record_count.clamp(1, 16),
-        prefix_len: 1,
-        top_blocks: 1,
+        pivot_count: (record_count / 8).clamp(16, 256),
+        prefix_len: 2,
+        top_blocks: (record_count / 128).clamp(1, 4),
         candidate_pool: record_count,
         mode: PrefixScoreMode::Weighted,
         cluster_iters: 2,
@@ -2713,8 +2719,8 @@ fn default_memory_htla_config(segment: &MemorySegment) -> HtlaMemoryVectorConfig
         levels: if record_count >= 8 { 3 } else { 2 },
         chart_dim: segment.dim.clamp(1, 4),
         beam: 4,
-        candidate_pool: record_count.clamp(1, 64),
-        final_nprobe: record_count.clamp(1, 16),
+        candidate_pool: record_count.clamp(1, 256),
+        final_nprobe: record_count.clamp(1, 32),
         fallback_on_route_risk: true,
     }
 }

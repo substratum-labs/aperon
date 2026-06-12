@@ -1816,23 +1816,26 @@ fn print_usage(bin: &str) {
 fn load_agent_memory_scenario() -> Result<Scenario, String> {
     let dataset_path = Path::new("benchmarks/data/agent_memory/agent_memory_dataset.json");
     if !dataset_path.exists() {
-        return Err(format!("dataset file not found at {}", dataset_path.display()));
+        return Err(format!(
+            "dataset file not found at {}",
+            dataset_path.display()
+        ));
     }
-    let data_str = std::fs::read_to_string(dataset_path)
-        .map_err(|err| format!("read dataset: {err}"))?;
-    
-    let json_records: Vec<JsonMemoryRecord> = serde_json::from_str(&data_str)
-        .map_err(|err| format!("parse dataset: {err}"))?;
-    
+    let data_str =
+        std::fs::read_to_string(dataset_path).map_err(|err| format!("read dataset: {err}"))?;
+
+    let json_records: Vec<JsonMemoryRecord> =
+        serde_json::from_str(&data_str).map_err(|err| format!("parse dataset: {err}"))?;
+
     let mut records = Vec::with_capacity(json_records.len());
     let mut queries = Vec::new();
-    
+
     // Split records into segments
     let num_segments = 10;
-    
+
     for (i, jr) in json_records.iter().enumerate() {
         let segment_id = (jr.record_id % num_segments) as u64;
-        
+
         let record = BenchRecord {
             segment_id,
             record: MemoryRecordInput {
@@ -1849,7 +1852,7 @@ fn load_agent_memory_scenario() -> Result<Scenario, String> {
             },
         };
         records.push(record);
-        
+
         // Select queries: take every 100th record starting from 15000 as a query
         if i >= 15000 && i % 100 == 0 {
             let query_symbols = if jr.symbols.is_empty() {
@@ -1857,7 +1860,7 @@ fn load_agent_memory_scenario() -> Result<Scenario, String> {
             } else {
                 vec![jr.symbols[0].clone()]
             };
-            
+
             queries.push(BenchQuery {
                 query: RecallQuery {
                     embedding: Some(jr.embedding.clone()),
@@ -1876,7 +1879,7 @@ fn load_agent_memory_scenario() -> Result<Scenario, String> {
             });
         }
     }
-    
+
     Ok(Scenario {
         name: "agent-memory".to_string(),
         category: "agent-memory-real",
@@ -1891,17 +1894,19 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
     let records_path = Path::new("benchmarks/data/locomo/locomo_records.json");
     let queries_path = Path::new("benchmarks/data/locomo/locomo_queries.json");
     if !records_path.exists() || !queries_path.exists() {
-        return Err(format!("LoCoMo dataset files not found under benchmarks/data/locomo/"));
+        return Err(format!(
+            "LoCoMo dataset files not found under benchmarks/data/locomo/"
+        ));
     }
-    
+
     let records_str = std::fs::read_to_string(records_path)
         .map_err(|err| format!("read locomo records: {err}"))?;
     let queries_str = std::fs::read_to_string(queries_path)
         .map_err(|err| format!("read locomo queries: {err}"))?;
-        
-    let json_records: Vec<JsonMemoryRecord> = serde_json::from_str(&records_str)
-        .map_err(|err| format!("parse locomo records: {err}"))?;
-        
+
+    let json_records: Vec<JsonMemoryRecord> =
+        serde_json::from_str(&records_str).map_err(|err| format!("parse locomo records: {err}"))?;
+
     #[derive(Debug, Deserialize)]
     struct JsonLocomoQuery {
         query_id: u64,
@@ -1909,18 +1914,18 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
         expected_record_ids: Vec<u64>,
         embedding: Vec<f32>,
     }
-    
-    let json_queries: Vec<JsonLocomoQuery> = serde_json::from_str(&queries_str)
-        .map_err(|err| format!("parse locomo queries: {err}"))?;
-        
+
+    let json_queries: Vec<JsonLocomoQuery> =
+        serde_json::from_str(&queries_str).map_err(|err| format!("parse locomo queries: {err}"))?;
+
     let mut records = Vec::with_capacity(json_records.len());
     let mut queries = Vec::new();
-    
+
     let num_segments = 10;
-    
+
     for jr in &json_records {
         let segment_id = (jr.record_id % num_segments) as u64;
-        
+
         let record = BenchRecord {
             segment_id,
             record: MemoryRecordInput {
@@ -1938,7 +1943,7 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
         };
         records.push(record);
     }
-    
+
     // Select a subset of queries to speed up benchmark (e.g. 50 queries)
     for (i, jq) in json_queries.iter().enumerate() {
         if i % 40 == 0 && !jq.expected_record_ids.is_empty() {
@@ -1960,7 +1965,7 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
             });
         }
     }
-    
+
     Ok(Scenario {
         name: "locomo".to_string(),
         category: "locomo-conversational-memory",
