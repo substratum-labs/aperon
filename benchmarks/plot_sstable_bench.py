@@ -17,15 +17,14 @@ plt.rcParams.update({
 })
 
 BENCH_DIR = Path("/Users/yong/projects/aperon/benchmarks")
-SUMMARY_PATH = Path("/Users/yong/projects/aperon/target/memory-sstable-bench/synthetic-custom/summary.json")
 ARTIFACTS_DIR = Path("/Users/yong/.gemini/antigravity-cli/brain/25abe1a0-36e1-4506-a57f-9580a12f7e91")
 
-def main():
-    if not SUMMARY_PATH.exists():
-        print(f"Error: summary file not found at {SUMMARY_PATH}")
+def plot_scenario(summary_path, out_png_name, title):
+    if not summary_path.exists():
+        print(f"Warning: summary file not found at {summary_path}, skipping.")
         return
 
-    with open(SUMMARY_PATH, "r") as f:
+    with open(summary_path, "r") as f:
         data = json.load(f)
 
     # Filter for the relevant paths
@@ -80,19 +79,34 @@ def main():
     for i, v in enumerate(recalls):
         axes[2].text(i, v + 0.02, f"{v:.3f}", ha='center', fontweight='bold')
 
-    plt.suptitle("SSTable Search Candidate Generation Path Comparison (N = 100,000)", y=1.02)
+    plt.suptitle(title, y=1.02)
     plt.tight_layout()
     
-    out_png = BENCH_DIR / "sstable_bench_comparison.png"
+    out_png = BENCH_DIR / out_png_name
     plt.savefig(out_png, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved plot to {out_png}")
 
     # Copy to artifacts directory
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    dest_path = ARTIFACTS_DIR / "sstable_bench_comparison.png"
+    dest_path = ARTIFACTS_DIR / out_png_name
     shutil.copy(out_png, dest_path)
     print(f"Copied plot to artifacts directory: {dest_path}")
+
+def main():
+    # Plot Scenario 1: Synthetic Custom (100k records)
+    plot_scenario(
+        Path("/Users/yong/projects/aperon/target/memory-sstable-bench/synthetic-custom/summary.json"),
+        "sstable_bench_comparison.png",
+        "SSTable Search Candidate Generation Path Comparison (Synthetic N = 100,000)"
+    )
+
+    # Plot Scenario 2: Real Agent Memory (17k records)
+    plot_scenario(
+        Path("/Users/yong/projects/aperon/target/memory-sstable-bench/agent-memory/summary.json"),
+        "sstable_bench_agent_memory.png",
+        "SSTable Search Candidate Generation Path Comparison (Real Agent Memory N = 17,485)"
+    )
 
 if __name__ == "__main__":
     main()

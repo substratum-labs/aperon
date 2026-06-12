@@ -36,6 +36,7 @@ struct BenchQuery {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonMemoryRecord {
+    #[serde(default)]
     segment_id: u64,
     record_id: u64,
     scope_id: u32,
@@ -231,6 +232,9 @@ fn run() -> Result<(), String> {
         );
         run_scenario(&medium, &args.out.join("synthetic-medium"))?;
     }
+
+    let agent_memory_scenario = load_agent_memory_scenario()?;
+    run_scenario(&agent_memory_scenario, &args.out.join("agent-memory"))?;
 
     Ok(())
 }
@@ -1804,4 +1808,78 @@ fn print_usage(bin: &str) {
     eprintln!("  {bin} [--records 100000] [--segments 100] [--queries 100] [--out target/memory-sstable-bench] [--medium]");
     eprintln!("examples:");
     eprintln!("  cargo run -p aperon-core --bin memory_sstable_bench -- --records 100000 --segments 100 --queries 100");
+}
+
+fn load_agent_memory_scenario() -> Result<Scenario, String> {
+    let dataset_path = Path::new("benchmarks/data/agent_memory/agent_memory_dataset.json");
+    if !dataset_path.exists() {
+        return Err(format!("dataset file not found at {}", dataset_path.display()));
+    }
+    let data_str = std::fs::read_to_string(dataset_path)
+        .map_err(|err| format!("read dataset: {err}"))?;
+    
+    let json_records: Vec<JsonMemoryRecord> = serde_json::from_str(&data_str)
+        .map_err(|err| format!("parse dataset: {err}"))?;
+    
+    let mut records = Vec::with_capacity(json_records.len());
+    let mut queries = Vec::new();
+    
+    // Split records into segments
+    let num_segments = 10;
+    
+    for (i, jr) in json_records.iter().enumerate() {
+        let segment_id = (jr.record_id % num_segments) as u64;
+        
+        let record = BenchRecord {
+            segment_id,
+            record: MemoryRecordInput {
+                record_id: jr.record_id,
+                scope_id: jr.scope_id,
+                timestamp: jr.timestamp,
+                source_id: jr.source_id,
+                confidence: jr.confidence,
+                text: jr.text.clone(),
+                embedding: jr.embedding.clone(),
+                symbols: jr.symbols.clone(),
+                vector_id: None,
+                metadata: std::collections::BTreeMap::new(),
+            },
+        };
+        records.push(record);
+        
+        // Select queries: take every 100th record starting from 15000 as a query
+        if i >= 15000 && i % 100 == 0 {
+            let query_symbols = if jr.symbols.is_empty() {
+                Vec::new()
+            } else {
+                vec![jr.symbols[0].clone()]
+            };
+            
+            queries.push(BenchQuery {
+                query: RecallQuery {
+                    embedding: Some(jr.embedding.clone()),
+                    symbols: query_symbols,
+                    scope_id: Some(jr.scope_id),
+                    time_start: Some(jr.timestamp - 3600 * 24), // 1 day window
+                    time_end: Some(jr.timestamp + 3600 * 24),
+                    min_confidence: Some(jr.confidence - 0.2),
+                    limit: 10,
+                    candidate_budget: Some(128),
+                    vector_id: None,
+                    metadata_filter: std::collections::BTreeMap::new(),
+                    fallback_to_recon_on_cold: false,
+                },
+                expected_record_id: jr.record_id,
+            });
+        }
+    }
+    
+    Ok(Scenario {
+        name: "agent-memory".to_string(),
+        category: "agent-memory-real",
+        description: "real vectorized multi-agent dev logs trajectory scenario",
+        required: false,
+        records,
+        queries,
+    })
 }
