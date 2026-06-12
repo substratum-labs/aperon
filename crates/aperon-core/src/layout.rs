@@ -210,6 +210,18 @@ impl BlockSoaLayout {
         &self.coords[start..start + self.block_size]
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn block_coords_ptr(&self, block: usize) -> *const i16 {
+        let start = block * self.local_dim * self.block_size;
+        unsafe { self.coords.as_ptr().add(start) }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn block_sketches_ptr(&self, block: usize) -> *const i8 {
+        let start = block * self.sketch_dim * self.block_size;
+        unsafe { self.sketches.as_ptr().add(start) as *const i8 }
+    }
+
     pub(crate) fn residual_block(&self, block: usize) -> &[u16] {
         let start = block * self.block_size;
         &self.residuals[start..start + self.block_size]
