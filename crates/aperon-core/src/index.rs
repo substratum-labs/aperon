@@ -101,6 +101,10 @@ impl AperonIndex {
         self.rerank_factor
     }
 
+    pub(crate) fn grains(&self) -> &[Grain] {
+        &self.grains
+    }
+
     pub fn set_residual_bits(&mut self, bits: u8) -> Result<(), String> {
         crate::layout::validate_residual_bits(bits)?;
         self.residual_bits = bits;
@@ -936,7 +940,7 @@ impl AperonIndex {
             .collect())
     }
 
-    fn route(&self, query: &[f32], nprobe: Option<usize>) -> Result<Vec<usize>, String> {
+    pub(crate) fn route(&self, query: &[f32], nprobe: Option<usize>) -> Result<Vec<usize>, String> {
         if query.len() != self.dim {
             return Err(format!(
                 "dimension mismatch: expected {}, got {}",
@@ -1911,5 +1915,40 @@ mod tests {
             .search_with_nprobe(&[10.1, 5.0, 2.0, 1.0], 3, 4)
             .unwrap();
         assert_eq!(results[0].id, VectorId::new(10));
+    }
+
+    #[test]
+    fn test_zero_copy_cow_index_branching() {
+        let mut index = AperonIndex::with_options(3, 2, 0, 4);
+        index.insert(1, [1.0, 2.0, 3.0]).unwrap();
+        index.insert(2, [4.0, 5.0, 6.0]).unwrap();
+        index.rebuild_single_grain().unwrap();
+
+        // Fork the index by cloning it (Zero-copy CoW)
+        let start = std::time::Instant::now();
+        let mut child_index = index.clone();
+        let elapsed = start.elapsed();
+        println!("Forking index took: {:?}", elapsed);
+        // Assert that branching takes < 10ms
+        assert!(
+            elapsed.as_millis() < 10,
+            "Branching took too long: {:?}",
+            elapsed
+        );
+
+        // Verify isolation: insert a vector into the child_index and rebuild it
+        child_index.insert(3, [7.0, 8.0, 9.0]).unwrap();
+        child_index.rebuild_single_grain().unwrap();
+
+        // Child should have 3 vectors, parent should still have 2
+        assert_eq!(child_index.stats().vectors, 3);
+        assert_eq!(index.stats().vectors, 2);
+
+        // Verify we can search both indices and get correct results
+        let results_child = child_index.search(&[7.0, 8.0, 9.0], 1).unwrap();
+        assert_eq!(results_child[0].id, VectorId::new(3));
+
+        let results_parent = index.search(&[7.0, 8.0, 9.0], 1).unwrap();
+        assert_eq!(results_parent[0].id, VectorId::new(2)); // nearest from parent
     }
 }

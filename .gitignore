@@ -4,3 +4,4 @@
 *.profdata
 /benchmarks/data/
 .venv/
+CLAUDE.md
