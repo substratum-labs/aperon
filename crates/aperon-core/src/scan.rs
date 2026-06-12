@@ -1,5 +1,267 @@
 use crate::layout::BlockSoaLayout;
 
+pub(crate) trait SIMDScanKernel {
+    fn scan_block(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        query_coords: &[i16],
+        query_residual: u16,
+        query_sketch: &[i8],
+        weights: ScanWeights<'_>,
+        scores: &mut [i64],
+    );
+
+    fn scan_block_multi(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        queries_coords: &[&[i16]],
+        queries_residual: &[u16],
+        queries_sketches: &[&[i8]],
+        weights: ScanWeights<'_>,
+        queries_scores: &mut [&mut [i64]],
+    );
+}
+
+pub(crate) struct ScalarScanKernel;
+
+impl SIMDScanKernel for ScalarScanKernel {
+    fn scan_block(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        query_coords: &[i16],
+        query_residual: u16,
+        query_sketch: &[i8],
+        weights: ScanWeights<'_>,
+        scores: &mut [i64],
+    ) {
+        scalar_scan_block_into(
+            layout,
+            block,
+            lanes,
+            query_coords,
+            query_residual,
+            query_sketch,
+            weights,
+            scores,
+        );
+    }
+
+    fn scan_block_multi(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        queries_coords: &[&[i16]],
+        queries_residual: &[u16],
+        queries_sketches: &[&[i8]],
+        weights: ScanWeights<'_>,
+        queries_scores: &mut [&mut [i64]],
+    ) {
+        let m = queries_coords.len();
+        for q in 0..m {
+            scalar_scan_block_into(
+                layout,
+                block,
+                lanes,
+                queries_coords[q],
+                queries_residual[q],
+                queries_sketches[q],
+                weights,
+                queries_scores[q],
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) struct NeonScanKernel;
+
+#[cfg(target_arch = "aarch64")]
+impl SIMDScanKernel for NeonScanKernel {
+    fn scan_block(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        query_coords: &[i16],
+        query_residual: u16,
+        query_sketch: &[i8],
+        weights: ScanWeights<'_>,
+        scores: &mut [i64],
+    ) {
+        scan_block_into(
+            layout,
+            block,
+            lanes,
+            query_coords,
+            query_residual,
+            query_sketch,
+            weights,
+            scores,
+        );
+    }
+
+    fn scan_block_multi(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        queries_coords: &[&[i16]],
+        queries_residual: &[u16],
+        queries_sketches: &[&[i8]],
+        weights: ScanWeights<'_>,
+        queries_scores: &mut [&mut [i64]],
+    ) {
+        unsafe {
+            aarch64_neon_scan_block_multi(
+                layout,
+                block,
+                lanes,
+                queries_coords,
+                queries_residual,
+                queries_sketches,
+                weights,
+                queries_scores,
+            );
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) struct Avx2ScanKernel;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl SIMDScanKernel for Avx2ScanKernel {
+    fn scan_block(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        query_coords: &[i16],
+        query_residual: u16,
+        query_sketch: &[i8],
+        weights: ScanWeights<'_>,
+        scores: &mut [i64],
+    ) {
+        scan_block_into(
+            layout,
+            block,
+            lanes,
+            query_coords,
+            query_residual,
+            query_sketch,
+            weights,
+            scores,
+        );
+    }
+
+    fn scan_block_multi(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        queries_coords: &[&[i16]],
+        queries_residual: &[u16],
+        queries_sketches: &[&[i8]],
+        weights: ScanWeights<'_>,
+        queries_scores: &mut [&mut [i64]],
+    ) {
+        unsafe {
+            x86_avx2_scan_block_multi(
+                layout,
+                block,
+                lanes,
+                queries_coords,
+                queries_residual,
+                queries_sketches,
+                weights,
+                queries_scores,
+            );
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) struct Avx512ScanKernel;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl SIMDScanKernel for Avx512ScanKernel {
+    fn scan_block(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        query_coords: &[i16],
+        query_residual: u16,
+        query_sketch: &[i8],
+        weights: ScanWeights<'_>,
+        scores: &mut [i64],
+    ) {
+        scan_block_into(
+            layout,
+            block,
+            lanes,
+            query_coords,
+            query_residual,
+            query_sketch,
+            weights,
+            scores,
+        );
+    }
+
+    fn scan_block_multi(
+        &self,
+        layout: &BlockSoaLayout,
+        block: usize,
+        lanes: usize,
+        queries_coords: &[&[i16]],
+        queries_residual: &[u16],
+        queries_sketches: &[&[i8]],
+        weights: ScanWeights<'_>,
+        queries_scores: &mut [&mut [i64]],
+    ) {
+        unsafe {
+            x86_avx512_scan_block_multi(
+                layout,
+                block,
+                lanes,
+                queries_coords,
+                queries_residual,
+                queries_sketches,
+                weights,
+                queries_scores,
+            );
+        }
+    }
+}
+
+pub(crate) fn get_optimal_scan_kernel() -> Box<dyn SIMDScanKernel + Send + Sync> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Box::new(NeonScanKernel)
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            Box::new(Avx512ScanKernel)
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            Box::new(Avx2ScanKernel)
+        } else {
+            Box::new(ScalarScanKernel)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+    {
+        Box::new(ScalarScanKernel)
+    }
+}
+
 #[cfg(target_arch = "x86")]
 type M256i = std::arch::x86::__m256i;
 #[cfg(target_arch = "x86_64")]
@@ -2228,7 +2490,19 @@ unsafe fn x86_avx512_scan_block_multi(
 
     let m = queries_coords.len();
     let vector_lanes = (lanes / 8) * 8;
-    if m == 4 {
+    if m == 8 {
+        if vector_lanes < lanes {
+            let res_block = layout.residual_block(block);
+            for q in 0..8 {
+                residual_scores(
+                    &res_block[vector_lanes..lanes],
+                    queries_residual[q],
+                    weights.residual,
+                    &mut queries_scores[q][vector_lanes..lanes],
+                );
+            }
+        }
+    } else if m == 4 {
         if vector_lanes < lanes {
             let res_block = layout.residual_block(block);
             for q in 0..4 {
@@ -2279,7 +2553,257 @@ unsafe fn x86_avx512_scan_block_multi(
 
     let mut lane = 0;
     while lane + 8 <= lanes {
-        if m == 4 && weights.coord.len() == 8 && weights.sketch.len() == 4 {
+        if m == 8 && weights.coord.len() == 8 && weights.sketch.len() == 4 {
+            let residual_ptr = layout.residual_block(block).as_ptr();
+            let raw_res = _mm_loadu_si128(residual_ptr.add(lane) as *const __m128i);
+            let res_64 = _mm512_cvtepu16_epi64(raw_res);
+            let v_res_weight = _mm512_set1_epi64(weights.residual);
+
+            let mut v_scores_0 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[0] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_1 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[1] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_2 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[2] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_3 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[3] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_4 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[4] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_5 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[5] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_6 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[6] as i64), res_64),
+                v_res_weight,
+            );
+            let mut v_scores_7 = _mm512_mul_epu32(
+                _mm512_add_epi64(_mm512_set1_epi64(queries_residual[7] as i64), res_64),
+                v_res_weight,
+            );
+
+            macro_rules! step_coord {
+                ($d:expr) => {
+                    let coord_ptr =
+                        layout.coord_block(block, $d).as_ptr().add(lane) as *const __m128i;
+                    let raw = _mm_loadu_si128(coord_ptr);
+                    let widened = _mm512_cvtepi16_epi64(raw);
+                    let v_weight = w_coord_v[$d];
+
+                    let diff0 = _mm512_sub_epi64(q_coord_v[0][$d], widened);
+                    let diff_sq0 = _mm512_mul_epu32(diff0, diff0);
+                    let prod0 = if weights.coord[$d] == 1 {
+                        diff_sq0
+                    } else {
+                        _mm512_mul_epu32(diff_sq0, v_weight)
+                    };
+                    v_scores_0 = _mm512_add_epi64(v_scores_0, prod0);
+
+                    let diff1 = _mm512_sub_epi64(q_coord_v[1][$d], widened);
+                    let diff_sq1 = _mm512_mul_epu32(diff1, diff1);
+                    let prod1 = if weights.coord[$d] == 1 {
+                        diff_sq1
+                    } else {
+                        _mm512_mul_epu32(diff_sq1, v_weight)
+                    };
+                    v_scores_1 = _mm512_add_epi64(v_scores_1, prod1);
+
+                    let diff2 = _mm512_sub_epi64(q_coord_v[2][$d], widened);
+                    let diff_sq2 = _mm512_mul_epu32(diff2, diff2);
+                    let prod2 = if weights.coord[$d] == 1 {
+                        diff_sq2
+                    } else {
+                        _mm512_mul_epu32(diff_sq2, v_weight)
+                    };
+                    v_scores_2 = _mm512_add_epi64(v_scores_2, prod2);
+
+                    let diff3 = _mm512_sub_epi64(q_coord_v[3][$d], widened);
+                    let diff_sq3 = _mm512_mul_epu32(diff3, diff3);
+                    let prod3 = if weights.coord[$d] == 1 {
+                        diff_sq3
+                    } else {
+                        _mm512_mul_epu32(diff_sq3, v_weight)
+                    };
+                    v_scores_3 = _mm512_add_epi64(v_scores_3, prod3);
+
+                    let diff4 = _mm512_sub_epi64(q_coord_v[4][$d], widened);
+                    let diff_sq4 = _mm512_mul_epu32(diff4, diff4);
+                    let prod4 = if weights.coord[$d] == 1 {
+                        diff_sq4
+                    } else {
+                        _mm512_mul_epu32(diff_sq4, v_weight)
+                    };
+                    v_scores_4 = _mm512_add_epi64(v_scores_4, prod4);
+
+                    let diff5 = _mm512_sub_epi64(q_coord_v[5][$d], widened);
+                    let diff_sq5 = _mm512_mul_epu32(diff5, diff5);
+                    let prod5 = if weights.coord[$d] == 1 {
+                        diff_sq5
+                    } else {
+                        _mm512_mul_epu32(diff_sq5, v_weight)
+                    };
+                    v_scores_5 = _mm512_add_epi64(v_scores_5, prod5);
+
+                    let diff6 = _mm512_sub_epi64(q_coord_v[6][$d], widened);
+                    let diff_sq6 = _mm512_mul_epu32(diff6, diff6);
+                    let prod6 = if weights.coord[$d] == 1 {
+                        diff_sq6
+                    } else {
+                        _mm512_mul_epu32(diff_sq6, v_weight)
+                    };
+                    v_scores_6 = _mm512_add_epi64(v_scores_6, prod6);
+
+                    let diff7 = _mm512_sub_epi64(q_coord_v[7][$d], widened);
+                    let diff_sq7 = _mm512_mul_epu32(diff7, diff7);
+                    let prod7 = if weights.coord[$d] == 1 {
+                        diff_sq7
+                    } else {
+                        _mm512_mul_epu32(diff_sq7, v_weight)
+                    };
+                    v_scores_7 = _mm512_add_epi64(v_scores_7, prod7);
+                };
+            }
+
+            step_coord!(0);
+            step_coord!(1);
+            step_coord!(2);
+            step_coord!(3);
+            step_coord!(4);
+            step_coord!(5);
+            step_coord!(6);
+            step_coord!(7);
+
+            macro_rules! step_sketch {
+                ($d:expr) => {
+                    let sketch_ptr =
+                        layout.sketch_block(block, $d).as_ptr().add(lane) as *const i64;
+                    let packed = std::ptr::read_unaligned(sketch_ptr);
+                    let raw = _mm_cvtsi64_si128(packed);
+                    let widened = _mm512_cvtepi8_epi64(raw);
+                    let v_weight = w_sketch_v[$d];
+
+                    let diff0 = _mm512_sub_epi64(q_sketch_v[0][$d], widened);
+                    let diff_sq0 = _mm512_mul_epu32(diff0, diff0);
+                    let prod0 = if weights.sketch[$d] == 1 {
+                        diff_sq0
+                    } else {
+                        _mm512_mul_epu32(diff_sq0, v_weight)
+                    };
+                    v_scores_0 = _mm512_add_epi64(v_scores_0, prod0);
+
+                    let diff1 = _mm512_sub_epi64(q_sketch_v[1][$d], widened);
+                    let diff_sq1 = _mm512_mul_epu32(diff1, diff1);
+                    let prod1 = if weights.sketch[$d] == 1 {
+                        diff_sq1
+                    } else {
+                        _mm512_mul_epu32(diff_sq1, v_weight)
+                    };
+                    v_scores_1 = _mm512_add_epi64(v_scores_1, prod1);
+
+                    let diff2 = _mm512_sub_epi64(q_sketch_v[2][$d], widened);
+                    let diff_sq2 = _mm512_mul_epu32(diff2, diff2);
+                    let prod2 = if weights.sketch[$d] == 1 {
+                        diff_sq2
+                    } else {
+                        _mm512_mul_epu32(diff_sq2, v_weight)
+                    };
+                    v_scores_2 = _mm512_add_epi64(v_scores_2, prod2);
+
+                    let diff3 = _mm512_sub_epi64(q_sketch_v[3][$d], widened);
+                    let diff_sq3 = _mm512_mul_epu32(diff3, diff3);
+                    let prod3 = if weights.sketch[$d] == 1 {
+                        diff_sq3
+                    } else {
+                        _mm512_mul_epu32(diff_sq3, v_weight)
+                    };
+                    v_scores_3 = _mm512_add_epi64(v_scores_3, prod3);
+
+                    let diff4 = _mm512_sub_epi64(q_sketch_v[4][$d], widened);
+                    let diff_sq4 = _mm512_mul_epu32(diff4, diff4);
+                    let prod4 = if weights.sketch[$d] == 1 {
+                        diff_sq4
+                    } else {
+                        _mm512_mul_epu32(diff_sq4, v_weight)
+                    };
+                    v_scores_4 = _mm512_add_epi64(v_scores_4, prod4);
+
+                    let diff5 = _mm512_sub_epi64(q_sketch_v[5][$d], widened);
+                    let diff_sq5 = _mm512_mul_epu32(diff5, diff5);
+                    let prod5 = if weights.sketch[$d] == 1 {
+                        diff_sq5
+                    } else {
+                        _mm512_mul_epu32(diff_sq5, v_weight)
+                    };
+                    v_scores_5 = _mm512_add_epi64(v_scores_5, prod5);
+
+                    let diff6 = _mm512_sub_epi64(q_sketch_v[6][$d], widened);
+                    let diff_sq6 = _mm512_mul_epu32(diff6, diff6);
+                    let prod6 = if weights.sketch[$d] == 1 {
+                        diff_sq6
+                    } else {
+                        _mm512_mul_epu32(diff_sq6, v_weight)
+                    };
+                    v_scores_6 = _mm512_add_epi64(v_scores_6, prod6);
+
+                    let diff7 = _mm512_sub_epi64(q_sketch_v[7][$d], widened);
+                    let diff_sq7 = _mm512_mul_epu32(diff7, diff7);
+                    let prod7 = if weights.sketch[$d] == 1 {
+                        diff_sq7
+                    } else {
+                        _mm512_mul_epu32(diff_sq7, v_weight)
+                    };
+                    v_scores_7 = _mm512_add_epi64(v_scores_7, prod7);
+                };
+            }
+
+            step_sketch!(0);
+            step_sketch!(1);
+            step_sketch!(2);
+            step_sketch!(3);
+
+            _mm512_storeu_si512(
+                queries_scores[0].as_mut_ptr().add(lane) as *mut _,
+                v_scores_0,
+            );
+            _mm512_storeu_si512(
+                queries_scores[1].as_mut_ptr().add(lane) as *mut _,
+                v_scores_1,
+            );
+            _mm512_storeu_si512(
+                queries_scores[2].as_mut_ptr().add(lane) as *mut _,
+                v_scores_2,
+            );
+            _mm512_storeu_si512(
+                queries_scores[3].as_mut_ptr().add(lane) as *mut _,
+                v_scores_3,
+            );
+            _mm512_storeu_si512(
+                queries_scores[4].as_mut_ptr().add(lane) as *mut _,
+                v_scores_4,
+            );
+            _mm512_storeu_si512(
+                queries_scores[5].as_mut_ptr().add(lane) as *mut _,
+                v_scores_5,
+            );
+            _mm512_storeu_si512(
+                queries_scores[6].as_mut_ptr().add(lane) as *mut _,
+                v_scores_6,
+            );
+            _mm512_storeu_si512(
+                queries_scores[7].as_mut_ptr().add(lane) as *mut _,
+                v_scores_7,
+            );
+        } else if m == 4 && weights.coord.len() == 8 && weights.sketch.len() == 4 {
             let residual_ptr = layout.residual_block(block).as_ptr();
             let raw_res = _mm_loadu_si128(residual_ptr.add(lane) as *const __m128i);
             let res_64 = _mm512_cvtepu16_epi64(raw_res);
@@ -2813,6 +3337,94 @@ mod tests {
             actual_scores[0][start_idx..start_idx + lanes].copy_from_slice(&s0);
             actual_scores[1][start_idx..start_idx + lanes].copy_from_slice(&s1);
             actual_scores[2][start_idx..start_idx + lanes].copy_from_slice(&s2);
+        }
+
+        assert_eq!(actual_scores, expected_scores);
+    }
+
+    #[test]
+    fn test_simd_scan_kernel_trait() {
+        let mut layout = BlockSoaLayout::with_shape(5, 3, 16);
+        for lane in 0..23 {
+            layout
+                .push_quantized(
+                    VectorId::new(lane as u64),
+                    &[
+                        lane as i16 - 11,
+                        17 - lane as i16,
+                        lane as i16 * 3 - 9,
+                        4,
+                        -6,
+                    ],
+                    lane as u16 * 2 + 1,
+                    &[lane as i8 - 5, 9 - lane as i8, lane as i8 / 2],
+                )
+                .unwrap();
+        }
+        let weights = ScanWeights {
+            coord: &[1, 2, 3, 4, 5],
+            residual: 6,
+            sketch: &[7, 8, 9],
+        };
+
+        let q_coords = [
+            vec![3i16, -7, 11, 13, -17],
+            vec![1i16, 2, 3, 4, 5],
+            vec![-5i16, 10, -15, 20, -25],
+        ];
+        let q_residuals = vec![19u16, 5, 23];
+        let q_sketches = [vec![5i8, -3, 2], vec![1i8, 1, 1], vec![-2i8, 4, 0]];
+
+        let q_coords_refs: Vec<&[i16]> = q_coords.iter().map(|v| v.as_slice()).collect();
+        let q_sketches_refs: Vec<&[i8]> = q_sketches.iter().map(|v| v.as_slice()).collect();
+
+        let kernel = get_optimal_scan_kernel();
+
+        // Run multi-query scans using the trait dispatch
+        let mut actual_scores = vec![vec![0i64; 23]; 3];
+        for block in 0..layout.block_count() {
+            let lanes = layout.block_len(block);
+            let start_idx = block * 16;
+            let mut s0 = vec![0i64; lanes];
+            let mut s1 = vec![0i64; lanes];
+            let mut s2 = vec![0i64; lanes];
+            {
+                let mut scratch_refs = [&mut s0[..], &mut s1[..], &mut s2[..]];
+                kernel.scan_block_multi(
+                    &layout,
+                    block,
+                    lanes,
+                    &q_coords_refs,
+                    &q_residuals,
+                    &q_sketches_refs,
+                    weights,
+                    &mut scratch_refs,
+                );
+            }
+            actual_scores[0][start_idx..start_idx + lanes].copy_from_slice(&s0);
+            actual_scores[1][start_idx..start_idx + lanes].copy_from_slice(&s1);
+            actual_scores[2][start_idx..start_idx + lanes].copy_from_slice(&s2);
+        }
+
+        // Run single query scan using the trait dispatch to verify parity
+        let mut expected_scores = vec![vec![0i64; 23]; 3];
+        for q in 0..3 {
+            for block in 0..layout.block_count() {
+                let lanes = layout.block_len(block);
+                let start_idx = block * 16;
+                let mut scratch = vec![0i64; lanes];
+                kernel.scan_block(
+                    &layout,
+                    block,
+                    lanes,
+                    q_coords_refs[q],
+                    q_residuals[q],
+                    q_sketches_refs[q],
+                    weights,
+                    &mut scratch,
+                );
+                expected_scores[q][start_idx..start_idx + lanes].copy_from_slice(&scratch);
+            }
         }
 
         assert_eq!(actual_scores, expected_scores);
