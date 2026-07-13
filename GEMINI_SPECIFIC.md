@@ -1,1 +1,1 @@
-../../substratum-internal/agent-md/aperon.md
+../substratum-internal/agent-md/aperon.md
