@@ -2,6 +2,7 @@
 
 pub mod binary;
 pub mod distance;
+pub mod gpu_scan;
 pub mod grain;
 pub mod index;
 pub mod layout;
@@ -16,6 +17,10 @@ pub mod wab;
 pub use wab::{WabRecord, WriteAheadBuffer};
 
 pub use distance::{l2_squared, Distance};
+pub use gpu_scan::{
+    CpuFallbackScanEngine, CpuScanEngine, GpuDistanceMetric, GpuScanEngine, GpuScanError,
+    GpuScanFuture, GpuScanResult, WgpuScanEngine,
+};
 pub use grain::{Grain, GrainId, ScoredVector};
 pub use index::{AperonIndex, IndexStats};
 pub use layout::{BlockSoaLayout, PackedBlock, VectorId, DEFAULT_BLOCK_SIZE};

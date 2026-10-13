@@ -1834,7 +1834,7 @@ fn load_agent_memory_scenario() -> Result<Scenario, String> {
     let num_segments = 10;
 
     for (i, jr) in json_records.iter().enumerate() {
-        let segment_id = (jr.record_id % num_segments) as u64;
+        let segment_id = jr.record_id % num_segments;
 
         let record = BenchRecord {
             segment_id,
@@ -1894,9 +1894,7 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
     let records_path = Path::new("benchmarks/data/locomo/locomo_records.json");
     let queries_path = Path::new("benchmarks/data/locomo/locomo_queries.json");
     if !records_path.exists() || !queries_path.exists() {
-        return Err(format!(
-            "LoCoMo dataset files not found under benchmarks/data/locomo/"
-        ));
+        return Err("LoCoMo dataset files not found under benchmarks/data/locomo/".to_owned());
     }
 
     let records_str = std::fs::read_to_string(records_path)
@@ -1909,6 +1907,7 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
 
     #[derive(Debug, Deserialize)]
     struct JsonLocomoQuery {
+        #[allow(dead_code)]
         query_id: u64,
         scope_id: u32,
         expected_record_ids: Vec<u64>,
@@ -1924,7 +1923,7 @@ fn load_locomo_scenario() -> Result<Scenario, String> {
     let num_segments = 10;
 
     for jr in &json_records {
-        let segment_id = (jr.record_id % num_segments) as u64;
+        let segment_id = jr.record_id % num_segments;
 
         let record = BenchRecord {
             segment_id,

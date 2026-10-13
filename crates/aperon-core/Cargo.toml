@@ -14,6 +14,7 @@ path = "src/lib.rs"
 libc = "0.2.186"
 serde.workspace = true
 serde_json.workspace = true
+wgpu = "0.20"
 
 [[bin]]
 name = "pivot_prefix_t171"

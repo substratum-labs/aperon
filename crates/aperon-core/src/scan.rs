@@ -1,5 +1,6 @@
 use crate::layout::BlockSoaLayout;
 
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) trait SIMDScanKernel {
     fn scan_block(
         &self,
@@ -26,6 +27,7 @@ pub(crate) trait SIMDScanKernel {
     );
 }
 
+#[allow(dead_code)]
 pub(crate) struct ScalarScanKernel;
 
 impl SIMDScanKernel for ScalarScanKernel {
@@ -80,6 +82,7 @@ impl SIMDScanKernel for ScalarScanKernel {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub(crate) struct NeonScanKernel;
 
 #[cfg(target_arch = "aarch64")]
@@ -241,6 +244,7 @@ impl SIMDScanKernel for Avx512ScanKernel {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_optimal_scan_kernel() -> Box<dyn SIMDScanKernel + Send + Sync> {
     #[cfg(target_arch = "aarch64")]
     {
